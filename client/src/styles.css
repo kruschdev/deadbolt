@@ -230,8 +230,22 @@ code {
 
 .db-select:focus,
 .db-input:focus {
-  outline: none;
   border-color: var(--db-cyan);
+}
+
+.db-select:focus:not(:focus-visible),
+.db-input:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.db-btn:focus-visible,
+.db-nav-tab:focus-visible,
+.db-preset-pill:focus-visible,
+.db-select:focus-visible,
+.db-input:focus-visible,
+.db-drawer-summary:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
 }
 
 /* Clean Buttons */
@@ -361,9 +375,26 @@ code {
   background: var(--db-cyan-dim);
 }
 
-.db-step.is-tripped {
+.db-step.is-tripped,
+.db-step.is-crimson {
   border-color: var(--db-crimson);
   background: var(--db-crimson-dim);
+}
+
+.db-step.is-tripped .db-step-meta,
+.db-step.is-crimson .db-step-meta {
+  color: #fca5a5;
+}
+
+.db-step.is-amber,
+.db-step.is-warn {
+  border-color: rgba(245, 158, 11, 0.48);
+  background: var(--db-amber-dim);
+}
+
+.db-step.is-amber .db-step-meta,
+.db-step.is-warn .db-step-meta {
+  color: #fcd34d;
 }
 
 .db-step.is-complete {
@@ -603,7 +634,8 @@ code {
 }
 
 .db-badge-crimson,
-.db-badge-danger {
+.db-badge-danger,
+.db-badge-err {
   border-color: rgba(239, 68, 68, 0.45);
   background: var(--db-crimson-dim);
   color: #fca5a5;
@@ -980,5 +1012,16 @@ span[role='status'] > span[aria-hidden='true'],
   .db-steps,
   .db-sofa-kpi-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

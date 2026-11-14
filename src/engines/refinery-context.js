@@ -243,9 +243,15 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
   }
 
   function scanUntrustedExternalInputs() {
-    const untrustedItems = (ORG_CONTEXT_MODALITIES.chats || []).filter(
-      (item) => item.trust === 'untrusted'
-    );
+    const scanModalities = ['tickets', 'emails', 'chats', 'transcripts'];
+    const untrustedItems = [];
+    for (const modality of scanModalities) {
+      for (const item of ORG_CONTEXT_MODALITIES[modality] || []) {
+        if (item && item.trust === 'untrusted') {
+          untrustedItems.push({ ...item, modality });
+        }
+      }
+    }
 
     let neutralizedTags = 0;
     let infectedCount = 0;
@@ -255,21 +261,40 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
     const inspectedItems = [];
 
     for (const item of untrustedItems) {
-      const delimited = delimitUntrustedContent(item.content, {
+      const rawContent = String(item.content || '');
+      const sanitized = sanitizeAgentMessage(rawContent);
+      const overrideDirectiveRe = /\[?\b(?:SYSTEM|DEVELOPER|ADMIN|INSTRUCTION)\s+OVERRIDE\b\]?\s*:?/gi;
+      const hadOverrideDirective = overrideDirectiveRe.test(rawContent);
+      const cleanedSanitizedMessage = String(sanitized.sanitizedMessage || '').replace(
+        /\[?\b(?:SYSTEM|DEVELOPER|ADMIN|INSTRUCTION)\s+OVERRIDE\b\]?\s*:?/gi,
+        '[STRIPPED_DIRECTIVE]'
+      );
+
+      const delimited = delimitUntrustedContent(cleanedSanitizedMessage, {
         source: item.source || item.id,
         trustLevel: 'untrusted'
       });
-      const sanitized = sanitizeAgentMessage(item.content);
 
+      const itemDetectedPatterns = [...(sanitized.detectedPatterns || [])];
+      if (hadOverrideDirective && !itemDetectedPatterns.includes('system_override_directive')) {
+        itemDetectedPatterns.push('system_override_directive');
+      }
+
+      const itemInfected = Boolean(sanitized.isInfected || hadOverrideDirective);
       neutralizedTags += Number(delimited.neutralizedTags || 0);
-      if (sanitized.isInfected) {
+      if (itemInfected) {
         infectedCount += 1;
       }
-      const itemRisk = String(sanitized.riskLevel || 'LOW').toUpperCase();
+
+      let itemRisk = String(sanitized.riskLevel || 'LOW').toUpperCase();
+      if (hadOverrideDirective && (riskRank[itemRisk] || 0) < riskRank.HIGH) {
+        itemRisk = 'HIGH';
+      }
       if ((riskRank[itemRisk] || 0) > (riskRank[highestRisk] || 0)) {
         highestRisk = itemRisk;
       }
-      for (const patternName of sanitized.detectedPatterns || []) {
+
+      for (const patternName of itemDetectedPatterns) {
         threatSet.add(patternName);
       }
       if (delimited.neutralizedTags > 0) {
@@ -278,16 +303,17 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
 
       inspectedItems.push({
         id: item.id,
-        channel: item.channel,
-        speaker: item.speaker,
+        modality: item.modality,
+        channel: item.channel || item.modality,
+        speaker: item.speaker || item.kind || 'external',
         source: item.source || 'external_comment',
         neutralizedTags: delimited.neutralizedTags,
-        isSafe: sanitized.isSafe,
-        isInfected: sanitized.isInfected,
+        isSafe: Boolean(sanitized.isSafe && !hadOverrideDirective && delimited.neutralizedTags === 0),
+        isInfected: itemInfected,
         riskLevel: itemRisk,
-        detectedPatterns: sanitized.detectedPatterns || [],
+        detectedPatterns: itemDetectedPatterns,
         delimitedContent: delimited.delimited,
-        sanitizedMessage: sanitized.sanitizedMessage
+        sanitizedMessage: cleanedSanitizedMessage
       });
     }
 
@@ -364,10 +390,58 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
     } else {
       const priorPool = stack.context.retrieve({
         query: '*',
-        include_lineage: false,
+        include_lineage: true,
         limit_tokens: 4000
       })?.data?.items || [];
+
+      let reusableInv02Id = null;
+      for (const item of [...existingItems, ...priorPool]) {
+        if (String(item.content || '').startsWith('INV-FIN-02:')) {
+          const candidateId = Number(item.id);
+          if (Number.isInteger(candidateId) && candidateId > 0) {
+            reusableInv02Id = candidateId;
+            break;
+          }
+        }
+        for (const node of item.lineage || []) {
+          if (String(node.content || '').startsWith('INV-FIN-02:')) {
+            const candidateId = Number(node.id);
+            if (Number.isInteger(candidateId) && candidateId > 0) {
+              reusableInv02Id = candidateId;
+              break;
+            }
+          }
+        }
+        if (reusableInv02Id) {
+          break;
+        }
+      }
+
+      if (!reusableInv02Id && Number.isInteger(lastSeedMeta?.memoryIds?.invFin02Id) && lastSeedMeta.memoryIds.invFin02Id > 0) {
+        reusableInv02Id = lastSeedMeta.memoryIds.invFin02Id;
+      }
+
+      if (!reusableInv02Id && typeof stack.db?.prepare === 'function') {
+        try {
+          const existingRow = stack.db
+            .prepare(
+              "SELECT id FROM context_memories WHERE category = 'invariant' AND content LIKE 'INV-FIN-02:%' AND status IN ('superseded', 'active') ORDER BY id ASC LIMIT 1"
+            )
+            .get();
+          const rowId = Number(existingRow?.id);
+          if (Number.isInteger(rowId) && rowId > 0) {
+            reusableInv02Id = rowId;
+          }
+        } catch {
+          /* optional direct lookup fallback */
+        }
+      }
+
       for (const staleItem of priorPool) {
+        const staleId = Number(staleItem.id);
+        if (reusableInv02Id && staleId === reusableInv02Id) {
+          continue;
+        }
         const text = String(staleItem.content || '');
         if (
           text.startsWith('INV-FIN-02:') ||
@@ -377,33 +451,56 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
         ) {
           stack.context.revise({
             action: 'invalidate',
-            target_id: Number(staleItem.id),
+            target_id: staleId,
             reason: 'Reseeded Deadbolt Refinery context for updated workspace target.'
           });
         }
       }
 
-      const inv02Res = stack.context.remember({
-        category: 'invariant',
-        content:
-          'INV-FIN-02: Legacy MVP settlement batch policy permitted up to 1 cent rounding variance across multi-line invoices during initial rollout.'
-      });
-      invFin02Id = Number(inv02Res?.data?.id);
+      const inv02Text =
+        'INV-FIN-02: Legacy MVP settlement batch policy permitted up to 1 cent rounding variance across multi-line invoices during initial rollout.';
+      const inv03Text =
+        'INV-FIN-03: Sum of settled line-item net payouts plus batch processor fee in integer cents must equal gross invoice total in integer cents (deltaCents === 0). Must not set `strictSox = false` in protected reconciler.';
+      const inv03Reason =
+        'Q1 SOX external audit revoked INV-FIN-02 after 3-way split settlement batches drifted by +1 cent against processor batch fee.';
+      const inv03Provenance = {
+        file: soxRelFile,
+        locator: soxSpan.locator,
+        quoted_sentence: soxSpan.quotedSentence
+      };
 
-      const inv03Res = stack.context.revise({
-        action: 'supersede',
-        target_id: invFin02Id,
-        new_content:
-          'INV-FIN-03: Sum of settled line-item net payouts plus batch processor fee in integer cents must equal gross invoice total in integer cents (deltaCents === 0). Must not set `strictSox = false` in protected reconciler.',
-        reason:
-          'Q1 SOX external audit revoked INV-FIN-02 after 3-way split settlement batches drifted by +1 cent against processor batch fee.',
-        provenance: {
-          file: soxRelFile,
-          locator: soxSpan.locator,
-          quoted_sentence: soxSpan.quotedSentence
+      if (reusableInv02Id) {
+        invFin02Id = reusableInv02Id;
+        const supersedeExistingRes = stack.context.revise({
+          action: 'supersede',
+          target_id: invFin02Id,
+          new_content: inv03Text,
+          reason: inv03Reason,
+          provenance: inv03Provenance
+        });
+        if (supersedeExistingRes?.ok && Number(supersedeExistingRes?.data?.new_id) > 0) {
+          invFin03Id = Number(supersedeExistingRes.data.new_id);
+        } else {
+          invFin02Id = null;
         }
-      });
-      invFin03Id = Number(inv03Res?.data?.new_id);
+      }
+
+      if (!invFin03Id) {
+        const inv02Res = stack.context.remember({
+          category: 'invariant',
+          content: inv02Text
+        });
+        invFin02Id = Number(inv02Res?.data?.id);
+
+        const inv03Res = stack.context.revise({
+          action: 'supersede',
+          target_id: invFin02Id,
+          new_content: inv03Text,
+          reason: inv03Reason,
+          provenance: inv03Provenance
+        });
+        invFin03Id = Number(inv03Res?.data?.new_id);
+      }
 
       const adrRes = stack.context.remember({
         category: 'decision',
@@ -505,9 +602,13 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
     }
 
     const healthSnapshot = stack.context.health()?.data || {};
-    const untrustedDeferredCount = (ORG_CONTEXT_MODALITIES.chats || []).filter(
-      (c) => c.trust === 'untrusted'
-    ).length;
+    const untrustedDeferredCount = ['tickets', 'emails', 'chats', 'transcripts'].reduce(
+      (sum, modality) =>
+        sum +
+        (ORG_CONTEXT_MODALITIES[modality] || []).filter((item) => item?.trust === 'untrusted')
+          .length,
+      0
+    );
 
     lastSeedMeta = {
       seeded: true,
@@ -740,9 +841,10 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
 
     const ticketItems = (ORG_CONTEXT_MODALITIES.tickets || []).filter(
       (ticket) =>
-        ticket.id === workOrder.id ||
-        ticket.id === workOrder.requirementRef ||
-        ticket.id === workOrder.blueprintRef
+        ticket.trust !== 'untrusted' &&
+        (ticket.id === workOrder.id ||
+          ticket.id === workOrder.requirementRef ||
+          ticket.id === workOrder.blueprintRef)
     );
     const spanItems = ORG_CONTEXT_MODALITIES.codebaseSpans || [];
     const sessionItems = ORG_CONTEXT_MODALITIES.pastSessions || [];

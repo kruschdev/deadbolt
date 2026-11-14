@@ -66,6 +66,51 @@ function resolveUntrustedTicketSnippet() {
     return untrustedChat ? String(untrustedChat.content || '') : '';
 }
 
+function isLoopbackBindHost(host) {
+    const clean = String(host || '127.0.0.1').trim().toLowerCase();
+    return clean === '127.0.0.1' || clean === 'localhost' || clean === '::1' || clean === '[::1]';
+}
+
+function isProtectedInternalHostTarget(candidatePath, projectRoot) {
+    const resolved = path.resolve(String(candidatePath || ''));
+    const homeEnv = path.join(os.homedir(), '.evolve.env');
+    if (resolved === homeEnv) return true;
+    const base = path.basename(resolved);
+    if (base === '.env' || base.startsWith('.env.') || base.endsWith('.hmac')) return true;
+    if (projectRoot) {
+        const rootResolved = path.resolve(projectRoot);
+        const dataDir = path.join(rootResolved, 'data');
+        const logsDir = path.join(rootResolved, 'logs');
+        if (
+            resolved === dataDir ||
+            resolved.startsWith(dataDir + path.sep) ||
+            resolved === logsDir ||
+            resolved.startsWith(logsDir + path.sep)
+        ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function looksLikeRemoteGitHubInput(rawTarget = '') {
+    const clean = String(rawTarget || '').trim();
+    if (!clean) return false;
+    if (/^(?:https?:\/\/|git@|ssh:\/\/)/i.test(clean)) return true;
+    if (/^(?:www\.)?github\.com\//i.test(clean)) return true;
+    if (
+        !clean.startsWith('/') &&
+        !clean.startsWith('./') &&
+        !clean.startsWith('../') &&
+        !clean.startsWith('~') &&
+        /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/.*)?$/.test(clean) &&
+        !fs.existsSync(path.resolve(clean))
+    ) {
+        return true;
+    }
+    return false;
+}
+
 function waitAbortable(delayMs, signal = null) {
     const ms = Number(delayMs);
     if (!Number.isFinite(ms) || ms <= 0) {
@@ -117,6 +162,8 @@ export async function createDeadboltOrchestrator(options = {}) {
                   hydradbGraphToken: '',
                   composioApiKey: '',
                   elevenlabsApiKey: '',
+                  kruschGitUrl: '',
+                  ollamaUrl: '',
                   enableLiveReviewers: false
               }
             : {};
@@ -148,108 +195,18 @@ export async function createDeadboltOrchestrator(options = {}) {
     }
 
     const scratchWorkspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-factory-ws-'));
+    let stack = null;
+    let hydraClient = null;
+    let hydraGraphClient = null;
+    let kruschGitClient = null;
+    let refinery = null;
+    let planner = null;
+    let foundry = null;
+    let validator = null;
+    let sponsors = null;
+    let modernizer = null;
     const billingRepoDir = path.join(scratchWorkspaceDir, 'acme-legacy-billing');
-    materializeBillingRepo(billingRepoDir);
 
-    const stack = createKruschStack({
-        workspaceRoot: scratchWorkspaceDir,
-        dbPath: resolvedStackDbPath,
-        ephemeral: resolvedStackDbPath === ':memory:',
-        autoEmbed: false
-    });
-
-    const hydraClient = (() => {
-        if (options.hydraClient) return options.hydraClient;
-        const created = createHydraDbClient({
-            apiKey: activeConfig.hydradbApiKey || '',
-            baseUrl: activeConfig.hydradbBaseUrl || 'https://api.hydradb.com',
-            database: activeConfig.hydradbDatabase || 'default-tenant',
-            collection: activeConfig.hydradbCollection || 'work_orders',
-            timeoutMs: 2500,
-            maxRetries: 0
-        });
-        if (!activeConfig.hydradbApiKey) {
-            created.apiKey = '';
-        }
-        return created;
-    })();
-
-    const hydraGraphClient =
-        options.hydraGraphClient ||
-        createHydraGraphClient({
-            baseUrl: activeConfig.hydradbGraphUrl || '',
-            token: activeConfig.hydradbGraphToken || '',
-            graphId: activeConfig.hydradbGraphId || 'deadbolt-factory',
-            cellId: activeConfig.hydradbCellId || 'cell-0',
-            namespace: activeConfig.hydradbNamespace || 'default',
-            allowPrivateLan: Boolean(activeConfig.hydradbAllowLan),
-            allowTailscale: Boolean(activeConfig.hydradbAllowLan),
-            timeoutMs: 2000
-        });
-
-    const kruschGitClient =
-        options.kruschGitClient !== undefined
-            ? options.kruschGitClient
-            : activeConfig.kruschGitUrl
-              ? createKruschGitClient({
-                    baseUrl: activeConfig.kruschGitUrl,
-                    apiKey: '',
-                    timeoutMs: 1200
-                })
-              : null;
-
-    const refinery = createRefineryEngine({
-        stack,
-        hydraClient,
-        workspaceRoot: scratchWorkspaceDir
-    });
-
-    const planner = createPlannerEngine({
-        stack,
-        kruschGitClient
-    });
-
-    const foundry = createFoundryEngine({
-        stack
-    });
-
-    const llmConfig = {
-        enableLiveReviewers: Boolean(activeConfig.enableLiveReviewers),
-        geminiApiKey: activeConfig.geminiApiKey || '',
-        openRouterApiKey: activeConfig.openRouterApiKey || '',
-        ollamaUrl: activeConfig.ollamaUrl || ''
-    };
-
-    const validator = createValidatorEngine({
-        auditDbPath: resolvedAuditDbPath,
-        hmacSecret: activeConfig.auditHmacSecret,
-        llmConfig
-    });
-
-    const sponsors = createSponsorHub({
-        config: activeConfig,
-        hydraClient,
-        hydraGraphClient
-    });
-
-    const modernizer = createModernizerBenchmarkEngine({
-        planner,
-        foundry,
-        validator,
-        hydraClient,
-        hydraGraphClient,
-        sponsors,
-        llmConfig: {
-            ...llmConfig,
-            ollamaFastModel: activeConfig.ollamaFastModel || 'qwen2.5-coder:7b',
-            frontierBenchmarkModel:
-                activeConfig.frontierBenchmarkModel || 'anthropic/claude-sonnet-5.5',
-            preferCloudFastTier: Boolean(activeConfig.preferCloudFastTier),
-            chatImpl: options.chatImpl || activeConfig.chatImpl || null
-        }
-    });
-
-    // Seed organizational context once at startup (cap startup network wait at 1500ms so listen/MCP never hangs)
     let seededOnce = false;
     let seedInFlight = null;
     async function ensureSeeded() {
@@ -266,7 +223,129 @@ export async function createDeadboltOrchestrator(options = {}) {
         }
         return seedInFlight;
     }
-    await Promise.race([ensureSeeded(), waitAbortable(1500)]);
+
+    try {
+        materializeBillingRepo(billingRepoDir);
+
+        stack = createKruschStack({
+            workspaceRoot: scratchWorkspaceDir,
+            dbPath: resolvedStackDbPath,
+            ephemeral: resolvedStackDbPath === ':memory:',
+            autoEmbed: false
+        });
+
+        hydraClient = (() => {
+            if (options.hydraClient) return options.hydraClient;
+            const created = createHydraDbClient({
+                apiKey: activeConfig.hydradbApiKey || '',
+                baseUrl: activeConfig.hydradbBaseUrl || 'https://api.hydradb.com',
+                database: activeConfig.hydradbDatabase || 'default-tenant',
+                collection: activeConfig.hydradbCollection || 'work_orders',
+                timeoutMs: 2500,
+                maxRetries: 0
+            });
+            if (!activeConfig.hydradbApiKey) {
+                created.apiKey = '';
+            }
+            return created;
+        })();
+
+        hydraGraphClient =
+            options.hydraGraphClient ||
+            createHydraGraphClient({
+                baseUrl: activeConfig.hydradbGraphUrl || '',
+                token: activeConfig.hydradbGraphToken || '',
+                graphId: activeConfig.hydradbGraphId || 'deadbolt-factory',
+                cellId: activeConfig.hydradbCellId || 'cell-0',
+                namespace: activeConfig.hydradbNamespace || 'default',
+                allowPrivateLan: Boolean(activeConfig.hydradbAllowLan),
+                allowTailscale: Boolean(activeConfig.hydradbAllowLan),
+                timeoutMs: 2000
+            });
+
+        kruschGitClient =
+            options.kruschGitClient !== undefined
+                ? options.kruschGitClient
+                : activeConfig.kruschGitUrl
+                  ? createKruschGitClient({
+                        baseUrl: activeConfig.kruschGitUrl,
+                        apiKey: '',
+                        timeoutMs: 1200
+                    })
+                  : null;
+
+        refinery = createRefineryEngine({
+            stack,
+            hydraClient,
+            workspaceRoot: scratchWorkspaceDir
+        });
+
+        planner = createPlannerEngine({
+            stack,
+            kruschGitClient
+        });
+
+        foundry = createFoundryEngine({
+            stack
+        });
+
+        const llmConfig = {
+            enableLiveReviewers: Boolean(activeConfig.enableLiveReviewers),
+            geminiApiKey: activeConfig.geminiApiKey || '',
+            openRouterApiKey: activeConfig.openRouterApiKey || '',
+            ollamaUrl: activeConfig.ollamaUrl || '',
+            chatImpl: options.chatImpl || activeConfig.chatImpl || null
+        };
+
+        validator = createValidatorEngine({
+            auditDbPath: resolvedAuditDbPath,
+            hmacSecret: activeConfig.auditHmacSecret,
+            llmConfig
+        });
+
+        sponsors = createSponsorHub({
+            config: activeConfig,
+            hydraClient,
+            hydraGraphClient
+        });
+
+        modernizer = createModernizerBenchmarkEngine({
+            planner,
+            foundry,
+            validator,
+            hydraClient,
+            hydraGraphClient,
+            sponsors,
+            llmConfig: {
+                ...llmConfig,
+                ollamaFastModel: activeConfig.ollamaFastModel || 'qwen2.5-coder:7b',
+                frontierBenchmarkModel:
+                    activeConfig.frontierBenchmarkModel || 'anthropic/claude-sonnet-5.5',
+                preferCloudFastTier: Boolean(activeConfig.preferCloudFastTier),
+                chatImpl: options.chatImpl || activeConfig.chatImpl || null
+            }
+        });
+
+        // Seed organizational context once at startup (cap startup network wait at 1500ms so listen/MCP never hangs)
+        await Promise.race([
+            ensureSeeded().catch(() => {
+                /* handled lazily on next hydrate call */
+            }),
+            waitAbortable(1500)
+        ]);
+    } catch (initErr) {
+        try {
+            stack?.db?.close?.();
+        } catch {
+            /* ignore cleanup error */
+        }
+        try {
+            fs.rmSync(scratchWorkspaceDir, { recursive: true, force: true });
+        } catch {
+            /* ignore cleanup error */
+        }
+        throw initErr;
+    }
 
     const MAX_VERIFIED_TASKS = 64;
     /** @type {Map<string, { workOrderId: string, validationData: object, unifiedDiff: string }>} */
@@ -328,6 +407,29 @@ export async function createDeadboltOrchestrator(options = {}) {
         const resolvedEntry =
             entryFile || targetWo.targetFiles?.[0] || 'src/fee-engine.js';
         const resolvedRepoDir = repoDir ? path.resolve(repoDir) : billingRepoDir;
+        if (repoDir && resolvedRepoDir !== billingRepoDir) {
+            if (isProtectedInternalHostTarget(resolvedRepoDir, activeConfig.projectRoot)) {
+                return errorEnvelope(
+                    'PATH_BLOCKED',
+                    'Mapping blast radius on internal runtime data or secret paths is forbidden.',
+                    null,
+                    'deadbolt.planner.blast_radius'
+                );
+            }
+            if (
+                !isLoopbackBindHost(activeConfig.host) &&
+                !activeConfig.allowLocalRepoPaths &&
+                process.env.NODE_ENV !== 'test' &&
+                !resolvedRepoDir.startsWith(scratchWorkspaceDir + path.sep)
+            ) {
+                return errorEnvelope(
+                    'PATH_BLOCKED',
+                    'Custom local repository paths are disabled when bound to a non-loopback network interface.',
+                    null,
+                    'deadbolt.planner.blast_radius'
+                );
+            }
+        }
         const resolvedRepoName =
             typeof repoName === 'string' && repoName.trim()
                 ? repoName.trim()
@@ -406,6 +508,7 @@ export async function createDeadboltOrchestrator(options = {}) {
         edits = undefined,
         runCrossModel = true
     } = {}) {
+        const cleanWoId = String(workOrderId || 'WO-101').trim() || 'WO-101';
         const hasCustomEdits = Array.isArray(edits) && edits.length > 0;
         const preset = resolvePresetEdits(mode);
         if (!hasCustomEdits && !preset) {
@@ -416,14 +519,26 @@ export async function createDeadboltOrchestrator(options = {}) {
                 'deadbolt.validator.validate'
             );
         }
+        if (!hasCustomEdits && cleanWoId.toUpperCase() !== 'WO-101') {
+            return errorEnvelope(
+                'WORK_ORDER_MISMATCH',
+                `Preset billing candidate mode "${preset.resolvedMode}" applies strictly to WO-101; provide explicit custom edits for ${cleanWoId}.`,
+                { workOrderId: cleanWoId, mode: preset.resolvedMode },
+                'deadbolt.validator.validate'
+            );
+        }
+        const matchedWo = BILLING_WORK_ORDERS.find(
+            (wo) => wo.id.toUpperCase() === cleanWoId.toUpperCase()
+        );
         const candidateEdits = hasCustomEdits ? edits : preset.edits;
         const attemptLabel = hasCustomEdits ? 'custom_candidate_edits' : preset.attemptLabel;
 
         const valEnv = await validator.validateCandidate({
-            workOrderId,
+            workOrderId: cleanWoId,
             attemptLabel,
             repoDir: billingRepoDir,
             edits: candidateEdits,
+            allowedTargetFiles: matchedWo?.targetFiles || null,
             runCrossModel: Boolean(runCrossModel)
         });
 
@@ -434,17 +549,18 @@ export async function createDeadboltOrchestrator(options = {}) {
         let stagedTaskId = null;
         if (valEnv.data.verdict === 'VERIFIED') {
             const stageEnv = foundry.stageWorkOrderEdits({
-                workOrderId,
-                goal: `Verified remediation for ${workOrderId}`,
+                workOrderId: cleanWoId,
+                goal: `Verified remediation for ${cleanWoId}`,
                 repoDir: billingRepoDir,
                 edits: candidateEdits
             });
             if (stageEnv.ok) {
                 stagedTaskId = stageEnv.data.taskId;
                 rememberVerifiedTask(stagedTaskId, {
-                    workOrderId,
+                    workOrderId: cleanWoId,
                     validationData: valEnv.data,
-                    unifiedDiff: stageEnv.data.unifiedDiff || ''
+                    unifiedDiff: stageEnv.data.unifiedDiff || '',
+                    appliedStageData: null
                 });
             }
         }
@@ -470,7 +586,7 @@ export async function createDeadboltOrchestrator(options = {}) {
     /**
      * Atomically apply a Stage-4-VERIFIED task and issue a [WO-*]-linked PR receipt via Composio Gate.
      */
-    async function applyVerifiedTask({ taskId, workOrderId = 'WO-101' } = {}) {
+    async function applyVerifiedTask({ taskId, workOrderId = '' } = {}) {
         const cleanTaskId = String(taskId || '').trim();
         if (!cleanTaskId) {
             return errorEnvelope(
@@ -486,27 +602,44 @@ export async function createDeadboltOrchestrator(options = {}) {
             return errorEnvelope(
                 'UNVERIFIED_STAGE_BLOCKED',
                 `Refusing to apply task "${cleanTaskId}": candidate has not passed Stage 4 Validator with VERIFIED verdict.`,
-                { taskId: cleanTaskId, workOrderId },
+                { taskId: cleanTaskId, workOrderId: workOrderId || 'WO-101' },
                 'deadbolt.orchestrator.apply'
             );
         }
 
-        const effectiveWoId = verifiedRecord.workOrderId || workOrderId || 'WO-101';
+        const callerWo = String(workOrderId || '').trim();
+        if (
+            callerWo &&
+            verifiedRecord.workOrderId &&
+            callerWo.toUpperCase() !== verifiedRecord.workOrderId.toUpperCase()
+        ) {
+            return errorEnvelope(
+                'WORK_ORDER_MISMATCH',
+                `Staged task "${cleanTaskId}" belongs to ${verifiedRecord.workOrderId}, not ${callerWo}.`,
+                {
+                    taskId: cleanTaskId,
+                    expectedWorkOrderId: verifiedRecord.workOrderId,
+                    requestedWorkOrderId: callerWo
+                },
+                'deadbolt.orchestrator.apply'
+            );
+        }
+
+        const effectiveWoId = verifiedRecord.workOrderId || callerWo || 'WO-101';
         const targetWo =
             BILLING_WORK_ORDERS.find((wo) => wo.id === effectiveWoId) || BILLING_WORK_ORDERS[0];
 
-        const applyEnv = foundry.applyVerifiedStage({
-            taskId: cleanTaskId,
-            applyToRepoDir: false
-        });
-        verifiedTasks.delete(cleanTaskId);
-        try {
-            foundry.releaseStage?.(cleanTaskId);
-        } catch {
-            /* ignore cleanup error */
-        }
-        if (!applyEnv.ok) {
-            return applyEnv;
+        let appliedStageData = verifiedRecord.appliedStageData || null;
+        if (!appliedStageData) {
+            const applyEnv = foundry.applyVerifiedStage({
+                taskId: cleanTaskId,
+                applyToRepoDir: false
+            });
+            if (!applyEnv.ok) {
+                return applyEnv;
+            }
+            appliedStageData = applyEnv.data;
+            verifiedRecord.appliedStageData = appliedStageData;
         }
 
         const auditEnv = validator.getAuditTrail({ limit: 10 });
@@ -531,13 +664,20 @@ export async function createDeadboltOrchestrator(options = {}) {
             return prEnv;
         }
 
+        verifiedTasks.delete(cleanTaskId);
+        try {
+            foundry.releaseStage?.(cleanTaskId);
+        } catch {
+            /* ignore cleanup error */
+        }
+
         return okEnvelope(
             'deadbolt.orchestrator.apply',
             `Applied verified task ${cleanTaskId} and dispatched linked PR receipt for [${effectiveWoId}].`,
             {
                 taskId: cleanTaskId,
                 workOrderId: effectiveWoId,
-                appliedStage: applyEnv.data,
+                appliedStage: appliedStageData,
                 sofaSync: sofaEnv.data,
                 prReceipt: prEnv.data,
                 auditChainValid: auditEnv.ok && auditEnv.data.valid === true
@@ -684,15 +824,22 @@ export async function createDeadboltOrchestrator(options = {}) {
             if (signal?.aborted) return makeAbortResult();
 
             // Stage 4: VALIDATOR (3-Attempt Self-Rejection & Remediation Loop)
+            const allowedWoFiles = [
+                ...new Set([...(targetWo.targetFiles || []), 'src/fee-engine.js'])
+            ];
             // Attempt 1: Naive per-line Math.round -> GATE_REJECTED (+1 cent batch discrepancy)
             const attempt1Env = await validator.validateCandidate({
                 workOrderId: targetWo.id,
                 attemptLabel: 'attempt_1_naive_rounding',
                 repoDir: runScratchDir,
                 edits: CANDIDATE_PATCHES.naiveAgentPatch,
+                allowedTargetFiles: allowedWoFiles,
                 runCrossModel: false,
                 signal
             });
+            if (signal?.aborted || attempt1Env.error?.code === 'VALIDATION_ABORTED') {
+                return makeAbortResult();
+            }
             const attempt1Beat = okEnvelope('deadbolt.run.attempt1', attempt1Env.summary, {
                 stage: 'validator',
                 attempt: 1,
@@ -707,9 +854,13 @@ export async function createDeadboltOrchestrator(options = {}) {
                 attemptLabel: 'attempt_2_sneaky_workaround',
                 repoDir: runScratchDir,
                 edits: CANDIDATE_PATCHES.sneakyWorkaroundPatch,
+                allowedTargetFiles: allowedWoFiles,
                 runCrossModel: false,
                 signal
             });
+            if (signal?.aborted || attempt2Env.error?.code === 'VALIDATION_ABORTED') {
+                return makeAbortResult();
+            }
             const attempt2Beat = okEnvelope(
                 'deadbolt.run.workaround_blocked',
                 attempt2Env.summary,
@@ -722,26 +873,37 @@ export async function createDeadboltOrchestrator(options = {}) {
             await emitBeat('validator.workaround_blocked', attempt2Beat);
             if (signal?.aborted) return makeAbortResult();
 
-            // Attempt 3: Legitimate integer basis-point largest-remainder fix in src/fee-engine.js -> VERIFIED
+            // Attempt 3: Legitimate integer basis-point largest-remainder fix in src/fee-engine.js -> VERIFIED (or ESCALATE_TO_HUMAN)
             const attempt3Env = await validator.validateCandidate({
                 workOrderId: targetWo.id,
                 attemptLabel: 'attempt_3_verified_remediation',
                 repoDir: runScratchDir,
                 edits: CANDIDATE_PATCHES.verifiedRemediationPatch,
+                allowedTargetFiles: allowedWoFiles,
                 runCrossModel: true,
                 signal
             });
-            const attempt3Beat = okEnvelope('deadbolt.run.verified', attempt3Env.summary, {
-                stage: 'validator',
-                attempt: 3,
-                ...attempt3Env.data
-            });
+            if (signal?.aborted || attempt3Env.error?.code === 'VALIDATION_ABORTED') {
+                return makeAbortResult();
+            }
+            const finalVerdict = attempt3Env.data?.verdict || 'GATE_REJECTED';
+            const isVerified = finalVerdict === 'VERIFIED';
+            const attempt3Beat = okEnvelope(
+                isVerified ? 'deadbolt.run.verified' : 'deadbolt.run.escalated',
+                attempt3Env.summary,
+                {
+                    stage: 'validator',
+                    attempt: 3,
+                    ...attempt3Env.data,
+                    verdict: finalVerdict
+                }
+            );
             await emitBeat('validator.verified', attempt3Beat);
             if (signal?.aborted) return makeAbortResult();
 
             // Apply verified stage to isolated run target + sync 8090 Work Order + Composio PR receipt
             let appliedStage = null;
-            if (stageEnv.ok && attempt3Env.data?.verdict === 'VERIFIED') {
+            if (stageEnv.ok && isVerified) {
                 const applyRes = foundry.applyVerifiedStage({
                     taskId: stageEnv.data.taskId,
                     applyToRepoDir: true
@@ -755,10 +917,11 @@ export async function createDeadboltOrchestrator(options = {}) {
             const sofaEnv = await sponsors.syncSoftwareFactoryWorkOrder({
                 workOrder: {
                     ...targetWo,
-                    status: 'VERIFIED',
+                    status: isVerified ? 'VERIFIED' : finalVerdict,
                     phase: '4_VALIDATOR'
                 },
-                repoDir: runScratchDir
+                repoDir: runScratchDir,
+                signal
             });
 
             const prEnv = await sponsors.dispatchVerifiedPullRequest({
@@ -783,7 +946,6 @@ export async function createDeadboltOrchestrator(options = {}) {
             );
             await emitBeat('pr.dispatched', prBeat);
 
-            const isVerified = attempt3Env.data?.verdict === 'VERIFIED';
             const [hydraFeedbackEnv] = await Promise.race([
                 Promise.all([
                     sponsors.submitHydraTaskFeedback({
@@ -794,7 +956,7 @@ export async function createDeadboltOrchestrator(options = {}) {
                     typeof sponsors.reportValidatorFeedback === 'function'
                         ? sponsors.reportValidatorFeedback({
                               workOrderId: targetWo.id,
-                              verdict: attempt3Env.data?.verdict || 'VERIFIED'
+                              verdict: finalVerdict
                           })
                         : Promise.resolve(null)
                 ]),
@@ -815,6 +977,7 @@ export async function createDeadboltOrchestrator(options = {}) {
             const telemetry = {
                 workOrderId: targetWo.id,
                 verified: isVerified,
+                finalVerdict,
                 attemptsExecuted: 3,
                 retries: 2,
                 workaroundsBlocked: 1,
@@ -850,11 +1013,19 @@ export async function createDeadboltOrchestrator(options = {}) {
             };
 
             lastRunReceipt = receiptData;
+            const deadboltOutcomeLabel = isVerified
+                ? 'VERIFIED 0c'
+                : `${finalVerdict} (promotion halted)`;
             return okEnvelope(
                 'deadbolt.orchestrator.run',
-                `Completed head-to-head governance run for ${targetWo.id} in ${totalElapsedMs}ms (Standard Agent: UNSAFE MERGE +1c vs DEADBOLT: VERIFIED 0c after blocking 1 policy-floor workaround).`,
+                `Completed head-to-head governance run for ${targetWo.id} in ${totalElapsedMs}ms (Standard Agent: UNSAFE MERGE +1c vs DEADBOLT: ${deadboltOutcomeLabel} after blocking 1 policy-floor workaround).`,
                 receiptData
             );
+        } catch (runErr) {
+            if (signal?.aborted || runErr?.name === 'AbortError') {
+                return makeAbortResult();
+            }
+            throw runErr;
         } finally {
             if (stack?.db?.prepare) {
                 try {
@@ -970,6 +1141,29 @@ export async function createDeadboltOrchestrator(options = {}) {
             }
         }
 
+        if (!looksLikeRemoteGitHubInput(cleanTarget)) {
+            if (isProtectedInternalHostTarget(cleanTarget, activeConfig.projectRoot)) {
+                return errorEnvelope(
+                    'PATH_BLOCKED',
+                    'Scanning internal runtime data or secret paths is forbidden.',
+                    null,
+                    'deadbolt.orchestrator.repo_scan'
+                );
+            }
+            if (
+                !isLoopbackBindHost(activeConfig.host) &&
+                !activeConfig.allowLocalRepoPaths &&
+                process.env.NODE_ENV !== 'test'
+            ) {
+                return errorEnvelope(
+                    'PATH_BLOCKED',
+                    'Local filesystem repository paths are disabled when bound to a non-loopback network interface. Use a public GitHub URL or built-in preset.',
+                    null,
+                    'deadbolt.orchestrator.repo_scan'
+                );
+            }
+        }
+
         return planner.scanExternalRepository({
             repoUrlOrPath: cleanTarget,
             maxFiles
@@ -1072,6 +1266,29 @@ export async function createDeadboltOrchestrator(options = {}) {
             }
         }
 
+        if (!looksLikeRemoteGitHubInput(cleanTarget)) {
+            if (isProtectedInternalHostTarget(cleanTarget, activeConfig.projectRoot)) {
+                return errorEnvelope(
+                    'PATH_BLOCKED',
+                    'Modernizing internal runtime data or secret paths is forbidden.',
+                    null,
+                    'deadbolt.orchestrator.repo_modernize'
+                );
+            }
+            if (
+                !isLoopbackBindHost(activeConfig.host) &&
+                !activeConfig.allowLocalRepoPaths &&
+                process.env.NODE_ENV !== 'test'
+            ) {
+                return errorEnvelope(
+                    'PATH_BLOCKED',
+                    'Local filesystem repository paths are disabled when bound to a non-loopback network interface. Use a public GitHub URL or built-in preset.',
+                    null,
+                    'deadbolt.orchestrator.repo_modernize'
+                );
+            }
+        }
+
         return modernizer.runModernizationComparison({
             repoUrlOrPath: cleanTarget,
             targetFile,
@@ -1141,8 +1358,33 @@ export async function createDeadboltOrchestrator(options = {}) {
         };
         const candidateWoCodes = new Set(aliasMap[upperWo] || [upperWo]);
 
-        const auditEnv = validator.getAuditTrail({ limit: 50 });
-        if (!auditEnv.ok || !auditEnv.data?.valid) {
+        let chainValid = false;
+        let matchedEntry = null;
+        if (typeof validator.findLatestVerifiedEntry === 'function') {
+            const lookup = validator.findLatestVerifiedEntry({
+                resourceCodes: [...candidateWoCodes]
+            });
+            chainValid = Boolean(lookup?.ok && lookup?.valid);
+            matchedEntry = lookup?.matchedEntry || null;
+        } else {
+            const auditEnv = validator.getAuditTrail({ limit: 200 });
+            chainValid = Boolean(auditEnv.ok && auditEnv.data?.valid);
+            const entries = Array.isArray(auditEnv.data?.entries) ? auditEnv.data.entries : [];
+            matchedEntry =
+                entries.find((entry) => {
+                    if (
+                        entry?.action !== 'validator.verified' ||
+                        entry?.actor !== 'deadbolt-validator-gate' ||
+                        entry?.outcome !== 'SUCCESS'
+                    ) {
+                        return false;
+                    }
+                    const resourceCode = String(entry?.resource || '').trim().toUpperCase();
+                    return candidateWoCodes.has(resourceCode);
+                }) || null;
+        }
+
+        if (!chainValid) {
             return errorEnvelope(
                 'AUDIT_TAMPERED',
                 'Cannot sync governance receipt: SHA-256 audit chain verification failed.',
@@ -1150,16 +1392,6 @@ export async function createDeadboltOrchestrator(options = {}) {
                 'deadbolt.orchestrator.sofa_sync'
             );
         }
-
-        const entries = Array.isArray(auditEnv.data?.entries) ? auditEnv.data.entries : [];
-        const matchedEntry = entries.find((entry) => {
-            const isVerifiedEntry =
-                entry?.action === 'validator.verified' ||
-                entry?.metadata?.verdict === 'VERIFIED';
-            if (!isVerifiedEntry) return false;
-            const resourceCode = String(entry?.resource || '').trim().toUpperCase();
-            return candidateWoCodes.has(resourceCode);
-        });
 
         if (!matchedEntry) {
             const knownLocal = BILLING_WORK_ORDERS.some((wo) =>
@@ -1195,13 +1427,11 @@ export async function createDeadboltOrchestrator(options = {}) {
             );
         }
 
-        const entryHash = String(
-            matchedEntry.entryHash || matchedEntry.hash || auditEnv.data?.tailHash || ''
-        ).trim();
-        if (!entryHash) {
+        const entryHash = String(matchedEntry.entryHash || matchedEntry.hash || '').trim();
+        if (!/^[0-9a-f]{64}$/i.test(entryHash)) {
             return errorEnvelope(
                 'UNVERIFIED_STAGE_BLOCKED',
-                `Missing cryptographic SHA-256 entry hash for ${safeWoId}.`,
+                `Missing valid 64-hex cryptographic SHA-256 entry hash for ${safeWoId}.`,
                 { workOrderId: safeWoId },
                 'deadbolt.orchestrator.sofa_sync'
             );

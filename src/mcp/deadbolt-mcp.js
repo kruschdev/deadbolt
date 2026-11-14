@@ -223,10 +223,18 @@ function wrapOrchestratorOutcome(toolName, outcome, fallbackSummary) {
   }
 
   if (outcome.ok === true && Object.hasOwn(outcome, 'data')) {
-    return okMcpResult(toolName, outcome.summary || fallbackSummary, outcome.data);
+    return okMcpResult(
+      toolName,
+      scrubPrivateNetworkStrings(outcome.summary || fallbackSummary),
+      scrubPrivateNetworkStrings(outcome.data)
+    );
   }
 
-  return okMcpResult(toolName, outcome.summary || fallbackSummary, outcome);
+  return okMcpResult(
+    toolName,
+    scrubPrivateNetworkStrings(outcome.summary || fallbackSummary),
+    scrubPrivateNetworkStrings(outcome)
+  );
 }
 
 /**

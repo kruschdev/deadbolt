@@ -20,73 +20,83 @@ const TAILSCALE_CGNAT_IPV4_RE =
 const RFC1918_10_IPV4_RE = /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g;
 const RFC1918_192_IPV4_RE = /\b192\.168\.\d{1,3}\.\d{1,3}\b/g;
 const RFC1918_172_IPV4_RE = /\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/g;
-const TAILSCALE_IPV6_RE = /\bfd7a:115c:a1e0:(?:[0-9a-fA-F:]*[0-9a-fA-F]\b|:*)/gi;
+const LINK_LOCAL_IPV4_RE = /\b169\.254\.\d{1,3}\.\d{1,3}\b/g;
+const TAILSCALE_IPV6_RE = /(?<![0-9a-fA-F:])\bfd7a:115c:a1e0:(?:[0-9a-fA-F:]*[0-9a-fA-F]\b|:*)/gi;
+const BRACKETED_PRIVATE_IPV6_RE = /\[(?:f[cd][0-9a-f]{2}|fe80):[0-9a-f:]+\]/gi;
+const RFC4193_ULA_IPV6_RE =
+    /(?<![0-9a-fA-F:])\bf[cd][0-9a-f]{2}:[0-9a-f:]{2,}(?=\b|[^0-9a-f:]|$)/gi;
+const LINK_LOCAL_IPV6_RE =
+    /(?<![0-9a-fA-F:])\bfe80:[0-9a-f:]{2,}(?=\b|[^0-9a-f:]|$)/gi;
 const LOOPBACK_INTERNAL_URL_RE =
-    /\bhttps?:\/\/(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.0\.0\.0|\[::1\])(?::\d{1,5})?(?:\/[^\s"'`):,\]]*)?/gi;
+    /\bhttps?:\/\/(?:[^\s/@]+@)?(?:localhost(?:\.localdomain)?|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.0\.0\.0|\[::1\])(?::\d{1,5})?(?:\/[^\s"'`):,\]]*)?/gi;
 const LOOPBACK_HOST_PORT_RE =
-    /\b(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\]):\d{2,5}\b/gi;
-const LOOPBACK_IPV4_RE = /\b127\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g;
-const LOCAL_HOME_PATH_RE = /(?<![A-Za-z0-9._-])\/home\/[A-Za-z0-9._-]+(?:\/[^\s"'`):,\]]+)*/g;
-const LOCAL_USERS_PATH_RE = /(?<![A-Za-z0-9._-])\/Users\/[A-Za-z0-9._-]+(?:\/[^\s"'`):,\]]+)*/g;
+    /(?:(?<=\s|^|["'(])\[::1\]|\b(?:localhost(?:\.localdomain)?|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.0\.0\.0)):\d{1,5}\b/gi;
+const LOOPBACK_IPV4_RE = /\b(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.0\.0\.0)\b/g;
+const LOOPBACK_HOST_LITERAL_RE =
+    /(?:\[::1\]|(?<![0-9a-fA-F:])::1(?![0-9a-fA-F:])|\blocalhost(?:\.localdomain)?\b)/gi;
+const LOCAL_FS_PATH_RE =
+    /(?<![A-Za-z0-9._-])\/(?:(?:home|Users)\/[A-Za-z0-9._-]+(?:\/[^\s"'`):,\]]+)*|(?:private\/tmp|var\/folders|tmp|mnt)\/[A-Za-z0-9._/-]+|root\/[A-Za-z0-9._/-]*)/g;
+const BEARER_TOKEN_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/g;
 const SECRET_TOKEN_RE =
-    /\b(?:sofa-(?:admin|ext)-[A-Za-z0-9_-]+|sf-rpt-[A-Za-z0-9_-]+|ck_[A-Za-z0-9_-]{8,}|sk-(?:or-v1-)?[A-Za-z0-9_-]{12,}|xi-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})\b/g;
+    /\b(?:sofa-(?:admin|ext)-[A-Za-z0-9_-]+|sf-rpt-[A-Za-z0-9_-]+|ak_[A-Za-z0-9_-]{8,}|ck_[A-Za-z0-9_-]{8,}|hdb_[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|sk_[A-Za-z0-9_-]{16,}|sk-(?:or-v1-)?[A-Za-z0-9_-]{12,}|xi-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})\b/g;
 const EMAIL_ADDRESS_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 
 const REDACTED_PRIVATE_HOST = '[redacted-private-host]';
 const REDACTED_PATH = '[REDACTED_PATH]';
+const REDACTED_TOKEN = 'Bearer [REDACTED_TOKEN]';
 const REDACTED_SECRET = '[REDACTED_SECRET]';
 const REDACTED_EMAIL = '[REDACTED_EMAIL]';
-const MAX_SCRUB_DEPTH = 12;
-const MAX_LEAF_FALLBACK_DEPTH = 32;
+const REDACTED_DEPTH = '[REDACTED_DEPTH]';
+const REDACTED_CYCLE = '[REDACTED_CYCLE]';
+const MAX_SCRUB_DEPTH = 24;
 
 function scrubString(str) {
     return str
+        .replace(BEARER_TOKEN_RE, REDACTED_TOKEN)
         .replace(SECRET_TOKEN_RE, REDACTED_SECRET)
-        .replace(EMAIL_ADDRESS_RE, REDACTED_EMAIL)
-        .replace(LOCAL_HOME_PATH_RE, REDACTED_PATH)
-        .replace(LOCAL_USERS_PATH_RE, REDACTED_PATH)
         .replace(LOOPBACK_INTERNAL_URL_RE, REDACTED_PRIVATE_HOST)
+        .replace(EMAIL_ADDRESS_RE, REDACTED_EMAIL)
+        .replace(LOCAL_FS_PATH_RE, REDACTED_PATH)
         .replace(LOOPBACK_HOST_PORT_RE, REDACTED_PRIVATE_HOST)
         .replace(LOOPBACK_IPV4_RE, REDACTED_PRIVATE_HOST)
+        .replace(LOOPBACK_HOST_LITERAL_RE, REDACTED_PRIVATE_HOST)
+        .replace(LINK_LOCAL_IPV4_RE, REDACTED_PRIVATE_HOST)
         .replace(TAILSCALE_CGNAT_IPV4_RE, REDACTED_PRIVATE_HOST)
         .replace(RFC1918_10_IPV4_RE, REDACTED_PRIVATE_HOST)
         .replace(RFC1918_192_IPV4_RE, REDACTED_PRIVATE_HOST)
         .replace(RFC1918_172_IPV4_RE, REDACTED_PRIVATE_HOST)
-        .replace(TAILSCALE_IPV6_RE, REDACTED_PRIVATE_HOST);
+        .replace(BRACKETED_PRIVATE_IPV6_RE, REDACTED_PRIVATE_HOST)
+        .replace(TAILSCALE_IPV6_RE, REDACTED_PRIVATE_HOST)
+        .replace(RFC4193_ULA_IPV6_RE, REDACTED_PRIVATE_HOST)
+        .replace(LINK_LOCAL_IPV6_RE, REDACTED_PRIVATE_HOST);
 }
 
-function shallowScrubLeaves(target) {
-    if (Array.isArray(target)) {
-        return target.map((item) => (typeof item === 'string' ? scrubString(item) : item));
-    }
-    const proto = Object.getPrototypeOf(target);
-    if (proto === null || proto === Object.prototype) {
-        const out = {};
-        for (const [k, v] of Object.entries(target)) {
-            out[k] = typeof v === 'string' ? scrubString(v) : v;
-        }
-        return out;
-    }
-    return target;
-}
-
-function scrubPrivateNetworkRecursive(value, depth, ancestors) {
+function scrubValue(value, depth, ancestors) {
     if (typeof value === 'string') {
         return scrubString(value);
     }
     if (value === null || value === undefined || typeof value !== 'object') {
         return value;
     }
-    if (ancestors.has(value)) {
-        return shallowScrubLeaves(value);
+    if (value instanceof Error) {
+        return {
+            name: scrubString(String(value.name || 'Error')),
+            message: scrubString(String(value.message || ''))
+        };
     }
-    if (depth >= MAX_SCRUB_DEPTH && depth >= MAX_LEAF_FALLBACK_DEPTH) {
-        return shallowScrubLeaves(value);
+    if (value instanceof URL) {
+        return scrubString(value.toString());
+    }
+    if (ancestors.has(value)) {
+        return REDACTED_CYCLE;
+    }
+    if (depth > MAX_SCRUB_DEPTH) {
+        return REDACTED_DEPTH;
     }
     if (Array.isArray(value)) {
         ancestors.add(value);
         try {
-            return value.map((item) => scrubPrivateNetworkRecursive(item, depth + 1, ancestors));
+            return value.map((item) => scrubValue(item, depth + 1, ancestors));
         } finally {
             ancestors.delete(value);
         }
@@ -97,7 +107,7 @@ function scrubPrivateNetworkRecursive(value, depth, ancestors) {
         try {
             const out = {};
             for (const [k, v] of Object.entries(value)) {
-                out[k] = scrubPrivateNetworkRecursive(v, depth + 1, ancestors);
+                out[k] = scrubValue(v, depth + 1, ancestors);
             }
             return out;
         } finally {
@@ -108,9 +118,8 @@ function scrubPrivateNetworkRecursive(value, depth, ancestors) {
 }
 
 /**
- * Recursively redact private/loopback hosts, local paths, secret tokens, and email addresses
- * across strings, arrays, and plain objects (depth 12 with leaf-preserving fallback) per INV-DB-08.
- * Never replaces nested objects or arrays with empty `{}` or `[]`.
+ * Recursively redact private/loopback/link-local hosts, local paths, secret/Bearer tokens, Error stacks,
+ * and email addresses across strings, arrays, and plain objects (up to depth 24) per INV-DB-08.
  *
  * @param {unknown} value
  * @param {number} [depth=0]
@@ -118,7 +127,7 @@ function scrubPrivateNetworkRecursive(value, depth, ancestors) {
  */
 export function scrubPrivateNetworkStrings(value, depth = 0) {
     const startDepth = Number.isInteger(depth) && depth >= 0 ? depth : 0;
-    return scrubPrivateNetworkRecursive(value, startDepth, new WeakSet());
+    return scrubValue(value, startDepth, new WeakSet());
 }
 
 function resolveResponseTarget(res) {
@@ -609,6 +618,10 @@ export function createHydraGraphClient(options = {}) {
         activeCode = 'INV-FIN-03'
     } = {}) {
         const cleanWoId = String(workOrderId || 'WO-101').trim();
+        const rawDigits = String(cleanWoId).replace(/\D+/g, '').slice(0, 9);
+        const numericWoSuffix = Number(rawDigits) || 101;
+        const woVertexId =
+            cleanWoId.toUpperCase() === 'WO-101' ? 9001 : 9000 + numericWoSuffix;
         const orderedFiles =
             Array.isArray(hopFiles) && hopFiles.length >= 2
                 ? hopFiles.map((f) => String(f).trim()).filter(Boolean)
@@ -630,6 +643,7 @@ export function createHydraGraphClient(options = {}) {
                     graphId: cleanGraphId,
                     cellId: cleanCellId,
                     workOrderId: cleanWoId,
+                    woVertexId,
                     verticesPrepared: fileVertices.length + 3
                 }
             );
@@ -648,6 +662,7 @@ export function createHydraGraphClient(options = {}) {
                     graphId: cleanGraphId,
                     cellId: cleanCellId,
                     workOrderId: cleanWoId,
+                    woVertexId,
                     verticesPrepared: fileVertices.length + 3
                 }
             );
@@ -674,7 +689,7 @@ export function createHydraGraphClient(options = {}) {
         const governedRes = await queryOpenCypher(
             'MERGE (wo:WorkOrder {id: $woId, code: $woCode})-[:GOVERNED_BY]->(curr:Invariant {id: $currInvId})',
             {
-                woId: 9001,
+                woId: woVertexId,
                 woCode: cleanWoId,
                 currInvId: 8003
             }
@@ -705,7 +720,7 @@ export function createHydraGraphClient(options = {}) {
         const targetEdgeRes = await queryOpenCypher(
             'MERGE (wo:WorkOrder {id: $woId})-[:TARGETS]->(entry:CodeFile {id: $entryId})',
             {
-                woId: 9001,
+                woId: woVertexId,
                 entryId: fileVertices[0].vertexId
             }
         );
@@ -718,7 +733,7 @@ export function createHydraGraphClient(options = {}) {
                 'MATCH (wo:WorkOrder {id: $woId})-[:GOVERNED_BY]->(curr:Invariant)-[:SUPERSEDES]->(prev:Invariant)',
                 'RETURN wo.id AS woVertexId, curr.id AS activeInvVertexId, prev.id AS supersededInvVertexId'
             ].join('\n'),
-            { woId: 9001 }
+            { woId: woVertexId }
         );
         if (!lineageRes.ok) {
             return toDegradedLineageFallback(lineageRes);
@@ -733,6 +748,7 @@ export function createHydraGraphClient(options = {}) {
                 graphId: cleanGraphId,
                 cellId: cleanCellId,
                 workOrderId: cleanWoId,
+                woVertexId,
                 fileVertices,
                 lineageRecord: lineageRes.data.records[0] || null
             }

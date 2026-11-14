@@ -17,8 +17,12 @@ function hydrateExternalEnvFile(filePath) {
             const eqIdx = trimmed.indexOf('=');
             if (eqIdx <= 0) continue;
             const key = trimmed.slice(0, eqIdx).trim();
-            const val = trimmed.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, '');
-            if (key && !(key in process.env)) {
+            let rawVal = trimmed.slice(eqIdx + 1).trim();
+            if (!/^['"]/.test(rawVal)) {
+                rawVal = rawVal.replace(/\s+#.*$/, '').trim();
+            }
+            const val = rawVal.replace(/^['"]|['"]$/g, '').trim();
+            if (key && val !== '' && !(key in process.env)) {
                 process.env[key] = val;
             }
         }
@@ -27,7 +31,9 @@ function hydrateExternalEnvFile(filePath) {
     }
 }
 
-hydrateExternalEnvFile(path.join(projectRoot, '.env'));
+if (process.env.NODE_ENV !== 'test') {
+    hydrateExternalEnvFile(path.join(projectRoot, '.env'));
+}
 if (process.env.DEADBOLT_LOAD_HOME_ENV !== 'false' && process.env.NODE_ENV !== 'test') {
     hydrateExternalEnvFile(path.join(os.homedir(), '.evolve.env'));
 }
@@ -69,8 +75,16 @@ function resolvePersistentAuditHmacSecret(auditDbPath, explicitSecret) {
         }
         fs.mkdirSync(path.dirname(keyFilePath), { recursive: true });
         const generated = crypto.randomBytes(32).toString('hex');
-        fs.writeFileSync(keyFilePath, `${generated}\n`, { mode: 0o600 });
-        return generated;
+        try {
+            fs.writeFileSync(keyFilePath, `${generated}\n`, { mode: 0o600, flag: 'wx' });
+            return generated;
+        } catch (writeErr) {
+            if (writeErr?.code === 'EEXIST') {
+                const raced = fs.readFileSync(keyFilePath, 'utf8').trim();
+                if (raced.length >= 32) return raced;
+            }
+            throw writeErr;
+        }
     } catch {
         return crypto.randomBytes(32).toString('hex');
     }
@@ -81,6 +95,13 @@ const runtimeHmacSecret = resolvePersistentAuditHmacSecret(resolvedAuditDbPath, 
 const resolvedGeminiApiKey = envOr('GEMINI_API_KEY', baseConfig.geminiApiKey, '');
 const resolvedOpenRouterApiKey = envOr('OPENROUTER_API_KEY', baseConfig.openRouterApiKey, '');
 const defaultEnableLiveReviewers = Boolean(resolvedOpenRouterApiKey || resolvedGeminiApiKey);
+const rawEnableLiveEnv = String(process.env.ENABLE_LIVE_REVIEWERS ?? '').trim();
+const resolvedEnableLiveReviewers =
+    rawEnableLiveEnv !== ''
+        ? envBool('ENABLE_LIVE_REVIEWERS', baseConfig.enableLiveReviewers, defaultEnableLiveReviewers)
+        : typeof baseConfig.enableLiveReviewers === 'boolean'
+          ? baseConfig.enableLiveReviewers
+          : defaultEnableLiveReviewers;
 
 export const config = Object.freeze({
     projectRoot,
@@ -128,10 +149,7 @@ export const config = Object.freeze({
     elevenlabsModelId: envOr('ELEVENLABS_MODEL_ID', baseConfig.elevenlabsModelId, 'eleven_turbo_v2_5'),
     geminiApiKey: resolvedGeminiApiKey,
     openRouterApiKey: resolvedOpenRouterApiKey,
-    enableLiveReviewers: envBool(
-        'ENABLE_LIVE_REVIEWERS',
-        baseConfig.enableLiveReviewers,
-        defaultEnableLiveReviewers
-    ),
+    enableLiveReviewers: resolvedEnableLiveReviewers,
+    allowLocalRepoPaths: envBool('ALLOW_LOCAL_REPO_PATHS', baseConfig.allowLocalRepoPaths, false),
     auditHmacSecret: runtimeHmacSecret
 });

@@ -19,6 +19,7 @@ import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { selectCascadeTier, createTierCircuitBreaker } from '@krusch/toolkit/cascade';
 import { scoreLegoBrickCoverage, auditBoilerplateText } from '@krusch/toolkit/catalog';
 import { validateOutboundUrl, isPrivateOrReservedIp } from '@krusch/toolkit/security';
+import { scrubPrivateNetworkStrings } from '../connectors/hydradb-graph.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -261,6 +262,7 @@ export function normalizeGitHubRepoInput(rawInput) {
   const hasDotTraversal = /(?:^|[/:\\])\.\.(?:[\/\\]|$)|%2e%2e/i.test(rawPathPortion);
 
   const cleanPathname = parsed.pathname.replace(/\/+$/, '');
+  let hasMalformedEncoding = false;
   const rawSegments = cleanPathname
     .replace(/^\/+/, '')
     .split('/')
@@ -269,12 +271,23 @@ export function normalizeGitHubRepoInput(rawInput) {
       try {
         return decodeURIComponent(seg);
       } catch {
+        hasMalformedEncoding = true;
         return seg;
       }
     });
 
+  const hasDecodedTraversal = rawSegments.some((seg) => {
+    const decodedSubSegments = seg.split(/[\/\\]/).filter(Boolean);
+    return (
+      decodedSubSegments.length === 0 ||
+      decodedSubSegments.some((sub) => sub === '.' || sub === '..' || sub.includes('\0'))
+    );
+  });
+
   if (
     hasDotTraversal ||
+    hasMalformedEncoding ||
+    hasDecodedTraversal ||
     rawSegments.length < 2 ||
     rawSegments.some(
       (seg) => seg === '.' || seg === '..' || seg.includes('\\') || seg.includes('\0')
@@ -317,7 +330,11 @@ export function normalizeGitHubRepoInput(rawInput) {
 
   let hintedFile = '';
   if (rawSegments[2] === 'blob' && rawSegments.length >= 5) {
-    hintedFile = rawSegments.slice(4).join('/').replace(/^\/+|\/+$/g, '');
+    hintedFile = rawSegments
+      .slice(4)
+      .join('/')
+      .replace(/\/+/g, '/')
+      .replace(/^\/+|\/+$/g, '');
   }
 
   const repoSlug = `${owner}/${repo}`;
@@ -535,13 +552,43 @@ function resolveSafeNonSymlinkFile(resolvedRoot, relPath) {
 }
 
 /**
+ * Validate whether a repository-relative `hintedFile` candidate obeys dotfile, skipped-dir,
+ * sensitive-segment, and scannable-extension rules.
+ * @param {string} relCandidate
+ * @returns {boolean}
+ */
+function isAllowedHintedRelPath(relCandidate) {
+  const clean = normalizeRelPath(relCandidate);
+  if (!clean || clean.includes('\0')) return false;
+  const ext = path.extname(clean).toLowerCase();
+  if (!SCANNABLE_EXTENSIONS.has(ext)) return false;
+  const segments = clean.split('/').filter(Boolean);
+  if (segments.length === 0) return false;
+  for (const seg of segments) {
+    const lower = seg.toLowerCase();
+    if (
+      seg === '.' ||
+      seg === '..' ||
+      seg.startsWith('.') ||
+      SKIPPED_SCAN_DIRS.has(seg) ||
+      SKIPPED_SCAN_DIRS.has(lower) ||
+      SENSITIVE_SEGMENT_NAMES.has(seg) ||
+      SENSITIVE_SEGMENT_NAMES.has(lower)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Collect candidate non-binary files (`<= 256 KB`) up to `walkCap`, sort by priority tier
  * (`0: hintedFile`, `1: core dirs/entrypoints`, `2: normal`, `3: tests/docs/examples/vendor`),
  * and slice to `maxFiles`.
  * @param {string} rootDir
  * @param {number} maxFiles
  * @param {{ hintedFile?: string, walkCap?: number }} [options={}]
- * @returns {{ files: string[], truncatedOrFiltered: boolean }}
+ * @returns {{ files: string[], truncatedOrFiltered: boolean, resolvedHinted: string, hintBlocked: boolean }}
  */
 function collectPrioritizedRepoFiles(rootDir, maxFiles = 200, options = {}) {
   const effectiveMaxFiles = Math.max(1, Math.trunc(Number(maxFiles) || 200));
@@ -556,20 +603,20 @@ function collectPrioritizedRepoFiles(rootDir, maxFiles = 200, options = {}) {
   const probeBuf = Buffer.allocUnsafe(4096);
   let truncatedOrFiltered = false;
 
-  const isEligibleCodeFile = (fullPath) => {
+  const checkEligibleCodeFile = (fullPath, recordFiltered = true) => {
     let st = null;
     try {
       st = fs.lstatSync(fullPath);
     } catch {
-      truncatedOrFiltered = true;
+      if (recordFiltered) truncatedOrFiltered = true;
       return false;
     }
     if (st.isSymbolicLink() || !st.isFile()) {
-      truncatedOrFiltered = true;
+      if (recordFiltered) truncatedOrFiltered = true;
       return false;
     }
     if (st.size > MAX_SCANNABLE_FILE_BYTES) {
-      truncatedOrFiltered = true;
+      if (recordFiltered) truncatedOrFiltered = true;
       return false;
     }
     if (st.size === 0) {
@@ -581,12 +628,12 @@ function collectPrioritizedRepoFiles(rootDir, maxFiles = 200, options = {}) {
       const toRead = Math.min(4096, st.size);
       const bytesRead = fs.readSync(fd, probeBuf, 0, toRead, 0);
       if (probeBuf.subarray(0, bytesRead).includes(0)) {
-        truncatedOrFiltered = true;
+        if (recordFiltered) truncatedOrFiltered = true;
         return false;
       }
       return true;
     } catch {
-      truncatedOrFiltered = true;
+      if (recordFiltered) truncatedOrFiltered = true;
       return false;
     } finally {
       if (fd !== null) {
@@ -617,41 +664,112 @@ function collectPrioritizedRepoFiles(rootDir, maxFiles = 200, options = {}) {
         truncatedOrFiltered = true;
         break;
       }
-      if (entry.name.startsWith('.') || SKIPPED_SCAN_DIRS.has(entry.name)) continue;
-      if (entry.isSymbolicLink()) continue;
+      if (entry.name.startsWith('.') || SKIPPED_SCAN_DIRS.has(entry.name)) {
+        truncatedOrFiltered = true;
+        continue;
+      }
+      if (entry.isSymbolicLink()) {
+        truncatedOrFiltered = true;
+        continue;
+      }
 
       const fullPath = path.join(currentDir, entry.name);
       if (entry.isDirectory()) {
         walk(fullPath);
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
-        if (SCANNABLE_EXTENSIONS.has(ext) && isEligibleCodeFile(fullPath)) {
+        if (!SCANNABLE_EXTENSIONS.has(ext)) {
+          truncatedOrFiltered = true;
+        } else if (checkEligibleCodeFile(fullPath, true)) {
           const rel = path.relative(resolvedRoot, fullPath).replace(/\\/g, '/');
           if (!candidateSet.has(rel)) {
             candidateSet.add(rel);
             candidates.push(rel);
           }
         }
+      } else {
+        truncatedOrFiltered = true;
       }
     }
   }
 
   walk(resolvedRoot);
 
-  if (normalizedHinted && !candidateSet.has(normalizedHinted)) {
-    const hintedExt = path.extname(normalizedHinted).toLowerCase();
-    if (SCANNABLE_EXTENSIONS.has(hintedExt)) {
-      const safeHintedAbs = resolveSafeNonSymlinkFile(resolvedRoot, normalizedHinted);
-      if (safeHintedAbs && isEligibleCodeFile(safeHintedAbs)) {
-        candidateSet.add(normalizedHinted);
-        candidates.push(normalizedHinted);
+  let resolvedHinted = '';
+  let hintBlocked = false;
+  if (normalizedHinted) {
+    const rawHintSegments = normalizedHinted.split('/').filter(Boolean);
+    const hasForbiddenHintSegment =
+      normalizedHinted.includes('\0') ||
+      rawHintSegments.some((seg) => {
+        const lower = seg.toLowerCase();
+        return (
+          seg === '.' ||
+          seg === '..' ||
+          seg.startsWith('.') ||
+          SKIPPED_SCAN_DIRS.has(seg) ||
+          SKIPPED_SCAN_DIRS.has(lower) ||
+          SENSITIVE_SEGMENT_NAMES.has(seg) ||
+          SENSITIVE_SEGMENT_NAMES.has(lower)
+        );
+      });
+
+    if (hasForbiddenHintSegment) {
+      hintBlocked = true;
+    } else {
+      let exactExistsOnDisk = false;
+      try {
+        fs.lstatSync(path.join(resolvedRoot, normalizedHinted));
+        exactExistsOnDisk = true;
+      } catch {
+        exactExistsOnDisk = false;
       }
+
+      if (exactExistsOnDisk) {
+        if (isAllowedHintedRelPath(normalizedHinted)) {
+          const safeHintedAbs = resolveSafeNonSymlinkFile(resolvedRoot, normalizedHinted);
+          if (
+            safeHintedAbs &&
+            !isSensitiveLocalPath(safeHintedAbs) &&
+            checkEligibleCodeFile(safeHintedAbs, false)
+          ) {
+            resolvedHinted = normalizedHinted;
+          } else {
+            hintBlocked = true;
+          }
+        } else {
+          hintBlocked = true;
+        }
+      } else if (rawHintSegments.length >= 2) {
+        const matchedSuffixes = [];
+        for (let idx = 1; idx < rawHintSegments.length; idx += 1) {
+          const suffixRel = rawHintSegments.slice(idx).join('/');
+          if (!isAllowedHintedRelPath(suffixRel)) continue;
+          const safeSuffixAbs = resolveSafeNonSymlinkFile(resolvedRoot, suffixRel);
+          if (
+            safeSuffixAbs &&
+            !isSensitiveLocalPath(safeSuffixAbs) &&
+            checkEligibleCodeFile(safeSuffixAbs, false)
+          ) {
+            matchedSuffixes.push(suffixRel);
+          }
+        }
+        if (matchedSuffixes.length === 1) {
+          resolvedHinted = matchedSuffixes[0];
+        }
+      }
+    }
+
+    if (resolvedHinted && !candidateSet.has(resolvedHinted)) {
+      candidateSet.add(resolvedHinted);
+      candidates.push(resolvedHinted);
     }
   }
 
+  const priorityHint = resolvedHinted || (!hintBlocked ? normalizedHinted : '');
   candidates.sort((a, b) => {
-    const pa = classifyScanFilePriority(a, normalizedHinted);
-    const pb = classifyScanFilePriority(b, normalizedHinted);
+    const pa = classifyScanFilePriority(a, priorityHint);
+    const pb = classifyScanFilePriority(b, priorityHint);
     if (pa !== pb) return pa - pb;
     return compareCodePathsAlpha(a, b);
   });
@@ -660,13 +778,17 @@ function collectPrioritizedRepoFiles(rootDir, maxFiles = 200, options = {}) {
     truncatedOrFiltered = true;
     return {
       files: candidates.slice(0, effectiveMaxFiles),
-      truncatedOrFiltered
+      truncatedOrFiltered,
+      resolvedHinted,
+      hintBlocked
     };
   }
 
   return {
     files: candidates,
-    truncatedOrFiltered
+    truncatedOrFiltered,
+    resolvedHinted,
+    hintBlocked
   };
 }
 
@@ -691,7 +813,7 @@ function extractRelativeSpecifiers(source) {
   const specifiers = new Set();
 
   const patterns = [
-    /\b(?:import|export)\s+(?:[^'"]*?\s+from\s+)?['"](\.\.?\/[^'"]+)['"]/g,
+    /\b(?:import|export)\s+(?:[^'";\r\n]{1,400}?\s+from\s+)?['"](\.\.?\/[^'"]+)['"]/g,
     /\bimport\s*\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g,
     /\brequire\s*\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g
   ];
@@ -1265,7 +1387,7 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
       const masked = maskCodePreservingNewlines(entry.content, { maskStrings: false });
       const specs = new Set();
       const jsPatterns = [
-        /\b(?:import|export)\s+(?:[^'";]*?\s+from\s+)?['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]/g,
+        /\b(?:import|export)\s+(?:[^'";]{1,600}?\s+from\s+)?['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]/g,
         /\b(?:import|require)\s*\(\s*['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]\s*\)/g
       ];
       for (const regex of jsPatterns) {
@@ -1924,6 +2046,7 @@ function extractPhpFileSymbols(source, relFile) {
 
   for (let idx = 0; idx < lines.length; idx += 1) {
     const line = lines[idx];
+    if (line.length > 2000) continue;
     const lineNo = idx + 1;
 
     const nsMatch = line.match(/\bnamespace\s+([A-Za-z_\\][A-Za-z0-9_\\]*)\s*;/);
@@ -2099,6 +2222,7 @@ function extractPolyglotFileSymbols(source, relFile, ext) {
 
   for (let idx = 0; idx < lines.length; idx += 1) {
     const line = lines[idx];
+    if (line.length > 2000) continue;
     const lineNo = idx + 1;
 
     const typeMatch = line.match(
@@ -2111,7 +2235,7 @@ function extractPolyglotFileSymbols(source, relFile, ext) {
     const fnMatch =
       line.match(/\b(?:func|fn|def|fun)\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_?!]*)/) ||
       line.match(
-        /\b(?:public|protected|private|internal)\s+(?:(?:static|final|virtual|override|async|synchronized)\s+)*[A-Za-z0-9_<>\[\].,?\s]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/
+        /\b(?:public|protected|private|internal)\s+(?:(?:static|final|virtual|override|async|synchronized)\s+)*(?:[A-Za-z0-9_<>\[\].,?*]+\s+){1,6}([A-Za-z_][A-Za-z0-9_]*)\s*\(/
       );
     if (
       fnMatch &&
@@ -2627,7 +2751,9 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         ...(remoteRepoCount !== null ? { remoteRepoCount } : {})
       };
     } catch (err) {
-      const scrubbedError = scrubPrivateIpLiterals(String(err?.message || 'unreachable'));
+      const scrubbedError = scrubPrivateIpLiterals(
+        String(scrubPrivateNetworkStrings(String(err?.message || 'unreachable')))
+      );
       return {
         configured: true,
         connected: false,
@@ -3052,7 +3178,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
     const safeMaxFiles = Math.max(1, Math.min(200, Math.trunc(Number(maxFiles) || 60)));
     const normalizedInput = normalizeGitHubRepoInput(rawTarget);
-    const effectiveHintedFile = normalizeRelPath(hintedFile || normalizedInput.hintedFile || '');
+    let effectiveHintedFile = normalizeRelPath(hintedFile || normalizedInput.hintedFile || '');
 
     let tempCloneDir = null;
     let scanRoot = '';
@@ -3097,10 +3223,25 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           await execFileAsync(
             'git',
             [
+              '-c',
+              'credential.helper=',
+              '-c',
+              'core.askPass=',
+              '-c',
+              'core.symlinks=false',
+              '-c',
+              'protocol.file.allow=never',
+              '-c',
+              'filter.lfs.smudge=',
+              '-c',
+              'filter.lfs.process=',
+              '-c',
+              'filter.lfs.required=false',
               'clone',
               '--depth',
               '1',
               '--single-branch',
+              '--no-tags',
               '--filter=blob:limit=256k',
               '--',
               cleanHttpsUrl,
@@ -3111,15 +3252,22 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
               killSignal: 'SIGKILL',
               maxBuffer: 8 * 1024 * 1024,
               env: {
-                ...process.env,
-                GIT_TERMINAL_PROMPT: '0'
+                PATH: process.env.PATH || '/usr/bin:/bin',
+                HOME: os.tmpdir(),
+                GIT_TERMINAL_PROMPT: '0',
+                GIT_ASKPASS: '',
+                SSH_ASKPASS: '',
+                GIT_CONFIG_NOSYSTEM: '1'
               }
             }
           );
         } catch (cloneErr) {
+          const scrubbedCloneMsg = scrubPrivateIpLiterals(
+            String(scrubPrivateNetworkStrings(String(cloneErr?.message || 'clone error')))
+          );
           return errorEnvelope(
             'GIT_CLONE_FAILED',
-            `Shallow git clone failed for ${repoSlug}: ${scrubPrivateIpLiterals(String(cloneErr?.message || 'clone error'))}`,
+            `Shallow git clone failed for ${repoSlug}: ${scrubbedCloneMsg}`,
             { repo: repoSlug },
             'deadbolt.planner.repo_scan'
           );
@@ -3171,14 +3319,19 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
       const scanStartNs = process.hrtime.bigint();
       const cloneElapsedMs = Number((Number(scanStartNs - startNs) / 1e6).toFixed(3));
-      const { files: relFiles, truncatedOrFiltered } = collectPrioritizedRepoFiles(
-        scanRoot,
-        safeMaxFiles,
-        {
-          hintedFile: effectiveHintedFile,
-          walkCap: MAX_REPO_WALK_CANDIDATES
-        }
-      );
+      const {
+        files: relFiles,
+        resolvedHinted,
+        hintBlocked
+      } = collectPrioritizedRepoFiles(scanRoot, safeMaxFiles, {
+        hintedFile: effectiveHintedFile,
+        walkCap: MAX_REPO_WALK_CANDIDATES
+      });
+      if (hintBlocked) {
+        effectiveHintedFile = '';
+      } else if (resolvedHinted) {
+        effectiveHintedFile = resolvedHinted;
+      }
       const repoFileSet = new Set(relFiles);
       const fileEntries = [];
       const dependencyPreview = [];
@@ -3255,14 +3408,9 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         }
       }
 
-      let boundedIndexDir = null;
-      let indexTargetRoot = scanRoot;
-      if (
-        truncatedOrFiltered ||
-        fileEntries.length >= safeMaxFiles ||
-        fileEntries.length < relFiles.length
-      ) {
-        boundedIndexDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-bounded-idx-'));
+      const boundedIndexDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-bounded-idx-'));
+      let indexRes = null;
+      try {
         for (const entry of fileEntries) {
           const destAbs = path.resolve(boundedIndexDir, entry.filePath);
           if (destAbs.startsWith(boundedIndexDir + path.sep)) {
@@ -3270,15 +3418,10 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
             fs.writeFileSync(destAbs, entry.content, 'utf8');
           }
         }
-        indexTargetRoot = boundedIndexDir;
-      }
-
-      let indexRes = null;
-      try {
         didIndexScanRepo = true;
         indexRes = stack.git.indexRepo({
-          path: indexTargetRoot,
-          repoPath: indexTargetRoot,
+          path: boundedIndexDir,
+          repoPath: boundedIndexDir,
           name: scanRepoName,
           repoName: scanRepoName
         });
@@ -3427,12 +3570,27 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         )
         .slice(0, 10);
 
-      const jsPyEntries = fileEntries.filter((entry) => {
-        const ext = path.extname(entry.filePath).toLowerCase();
-        return ext !== '.php' && !POLYGLOT_EXTENSIONS.has(ext);
-      });
+      const EXT_LIB_AUDIT_PREFIX = '__deadbolt_ext__/';
+      const EXT_LIB_AUDIT_PREFIX_STRIP_RE = /^__deadbolt_ext__\//;
+      const jsPyEntries = fileEntries
+        .filter((entry) => {
+          const ext = path.extname(entry.filePath).toLowerCase();
+          return ext !== '.php' && !POLYGLOT_EXTENSIONS.has(ext);
+        })
+        .map((entry) =>
+          /^lib(?:-py)?(?:\/|$)/i.test(entry.filePath)
+            ? { ...entry, filePath: `${EXT_LIB_AUDIT_PREFIX}${entry.filePath}` }
+            : entry
+        );
       const coverage = scoreLegoBrickCoverage(jsPyEntries);
-      const baseAudit = coverage.data;
+      const rawBaseAudit = coverage.data;
+      const baseAudit = {
+        ...rawBaseAudit,
+        findings: (rawBaseAudit.findings || []).map((finding) => ({
+          ...finding,
+          filePath: String(finding.filePath || '').replace(EXT_LIB_AUDIT_PREFIX_STRIP_RE, '')
+        }))
+      };
       const mergedFindings = [...baseAudit.findings, ...extraFindings];
       const flaggedFileSet = new Set(mergedFindings.map((item) => item.filePath));
       const recommendedSet = new Set(baseAudit.recommendedBrickIds || []);

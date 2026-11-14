@@ -7,6 +7,12 @@ import {
   cn
 } from '@krusch/toolkit/react';
 
+const WORKSPACE_TABS = Object.freeze([
+  { id: 'gate', label: '1. Work Order Gate' },
+  { id: 'scanner', label: '2. GitHub Modernizer' },
+  { id: 'resilience', label: '3. 8090 Factory & Safety' }
+]);
+
 const DEFAULT_WORK_ORDERS = Object.freeze([
   {
     id: 'WO-101',
@@ -302,6 +308,7 @@ export function BreakerCockpit() {
   const foremanAbortRef = useRef(null);
   const audioMutedRef = useRef(false);
   const activeTabRef = useRef('gate');
+  const tabRefs = useRef({});
   const runIdRef = useRef(0);
   const spokenAlertKeysRef = useRef(new Set());
 
@@ -323,6 +330,11 @@ export function BreakerCockpit() {
           statusQuery.data?.data?.connectors
       ),
     [statusPayload, statusQuery.data]
+  );
+
+  const healthyArmedCount = useMemo(
+    () => connectorBar.filter((c) => c.pill !== 'offline' && c.pill !== 'error').length,
+    [connectorBar]
   );
 
   const liveConfiguredCount = useMemo(() => {
@@ -397,7 +409,9 @@ export function BreakerCockpit() {
         stages.workaroundBlocked = payload;
       } else if (
         ev.includes('verified') ||
+        ev.includes('attempt3') ||
         payload?.verdict === 'VERIFIED' ||
+        payload?.verdict === 'ESCALATE_TO_HUMAN' ||
         payload?.attempt === 3
       ) {
         stages.verified = payload;
@@ -555,8 +569,8 @@ export function BreakerCockpit() {
       } finally {
         if (foremanAbortRef.current === controller) {
           foremanAbortRef.current = null;
+          setForemanBusy(false);
         }
-        setForemanBusy(false);
       }
     },
     [selectedWo]
@@ -586,6 +600,38 @@ export function BreakerCockpit() {
       setActiveTab(nextTab);
     },
     [activeTab, stopActiveForemanAudio]
+  );
+
+  const handleTabListKeyDown = useCallback(
+    (e) => {
+      if (
+        e.key !== 'ArrowRight' &&
+        e.key !== 'ArrowLeft' &&
+        e.key !== 'Home' &&
+        e.key !== 'End'
+      ) {
+        return;
+      }
+      e.preventDefault();
+      const currentIndex = Math.max(
+        0,
+        WORKSPACE_TABS.findIndex((t) => t.id === activeTabRef.current)
+      );
+      let nextIndex = currentIndex;
+      if (e.key === 'ArrowRight') {
+        nextIndex = (currentIndex + 1) % WORKSPACE_TABS.length;
+      } else if (e.key === 'ArrowLeft') {
+        nextIndex = (currentIndex - 1 + WORKSPACE_TABS.length) % WORKSPACE_TABS.length;
+      } else if (e.key === 'Home') {
+        nextIndex = 0;
+      } else if (e.key === 'End') {
+        nextIndex = WORKSPACE_TABS.length - 1;
+      }
+      const nextTabId = WORKSPACE_TABS[nextIndex].id;
+      handleSelectTab(nextTabId);
+      tabRefs.current[nextTabId]?.focus();
+    },
+    [handleSelectTab]
   );
 
   useEffect(() => {
@@ -630,6 +676,7 @@ export function BreakerCockpit() {
     setLiveAudit(null);
     setForemanAlert(null);
     stopActiveForemanAudio();
+    setForemanBusy(false);
     setRunError(null);
     setSyncRunResult(null);
     runIdRef.current += 1;
@@ -640,6 +687,7 @@ export function BreakerCockpit() {
     setLiveAudit(null);
     setForemanAlert(null);
     stopActiveForemanAudio();
+    setForemanBusy(false);
     setRunError(null);
     setSyncRunResult(null);
     runStream.reset();
@@ -730,7 +778,7 @@ export function BreakerCockpit() {
     try {
       const raw = await fetchApiJson('/api/repo/modernize', {
         method: 'POST',
-        timeoutMs: 45000,
+        timeoutMs: 75000,
         body: {
           repoUrlOrPath: targetToUse,
           targetFile: String(specificFile || '').trim()
@@ -800,25 +848,8 @@ export function BreakerCockpit() {
     try {
       const raw = await fetchApiJson('/api/sofa/sync-receipt', {
         method: 'POST',
-        unwrapEnvelope: false,
         body: { workOrderId: selectedWo || 'WO-101' }
       });
-      if (raw && raw.ok === false) {
-        const errCode = String(raw.error?.code || '');
-        const errMsg = String(raw.error?.message || '').trim();
-        setSofaSyncBanner({
-          tone: 'amber',
-          heading:
-            errCode === 'WORK_ORDER_NOT_FOUND'
-              ? 'Work Order Lookup Blocked:'
-              : 'Stage 4 Receipt Required:',
-          message:
-            errCode === 'UNVERIFIED_STAGE_BLOCKED' || !errMsg
-              ? `Run WO-101 Head-to-Head on Tab 1 first so Stage 4 mints a signed SHA-256 receipt before syncing to 8090.${errMsg ? ` (${errMsg})` : ''}`
-              : errMsg
-        });
-        return;
-      }
 
       const synced = unwrapEnvelopeData(raw) || raw || {};
       if (synced.snapshot) {
@@ -1035,39 +1066,6 @@ export function BreakerCockpit() {
   const isStreaming = runStream.status === 'streaming' || syncRunning;
   const hasCompletedRun = Boolean(activeRun) || streamState.done;
 
-  const conveyorStages = useMemo(() => {
-    const rDone = Boolean(streamState.refinery || hasCompletedRun);
-    const pDone = Boolean(streamState.planner || hasCompletedRun);
-    const fDone = Boolean(streamState.foundry || hasCompletedRun);
-    const vTripped = Boolean(
-      streamState.workaroundBlocked && !streamState.verified && !hasCompletedRun
-    );
-    const vDone = Boolean(streamState.verified || hasCompletedRun);
-
-    return [
-      {
-        name: '1. Refinery',
-        meta: rDone ? '< 4k tok' : 'Context',
-        state: rDone ? 'complete' : isStreaming ? 'active' : 'idle'
-      },
-      {
-        name: '2. Planner',
-        meta: pDone ? '2-Hop AST' : 'Graph',
-        state: pDone ? 'complete' : isStreaming && rDone ? 'active' : 'idle'
-      },
-      {
-        name: '3. Foundry',
-        meta: fDone ? '< 1ms Slop' : 'Staging',
-        state: fDone ? 'complete' : isStreaming && pDone ? 'active' : 'idle'
-      },
-      {
-        name: '4. Validator',
-        meta: vTripped ? 'BLOCKED' : vDone ? 'VERIFIED' : 'Policy Gate',
-        state: vTripped ? 'tripped' : vDone ? 'complete' : isStreaming && fDone ? 'active' : 'idle'
-      }
-    ];
-  }, [streamState, hasCompletedRun, isStreaming]);
-
   const standardData = useMemo(() => {
     const std =
       activeRun?.standardAgent ||
@@ -1159,6 +1157,17 @@ export function BreakerCockpit() {
       att3?.telemetry?.costPerVerifiedTaskUsd ??
       (runFinished ? 0 : null);
 
+    const rawTailHash = String(
+      liveAudit?.tailHash ||
+        att3?.auditReceipt?.entryHash ||
+        att3?.auditReceipt?.hash ||
+        auditSummary?.tailHash ||
+        statusPayload?.audit?.tailHash ||
+        auditSummary?.headHash ||
+        ''
+    ).trim();
+    const normalizedTailHash = !rawTailHash || /^0+$/.test(rawTailHash) ? null : rawTailHash;
+
     return {
       modalities: normalizeModalityNames(refinery?.modalitiesHydrated),
       tokensUsed,
@@ -1183,26 +1192,83 @@ export function BreakerCockpit() {
           'src/sox-reconciler.js'
       },
       attempt3: {
-        verdict: att3?.verdict || 'VERIFIED',
-        deltaCents: att3?.reconciliation?.batchCheck?.deltaCents ?? 0,
-        actualNetCents: att3?.reconciliation?.batchCheck?.actualNetCents ?? 9750
+        verdict: att3?.verdict || gov?.verdict || null,
+        deltaCents: att3?.reconciliation?.batchCheck?.deltaCents ?? (att3?.deltaCents ?? 0),
+        actualNetCents: att3?.reconciliation?.batchCheck?.actualNetCents ?? 9750,
+        crossModelReview: att3?.crossModelReview || gov?.crossModelReview || null
       },
       prTitle:
         prInfo?.prTitle ||
         prInfo?.title ||
         `[${selectedWo}] Fix integer basis-point residual allocation in fee-engine`,
       auditValid: auditSummary?.valid !== false,
-      auditVerifiedCount: auditSummary?.verifiedCount ?? 3,
-      auditTailHash:
-        att3?.auditReceipt?.hash ||
-        att3?.auditReceipt?.entryHash ||
-        auditSummary?.tailHash ||
-        auditSummary?.headHash ||
-        'sha256:verified',
+      auditVerifiedCount: auditSummary?.verifiedCount ?? 0,
+      auditTailHash: normalizedTailHash,
       costUsd: rawCost,
       costPerVerifiedTaskUsd: rawCost
     };
   }, [activeRun, streamState, liveAudit, statusPayload, selectedWo, hasCompletedRun]);
+
+  const att3Verdict = governedData?.attempt3?.verdict || 'ARMED';
+
+  const conveyorStages = useMemo(() => {
+    const rDone = Boolean(streamState.refinery || hasCompletedRun);
+    const pDone = Boolean(streamState.planner || hasCompletedRun);
+    const fDone = Boolean(streamState.foundry || hasCompletedRun);
+    const vTripped = Boolean(
+      streamState.workaroundBlocked && !streamState.verified && !hasCompletedRun
+    );
+    const vDone = Boolean(streamState.verified || hasCompletedRun);
+
+    const vMeta = vTripped
+      ? 'BLOCKED'
+      : vDone
+        ? att3Verdict === 'VERIFIED'
+          ? 'VERIFIED'
+          : att3Verdict === 'ESCALATE_TO_HUMAN'
+            ? 'ESCALATE_TO_HUMAN'
+            : att3Verdict === 'GATE_REJECTED' || att3Verdict === 'WORKAROUND_REJECTED'
+              ? att3Verdict
+              : 'Policy Gate'
+        : 'Policy Gate';
+
+    const vState = vTripped
+      ? 'tripped'
+      : vDone
+        ? att3Verdict === 'VERIFIED'
+          ? 'complete'
+          : att3Verdict === 'ESCALATE_TO_HUMAN'
+            ? 'amber'
+            : att3Verdict === 'GATE_REJECTED' || att3Verdict === 'WORKAROUND_REJECTED'
+              ? 'crimson'
+              : 'idle'
+        : isStreaming && fDone
+          ? 'active'
+          : 'idle';
+
+    return [
+      {
+        name: '1. Refinery',
+        meta: rDone ? '< 4k tok' : 'Context',
+        state: rDone ? 'complete' : isStreaming ? 'active' : 'idle'
+      },
+      {
+        name: '2. Planner',
+        meta: pDone ? '2-Hop AST' : 'Graph',
+        state: pDone ? 'complete' : isStreaming && rDone ? 'active' : 'idle'
+      },
+      {
+        name: '3. Foundry',
+        meta: fDone ? '< 1ms Slop' : 'Staging',
+        state: fDone ? 'complete' : isStreaming && pDone ? 'active' : 'idle'
+      },
+      {
+        name: '4. Validator',
+        meta: vMeta,
+        state: vState
+      }
+    ];
+  }, [streamState, hasCompletedRun, isStreaming, att3Verdict]);
 
   const normalizedScan = useMemo(() => {
     if (!scanResult) return null;
@@ -1234,9 +1300,24 @@ export function BreakerCockpit() {
   );
 
   const rightCardHeaderBadge = useMemo(() => {
+    const mapVerdictBadge = (verdict) => {
+      if (verdict === 'VERIFIED') {
+        return { label: 'VERIFIED', badgeClass: 'db-badge-ok' };
+      }
+      if (verdict === 'ESCALATE_TO_HUMAN') {
+        return { label: 'ESCALATE_TO_HUMAN', badgeClass: 'db-badge-warn' };
+      }
+      if (verdict === 'GATE_REJECTED' || verdict === 'WORKAROUND_REJECTED') {
+        return { label: verdict, badgeClass: 'db-badge-err' };
+      }
+      return { label: 'GATE ARMED', badgeClass: 'db-badge-cyan' };
+    };
+
     if (runStream.status === 'streaming') {
       if (streamState.verified || streamState.done) {
-        return { label: 'VERIFIED', badgeClass: 'db-badge-ok' };
+        return att3Verdict === 'ARMED'
+          ? { label: 'RUNNING GATE...', badgeClass: 'db-badge-cyan' }
+          : mapVerdictBadge(att3Verdict);
       }
       if (streamState.workaroundBlocked) {
         return { label: 'BREAKER TRIPPED', badgeClass: 'db-badge-danger' };
@@ -1256,10 +1337,7 @@ export function BreakerCockpit() {
       return { label: 'STREAM INTERRUPTED', badgeClass: 'db-badge-warn' };
     }
     if (activeRun || streamState.done || streamState.verified) {
-      return {
-        label: governedData.attempt3.verdict || 'VERIFIED',
-        badgeClass: 'db-badge-ok'
-      };
+      return mapVerdictBadge(att3Verdict);
     }
     return { label: 'GATE ARMED', badgeClass: 'db-badge-cyan' };
   }, [
@@ -1272,7 +1350,7 @@ export function BreakerCockpit() {
     streamState.done,
     streamState.workaroundBlocked,
     activeRun,
-    governedData.attempt3.verdict
+    att3Verdict
   ]);
 
   const trimmedScanInput = scanInput.trim();
@@ -1326,16 +1404,56 @@ export function BreakerCockpit() {
   const hasBoundedVerificationOverhead =
     rawPromptTokenReductionPct < 0 || rawCostReductionPct < 0;
 
-  const activeTabLabel =
-    activeTab === 'gate'
-      ? '1. Work Order Gate'
-      : activeTab === 'scanner'
-        ? '2. GitHub Modernizer'
-        : '3. 8090 Factory & Safety';
+  const isColdStart = !hasCompletedRun && !isStreaming && runStream.events.length === 0;
+  const att1Pending = !hasCompletedRun && !streamState.attempt1;
+  const att2Pending = !hasCompletedRun && !streamState.workaroundBlocked;
+  const att3Pending = !hasCompletedRun && !streamState.verified;
 
-  const att1Pending = isStreaming && !streamState.attempt1 && !hasCompletedRun;
-  const att2Pending = isStreaming && !streamState.workaroundBlocked && !hasCompletedRun;
-  const att3Pending = isStreaming && !streamState.verified && !hasCompletedRun;
+  const rightCardAccentClass = att3Pending
+    ? null
+    : att3Verdict === 'VERIFIED'
+      ? 'db-card-emerald'
+      : att3Verdict === 'ESCALATE_TO_HUMAN'
+        ? 'db-card-amber'
+        : 'db-card-crimson';
+
+  const rightHeroToneClass = att3Pending
+    ? 'is-cyan'
+    : att3Verdict === 'VERIFIED'
+      ? 'is-emerald'
+      : att3Verdict === 'ESCALATE_TO_HUMAN'
+        ? 'is-amber'
+        : 'is-crimson';
+
+  const att3RowAccentClass = att3Pending
+    ? null
+    : att3Verdict === 'VERIFIED'
+      ? 'is-emerald'
+      : att3Verdict === 'ESCALATE_TO_HUMAN'
+        ? 'is-amber'
+        : 'is-crimson';
+
+  const att3BadgeClass = att3Pending
+    ? 'db-badge-cyan'
+    : att3Verdict === 'VERIFIED'
+      ? 'db-badge-emerald'
+      : att3Verdict === 'ESCALATE_TO_HUMAN'
+        ? 'db-badge-amber'
+        : 'db-badge-crimson';
+
+  const att3ReviewMode = governedData?.attempt3?.crossModelReview?.mode;
+  const att3Description = isColdStart
+    ? 'Armed: Requires $0.00 conservation parity plus cross-family reviewer consensus.'
+    : att3Pending
+      ? 'Awaiting largest-remainder remediation + cross-family consensus...'
+      : att3Verdict === 'VERIFIED' && att3ReviewMode === 'live_api'
+        ? `Exact ${formatCentsUsd(governedData.attempt3.actualNetCents)} parity + Gemini and DeepSeek live cross-family approval.`
+        : att3Verdict === 'VERIFIED'
+          ? `Exact ${formatCentsUsd(governedData.attempt3.actualNetCents)} parity + deterministic structural conservation gate.`
+          : att3Verdict === 'ESCALATE_TO_HUMAN'
+            ? `Exact ${formatCentsUsd(governedData.attempt3.actualNetCents)} math parity, but cross-family reviewers diverged or timed out. Escalated to human operator.`
+            : 'Candidate failed Stage 4 validation gate.';
+
   const verifiedCostLabel =
     Boolean(activeRun || streamState.done) && governedData.costUsd === 0
       ? '$0.0000 (deterministic)'
@@ -1370,40 +1488,33 @@ export function BreakerCockpit() {
             <span className="db-brand-sub">8090 Factory</span>
           </div>
 
-          <nav className="db-nav db-tabs" role="tablist" aria-label="Workspace Mode">
-            <button
-              id="db-tab-gate"
-              type="button"
-              role="tab"
-              aria-controls="db-tabpanel-active"
-              aria-selected={activeTab === 'gate'}
-              className={cn('db-nav-tab', activeTab === 'gate' && 'is-active')}
-              onClick={() => handleSelectTab('gate')}
-            >
-              1. Work Order Gate
-            </button>
-            <button
-              id="db-tab-scanner"
-              type="button"
-              role="tab"
-              aria-controls="db-tabpanel-active"
-              aria-selected={activeTab === 'scanner'}
-              className={cn('db-nav-tab', activeTab === 'scanner' && 'is-active')}
-              onClick={() => handleSelectTab('scanner')}
-            >
-              2. GitHub Modernizer
-            </button>
-            <button
-              id="db-tab-resilience"
-              type="button"
-              role="tab"
-              aria-controls="db-tabpanel-active"
-              aria-selected={activeTab === 'resilience'}
-              className={cn('db-nav-tab', activeTab === 'resilience' && 'is-active')}
-              onClick={() => handleSelectTab('resilience')}
-            >
-              3. 8090 Factory &amp; Safety
-            </button>
+          <nav
+            className="db-nav db-tabs"
+            role="tablist"
+            aria-label="Workspace Mode"
+            onKeyDown={handleTabListKeyDown}
+          >
+            {WORKSPACE_TABS.map((tab) => {
+              const isSelected = activeTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  ref={(el) => {
+                    tabRefs.current[tab.id] = el;
+                  }}
+                  id={`db-tab-${tab.id}`}
+                  type="button"
+                  role="tab"
+                  tabIndex={isSelected ? 0 : -1}
+                  aria-controls="db-tabpanel-active"
+                  aria-selected={isSelected}
+                  className={cn('db-nav-tab', isSelected && 'is-active')}
+                  onClick={() => handleSelectTab(tab.id)}
+                >
+                  {tab.label}
+                </button>
+              );
+            })}
           </nav>
 
           <div className="db-topbar-right">
@@ -1422,15 +1533,20 @@ export function BreakerCockpit() {
                   width: '7px',
                   height: '7px',
                   borderRadius: '999px',
-                  background: statusError ? '#f87171' : '#34d399',
+                  background: statusError
+                    ? '#f87171'
+                    : healthyArmedCount < connectorBar.length
+                      ? '#fbbf24'
+                      : '#34d399',
                   display: 'inline-block'
                 }}
               />
               {statusError
                 ? 'API Offline'
-                : liveConfiguredCount === connectorBar.length
-                  ? '6/6 Live'
-                  : `${connectorBar.length}/6 Armed`}
+                : liveConfiguredCount === connectorBar.length &&
+                    healthyArmedCount === connectorBar.length
+                  ? `${connectorBar.length}/${connectorBar.length} Live`
+                  : `${healthyArmedCount}/${connectorBar.length} Armed`}
             </button>
             <button
               type="button"
@@ -1457,7 +1573,7 @@ export function BreakerCockpit() {
         <div
           id="db-tabpanel-active"
           role="tabpanel"
-          aria-label={activeTabLabel}
+          aria-labelledby={`db-tab-${activeTab}`}
           className={cn('db-tabpanel', activeTab === 'resilience' && 'db-tabpanel-compact')}
         >
         {/* =========================================================
@@ -1557,7 +1673,8 @@ export function BreakerCockpit() {
                   className={cn(
                     'db-step',
                     stage.state === 'active' && 'is-active',
-                    stage.state === 'tripped' && 'is-tripped',
+                    stage.state === 'amber' && 'is-amber',
+                    (stage.state === 'tripped' || stage.state === 'crimson') && 'is-tripped is-crimson',
                     stage.state === 'complete' && 'is-complete'
                   )}
                 >
@@ -1638,7 +1755,7 @@ export function BreakerCockpit() {
               </article>
 
               {/* RIGHT: DEADBOLT GOVERNED */}
-              <article className="db-card db-card-emerald">
+              <article className={cn('db-card', rightCardAccentClass)}>
                 <div className="db-card-head">
                   <div>
                     <div className="db-kicker">4-Stage Deterministic Governance</div>
@@ -1652,15 +1769,12 @@ export function BreakerCockpit() {
                 <div className="db-hero-stat">
                   <div>
                     <div className="db-kicker">SOX-Style Batch Variance</div>
-                    <div
-                      className={cn(
-                        'db-hero-number tabular-nums',
-                        att3Pending ? 'is-cyan' : 'is-emerald'
-                      )}
-                    >
-                      {att3Pending
-                        ? 'Evaluating...'
-                        : `${formatSignedCents(governedData.attempt3.deltaCents)} (${formatSignedUsdFromCents(governedData.attempt3.deltaCents)})`}
+                    <div className={cn('db-hero-number tabular-nums', rightHeroToneClass)}>
+                      {isColdStart
+                        ? 'STANDBY'
+                        : att3Pending
+                          ? 'Evaluating...'
+                          : `${formatSignedCents(governedData.attempt3.deltaCents)} (${formatSignedUsdFromCents(governedData.attempt3.deltaCents)})`}
                     </div>
                   </div>
                   <div className="db-hero-caption tabular-nums">
@@ -1678,13 +1792,19 @@ export function BreakerCockpit() {
                           att1Pending ? 'db-badge-cyan' : 'db-badge-amber'
                         )}
                       >
-                        {att1Pending ? 'PENDING' : governedData.attempt1.verdict}
+                        {isColdStart
+                          ? 'STANDBY'
+                          : att1Pending
+                            ? 'PENDING'
+                            : governedData.attempt1.verdict}
                       </span>
                     </div>
                     <div className="db-attempt-desc">
-                      {att1Pending
-                        ? 'Running Stage 4 deterministic SOX-style batch reconciliation...'
-                        : `INV-FIN-03 caught ${formatSignedCents(governedData.attempt1.deltaCents)} split-invoice drift missed by unit tests.`}
+                      {isColdStart
+                        ? 'Armed: Stage 4 deterministic SOX-style batch reconciliation awaits WO-101 run.'
+                        : att1Pending
+                          ? 'Running Stage 4 deterministic SOX-style batch reconciliation...'
+                          : `INV-FIN-03 caught ${formatSignedCents(governedData.attempt1.deltaCents)} split-invoice drift missed by unit tests.`}
                     </div>
                   </div>
 
@@ -1697,11 +1817,17 @@ export function BreakerCockpit() {
                           att2Pending ? 'db-badge-cyan' : 'db-badge-crimson'
                         )}
                       >
-                        {att2Pending ? 'PENDING' : governedData.attempt2.verdict}
+                        {isColdStart
+                          ? 'GATE ARMED'
+                          : att2Pending
+                            ? 'PENDING'
+                            : governedData.attempt2.verdict}
                       </span>
                     </div>
                     <div className="db-attempt-desc">
-                      {att2Pending ? (
+                      {isColdStart ? (
+                        'Armed: Import-frozen policy floor guards protected verifiers against workaround edits.'
+                      ) : att2Pending ? (
                         'Guarding protected policy-floor verifiers...'
                       ) : (
                         <>
@@ -1712,23 +1838,14 @@ export function BreakerCockpit() {
                     </div>
                   </div>
 
-                  <div className={cn('db-attempt-item', !att3Pending && 'is-emerald')}>
+                  <div className={cn('db-attempt-item', att3RowAccentClass)}>
                     <div className="db-attempt-top">
                       <span>Attempt 3: Integer largest-remainder carry</span>
-                      <span
-                        className={cn(
-                          'db-badge',
-                          att3Pending ? 'db-badge-cyan' : 'db-badge-emerald'
-                        )}
-                      >
-                        {att3Pending ? 'PENDING' : governedData.attempt3.verdict}
+                      <span className={cn('db-badge', att3BadgeClass)}>
+                        {isColdStart ? 'STANDBY' : att3Pending ? 'PENDING' : att3Verdict}
                       </span>
                     </div>
-                    <div className="db-attempt-desc">
-                      {att3Pending
-                        ? 'Awaiting largest-remainder remediation + cross-family consensus...'
-                        : `Exact ${formatCentsUsd(governedData.attempt3.actualNetCents)} parity + Gemini and DeepSeek cross-family approval.`}
-                    </div>
+                    <div className="db-attempt-desc">{att3Description}</div>
                   </div>
                 </div>
               </article>
@@ -1810,7 +1927,9 @@ export function BreakerCockpit() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.82rem', color: '#94a3b8' }}>
                   <span>Linked PR: <code>{governedData.prTitle}</code></span>
                   <span className="db-mono">
-                    Audit Tail: {String(governedData.auditTailHash).slice(0, 28)}...
+                    {governedData.auditTailHash
+                      ? `Audit Tail: ${governedData.auditTailHash.slice(0, 28)}...`
+                      : `Audit Ledger: Armed (${governedData.auditVerifiedCount} entries)`}
                   </span>
                 </div>
               </div>

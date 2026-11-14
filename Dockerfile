@@ -11,7 +11,7 @@ COPY client/package*.json ./client/
 RUN npm --prefix client ci
 
 COPY . .
-RUN npm run build && mkdir -p /app/data /app/logs && chown -R node:node /app
+RUN npm run build && mkdir -p /app/data /app/logs && chown -R node:node /app/data /app/logs
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0

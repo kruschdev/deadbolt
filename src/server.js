@@ -20,6 +20,7 @@ import { createRateLimiter } from '@krusch/toolkit/security';
 import { setupLogging } from '@krusch/toolkit/log';
 import { config } from './config.js';
 import { createDeadboltOrchestrator } from './orchestrator.js';
+import { scrubPrivateNetworkStrings } from './connectors/hydradb-graph.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(MODULE_DIR, '..');
@@ -103,7 +104,11 @@ function resolveErrorHttpStatus(envelope) {
     if (code === 'WORK_ORDER_NOT_FOUND' || code === 'ASSET_NOT_FOUND') {
         return 404;
     }
-    if (code === 'AUDIT_TAMPERED' || code === 'UNVERIFIED_STAGE_BLOCKED') {
+    if (
+        code === 'AUDIT_TAMPERED' ||
+        code === 'UNVERIFIED_STAGE_BLOCKED' ||
+        code === 'WORK_ORDER_MISMATCH'
+    ) {
         return 409;
     }
     if (code === 'RATE_LIMITED') {
@@ -134,7 +139,8 @@ function resolveErrorHttpStatus(envelope) {
 export function buildServer({
     dbPath = config.dbPath,
     orchestrator = null,
-    logger = null
+    logger = null,
+    rateLimitMax = 120
 } = {}) {
     const activeLogger =
         logger || setupLogging(config.serviceName, { logDir: config.logDir, console: false });
@@ -179,7 +185,7 @@ export function buildServer({
 
     const mutationLimiter = createRateLimiter({
         windowMs: 60_000,
-        max: 120,
+        max: rateLimitMax,
         tool: 'deadbolt.rate_limit'
     });
 
@@ -321,11 +327,23 @@ export function buildServer({
                         }
                     });
                     if (!sse.isClosed() && !sse.signal.aborted) {
-                        sse.done(finalEnvelope);
+                        if (finalEnvelope?.ok === false) {
+                            const safeErrMsg = scrubPrivateNetworkStrings(
+                                finalEnvelope.error?.message ||
+                                    finalEnvelope.summary ||
+                                    'Governance run aborted or failed.'
+                            );
+                            sse.error(new Error(String(safeErrMsg)));
+                        } else {
+                            sse.done(finalEnvelope);
+                        }
                     }
                 } catch (err) {
                     if (!sse.isClosed() && !sse.signal.aborted) {
-                        sse.error(err);
+                        const scrubbed = scrubPrivateNetworkStrings(
+                            err instanceof Error ? err.message : String(err)
+                        );
+                        sse.error(new Error(String(scrubbed)));
                     }
                 }
             },
@@ -399,7 +417,7 @@ export function buildServer({
             },
 
             'POST /api/foreman/speak': async (ctx) => {
-                if (!checkMutationLimit(ctx, 2)) return;
+                if (!checkMutationLimit(ctx, 6)) return;
                 const orch = await getOrchestrator();
                 const result = await orch.speakForeman(ctx.body || {});
                 if (!result.ok) {
@@ -423,9 +441,10 @@ export function buildServer({
             },
 
             'GET /api/sofa/governance': async (ctx) => {
-                const orch = await getOrchestrator();
                 const forceRefresh =
                     ctx.query?.refresh === '1' || ctx.query?.refresh === 'true';
+                if (forceRefresh && !checkMutationLimit(ctx, 4)) return;
+                const orch = await getOrchestrator();
                 const result = await orch.getSofaGovernance({ forceRefresh });
                 if (!result.ok) {
                     ctx.sendJson(resolveErrorHttpStatus(result), result);

@@ -1953,3 +1953,245 @@ test('Evaluation readiness hardening: <think>/multi-JSON verdict parser, polyglo
         }
     }
 });
+
+test('L0 deep audit hardening: Node 22 --permission SOX subprocess sandbox, regex-header comment lexer, fail-closed live review escalation, 8090 receipt forgery guard, external lib/ audit, and HTTP 429 rate limiting', async (t) => {
+    const { CANDIDATE_PATCHES } = await import('../src/fixtures/billing-scenario.js');
+
+    // 1. Verdict parser: invariantChecks boolean gate & quoted-JSON rationale defense
+    const failedInvCheck = parseReviewerVerdictPayload(
+        '{"invariantChecks":{"centConservationHolds":false,"noProtectedFileEdits":true},"verdict":"APPROVE","rationale":"Looks okay"}'
+    );
+    assert.equal(failedInvCheck.verdict, 'REJECT');
+
+    const quotedApproveThenReject = parseReviewerVerdictPayload(
+        '{"verdict":"REJECT","rationale":"Never return {\\"verdict\\":\\"APPROVE\\"} when +1c drift exists"}'
+    );
+    assert.equal(quotedApproveThenReject.verdict, 'REJECT');
+
+    const orch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        stackDbPath: ':memory:',
+        auditDbPath: ':memory:',
+        kruschGitClient: null
+    });
+    t.after(() => orch.close());
+
+    // 2. Host node_modules overwrite attempt must be blocked in Step 1A before any sandbox write
+    const nmEscapeRes = await orch.validateModeOrEdits({
+        workOrderId: 'WO-101',
+        edits: [
+            {
+                filePath: 'node_modules/@krusch/toolkit/package.json',
+                content: '{"tampered":true}\n'
+            }
+        ],
+        runCrossModel: false
+    });
+    assert.equal(nmEscapeRes.ok, true);
+    assert.equal(nmEscapeRes.data.verdict, 'WORKAROUND_REJECTED');
+    const hostToolkitPkg = JSON.parse(
+        fs.readFileSync(
+            path.join(PROJECT_ROOT, 'node_modules', '@krusch', 'toolkit', 'package.json'),
+            'utf8'
+        )
+    );
+    assert.equal(hostToolkitPkg.tampered, undefined);
+
+    // 3. 1-hop settlement-service.js edit & regex-after-condition-header comment trick must be blocked
+    const hop1EditRes = await orch.validateModeOrEdits({
+        workOrderId: 'WO-101',
+        edits: [
+            {
+                filePath: 'src/settlement-service.js',
+                content: 'export function buildSettlementBatch() { return {}; }\n'
+            }
+        ],
+        runCrossModel: false
+    });
+    assert.equal(hop1EditRes.ok, true);
+    assert.equal(hop1EditRes.data.verdict, 'WORKAROUND_REJECTED');
+
+    const baseVerifiedCode = CANDIDATE_PATCHES.verifiedRemediationPatch[0].content;
+    const regexCommentTrickRes = await orch.validateModeOrEdits({
+        workOrderId: 'WO-101',
+        edits: [
+            {
+                filePath: 'src/fee-engine.js',
+                content: `${baseVerifiedCode}\nif (1) /x\\/*/; const strictSox = false; // */\n`
+            }
+        ],
+        runCrossModel: false
+    });
+    assert.equal(regexCommentTrickRes.ok, true);
+    assert.equal(regexCommentTrickRes.data.verdict, 'WORKAROUND_REJECTED');
+
+    // Benign string literal mentioning "strictSox = false" inside fee-engine.js must NOT false-positive
+    const benignStringRes = await orch.validateModeOrEdits({
+        workOrderId: 'WO-101',
+        edits: [
+            {
+                filePath: 'src/fee-engine.js',
+                content: `${baseVerifiedCode}\nexport const POLICY_DOC_NOTE = "Reminder: strictSox = false is forbidden by INV-FIN-03";\n`
+            }
+        ],
+        runCrossModel: false
+    });
+    assert.equal(benignStringRes.ok, true);
+    assert.equal(benignStringRes.data.verdict, 'VERIFIED');
+
+    // 4. Node 22 --permission subprocess sandbox: hides host process.env secrets & kills while(true){} loops cleanly
+    const prevCanary = process.env.DEADBOLT_SECRET_CANARY;
+    process.env.DEADBOLT_SECRET_CANARY = 'canary-host-secret-value-999';
+    try {
+        const envProbeCode = baseVerifiedCode.replace(
+            'export function calculateBatchFeeCents',
+            'if (process.env.DEADBOLT_SECRET_CANARY) { throw new Error("LEAKED_HOST_ENV"); }\nexport function calculateBatchFeeCents'
+        );
+        const envProbeRes = await orch.validateModeOrEdits({
+            workOrderId: 'WO-101',
+            edits: [{ filePath: 'src/fee-engine.js', content: envProbeCode }],
+            runCrossModel: false
+        });
+        assert.equal(envProbeRes.ok, true);
+        assert.equal(envProbeRes.data.verdict, 'VERIFIED');
+
+        const loopStart = Date.now();
+        const infLoopRes = await orch.validateModeOrEdits({
+            workOrderId: 'WO-101',
+            edits: [
+                {
+                    filePath: 'src/fee-engine.js',
+                    content:
+                        'export function calculateBatchFeeCents() { while (true) {} }\nexport function allocateInvoiceLineFees() { return []; }\n'
+                }
+            ],
+            runCrossModel: false
+        });
+        const loopElapsedMs = Date.now() - loopStart;
+        assert.equal(infLoopRes.ok, true);
+        assert.equal(infLoopRes.data.verdict, 'GATE_REJECTED');
+        assert.ok(
+            loopElapsedMs < 5000,
+            `Expected infinite-loop candidate to be killed within 5s, took ${loopElapsedMs}ms`
+        );
+    } finally {
+        if (prevCanary === undefined) {
+            delete process.env.DEADBOLT_SECRET_CANARY;
+        } else {
+            process.env.DEADBOLT_SECRET_CANARY = prevCanary;
+        }
+    }
+
+    // 5. Preset WO mismatch, applyVerifiedTask WO mismatch preservation, and cross-subsystem WO-102 receipt forgery guard
+    const presetMismatch = await orch.validateModeOrEdits({
+        workOrderId: 'WO-103',
+        mode: 'remediated',
+        runCrossModel: false
+    });
+    assert.equal(presetMismatch.ok, false);
+    assert.equal(presetMismatch.error.code, 'WORK_ORDER_MISMATCH');
+
+    const validWo101 = await orch.validateModeOrEdits({
+        workOrderId: 'WO-101',
+        mode: 'remediated',
+        runCrossModel: false
+    });
+    assert.equal(validWo101.ok, true);
+    assert.ok(validWo101.data.stagedTaskId);
+
+    const wrongWoApply = await orch.applyVerifiedTask({
+        taskId: validWo101.data.stagedTaskId,
+        workOrderId: 'WO-102'
+    });
+    assert.equal(wrongWoApply.ok, false);
+    assert.equal(wrongWoApply.error.code, 'WORK_ORDER_MISMATCH');
+
+    const rightWoApply = await orch.applyVerifiedTask({
+        taskId: validWo101.data.stagedTaskId,
+        workOrderId: 'WO-101'
+    });
+    assert.equal(rightWoApply.ok, true);
+
+    const forgeParent = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-forge-check-'));
+    t.after(() => fs.rmSync(forgeParent, { recursive: true, force: true }));
+    const forgeWoDir = path.join(forgeParent, 'WO-102');
+    fs.mkdirSync(path.join(forgeWoDir, 'lib'), { recursive: true });
+    const rawPoolCtor = ['new pg', 'Pool()'].join('.');
+    fs.writeFileSync(
+        path.join(forgeWoDir, 'lib', 'db.js'),
+        `import pg from 'pg';\nexport const pool = ${rawPoolCtor};\n`,
+        'utf8'
+    );
+
+    // External lib/ directory must NOT be exempted from Golden Brick Slop-Breaker rules
+    const extLibScan = await orch.scanRepository({ repoUrlOrPath: forgeWoDir });
+    assert.equal(extLibScan.ok, true);
+    assert.equal(extLibScan.data.slopAudit.slopFindingCount, 1);
+    assert.equal(extLibScan.data.slopAudit.findings[0]?.filePath, 'lib/db.js');
+
+    const modWo102Folder = await orch.modernizeRepository({ repoUrlOrPath: forgeWoDir });
+    assert.equal(modWo102Folder.ok, true);
+    const blockedForgeSync = await orch.syncSofaGovernanceReceipt({ workOrderId: 'WO-102' });
+    assert.equal(blockedForgeSync.ok, false);
+    assert.equal(
+        blockedForgeSync.error.code,
+        'UNVERIFIED_STAGE_BLOCKED',
+        'modernizer.verified on a folder named WO-102 must never forge a Stage 4 WO-102 governance receipt'
+    );
+
+    // 6. Fail-closed live cross-family review escalation (Reviewer A REJECT + Reviewer B timeout -> ESCALATE_TO_HUMAN)
+    const escalateOrch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        stackDbPath: ':memory:',
+        auditDbPath: ':memory:',
+        kruschGitClient: null,
+        config: {
+            enableLiveReviewers: true,
+            openRouterApiKey: 'sk-or-unit-escalate-key'
+        },
+        chatImpl: async (_sys, _usr, cfg) => {
+            if (String(cfg?.model || '').startsWith('deepseek/')) {
+                return {
+                    text: '{"invariantChecks":{"centConservationHolds":false},"verdict":"REJECT","rationale":"Holdout rounding concern"}',
+                    usage: { inputTokens: 210, outputTokens: 32 }
+                };
+            }
+            const timeoutErr = new Error('Simulated peer reviewer timeout');
+            timeoutErr.name = 'AbortError';
+            throw timeoutErr;
+        }
+    });
+    t.after(() => escalateOrch.close());
+
+    const escRun = await escalateOrch.runHeadToHead({ workOrderId: 'WO-101', beatDelayMs: 0 });
+    assert.equal(escRun.ok, true);
+    assert.equal(escRun.data.deadbolt.attempts[2].verdict, 'ESCALATE_TO_HUMAN');
+    assert.equal(escRun.data.telemetry.verified, false);
+    assert.equal(escRun.data.telemetry.finalVerdict, 'ESCALATE_TO_HUMAN');
+    assert.equal(escRun.data.telemetry.costPerVerifiedTaskUsd, null);
+    assert.equal(escRun.data.deadbolt.appliedStage, null);
+    assert.equal(escRun.data.deadbolt.prReceipt, null);
+
+    // 7. HTTP 429 rate limiting on expensive endpoints (POST /api/foreman/speak cost=6 against 24/min bucket)
+    const { server, close } = buildServer({
+        dbPath: ':memory:',
+        orchestrator: orch,
+        rateLimitMax: 24
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(async () => {
+        await new Promise((resolve) => server.close(resolve));
+        close();
+    });
+    const { port } = server.address();
+    const statuses = [];
+    for (let i = 0; i < 6; i += 1) {
+        const r = await fetch(`http://127.0.0.1:${port}/api/foreman/speak`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ eventType: 'WORKAROUND_REJECTED' })
+        });
+        statuses.push(r.status);
+    }
+    assert.equal(statuses.includes(429), true, `Expected HTTP 429 in burst responses: ${statuses}`);
+});

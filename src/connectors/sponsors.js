@@ -33,6 +33,11 @@ const DEFAULT_ELEVENLABS_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
 const DEFAULT_ELEVENLABS_MODEL_ID = 'eleven_turbo_v2_5';
 const SAFE_WORK_ORDER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const SAFE_VOICE_ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
+const SAFE_TARGET_REPO_RE = /^(?!\.\.?\/)[A-Za-z0-9_.-]+\/(?!\.\.?$)[A-Za-z0-9_.-]+$/;
+const LOOPBACK_IPV4_HOST_RE = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+const FOREMAN_UNSAFE_TEXT_RE = /[\u0000-\u001F\u007F-\u009F<>]+/g;
+const MAX_FOREMAN_TTS_CACHE = 12;
+const MAX_FOREMAN_SPEECH_CHARS = 320;
 const HEX64_RE = /^[0-9a-f]{64}$/i;
 const VALID_AUDIT_HASH_RE = /^[a-f0-9]{32,128}$/i;
 const MAX_REPORTED_FEEDBACK_KEYS = 64;
@@ -128,13 +133,25 @@ function sanitizeEndpointForDisplay(rawUrl, fallbackLabel) {
         const parsed = new URL(rawUrl.trim());
         parsed.username = '';
         parsed.password = '';
+        const host = parsed.hostname.toLowerCase();
         if (
-            parsed.hostname === '127.0.0.1' ||
-            parsed.hostname === 'localhost' ||
-            parsed.hostname.endsWith('.dev') ||
-            parsed.hostname.endsWith('.com') ||
-            parsed.hostname.endsWith('.ai') ||
-            parsed.hostname.endsWith('.io')
+            host === 'localhost' ||
+            host.endsWith('.localhost') ||
+            host === '0.0.0.0' ||
+            host === '[::1]' ||
+            host === '::1' ||
+            LOOPBACK_IPV4_HOST_RE.test(host)
+        ) {
+            return 'local-loopback';
+        }
+        if (scrubPrivateNetworkStrings(host) !== host) {
+            return fallbackLabel;
+        }
+        if (
+            host.endsWith('.dev') ||
+            host.endsWith('.com') ||
+            host.endsWith('.ai') ||
+            host.endsWith('.io')
         ) {
             return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
         }
@@ -314,17 +331,55 @@ export function createSponsorHub({
             ? safeConfig.auditHmacSecret.trim()
             : crypto.randomBytes(32).toString('hex');
 
-    const resolvedHydra =
-        hydraClient ||
-        createHydraDbClient({
+    const resolvedHydraBaseUrl = String(safeConfig.hydradbBaseUrl || DEFAULT_HYDRADB_BASE_URL)
+        .trim()
+        .replace(/\/+$/, '');
+    let hydraHost = 'api.hydradb.com';
+    try {
+        hydraHost = new URL(resolvedHydraBaseUrl).hostname;
+    } catch {
+        hydraHost = 'api.hydradb.com';
+    }
+
+    const hydraSafeFetchImpl = async (url, init = {}) => {
+        const safeRes = await safeFetch(url, init, {
+            allowedProtocols: ['https:'],
+            allowedHosts: [hydraHost],
+            allowPrivateLan: false,
+            allowTailscale: false,
+            maxRedirects: 0,
+            timeoutMs: 3500,
+            tool: 'deadbolt.sponsors.hydradb_v2',
+            ...extraSafeFetchOpts
+        });
+        if (!safeRes.ok) {
+            const err = new Error(
+                scrubPrivateNetworkStrings(
+                    safeRes.error?.message || 'HydraDB outbound fetch blocked.'
+                )
+            );
+            err.code = safeRes.error?.code || 'HYDRADB_FETCH_BLOCKED';
+            throw err;
+        }
+        return safeRes.data.response;
+    };
+
+    const resolvedHydra = (() => {
+        if (hydraClient) return hydraClient;
+        const created = createHydraDbClient({
             apiKey: safeConfig.hydradbApiKey || '',
-            baseUrl: safeConfig.hydradbBaseUrl || DEFAULT_HYDRADB_BASE_URL,
+            baseUrl: resolvedHydraBaseUrl,
             database: safeConfig.hydradbDatabase || 'default-tenant',
             collection: safeConfig.hydradbCollection || 'work_orders',
-            timeoutMs: 8000,
-            maxRetries: 1,
-            ...(typeof fetchImpl === 'function' ? { fetchImpl } : {})
+            timeoutMs: 3500,
+            maxRetries: 0,
+            fetchImpl: hydraSafeFetchImpl
         });
+        if (!safeConfig.hydradbApiKey) {
+            created.apiKey = '';
+        }
+        return created;
+    })();
 
     const resolvedHydraGraph =
         hydraGraphClient ||
@@ -458,7 +513,8 @@ export function createSponsorHub({
         workOrder = {},
         repoDir = '',
         prNumber = 101,
-        driftSummary = ''
+        driftSummary = '',
+        signal = undefined
     } = {}) {
         const rawId = String(workOrder?.id || 'WO-101').trim();
         if (!SAFE_WORK_ORDER_ID_RE.test(rawId)) {
@@ -513,11 +569,13 @@ export function createSponsorHub({
         if (typeof repoDir === 'string' && repoDir.trim().length > 0 && fs.existsSync(repoDir)) {
             const swFactoryDir = path.join(repoDir, '.sw-factory');
             fs.mkdirSync(swFactoryDir, { recursive: true });
-            manifestPath = path.join(swFactoryDir, `${rawId}.json`);
-            fs.writeFileSync(manifestPath, `${JSON.stringify(manifestPayload, null, 2)}\n`, 'utf8');
+            const diskManifestPath = path.join(swFactoryDir, `${rawId}.json`);
+            fs.writeFileSync(diskManifestPath, `${JSON.stringify(manifestPayload, null, 2)}\n`, 'utf8');
+            manifestPath = `.sw-factory/${rawId}.json`;
         }
 
         const sofaCreds = resolveSofaCredentials();
+        const signalInit = signal ? { signal } : {};
         let liveMcpSync = {
             attempted: false,
             connected: false,
@@ -527,6 +585,28 @@ export function createSponsorHub({
             externalApiHealthy: null,
             externalWorkOrderCount: null
         };
+
+        if (signal?.aborted) {
+            if (sofaCreds.hasOrgAdmin || sofaCreds.hasExternalApi || sofaCreds.hasMcp) {
+                liveMcpSync.attempted = true;
+                liveMcpSync.fallbackReason = 'ABORTED';
+            }
+            return okEnvelope(
+                'deadbolt.sponsors.sofa_sync',
+                `Synced 8090 Software Factory Work Order ${rawId} (${liveMcpSync.mode}).`,
+                {
+                    workOrderId: rawId,
+                    manifestPath,
+                    prMetadata: {
+                        prNumber: manifestPayload.linkedPullRequest.number,
+                        title: linkedPrTitle,
+                        autoLinkedWorkOrderId: rawId
+                    },
+                    blueprintDriftReport,
+                    liveMcpSync: scrubPrivateNetworkStrings(liveMcpSync)
+                }
+            );
+        }
 
         let sofaApiHost = 'api.factory.8090.dev';
         try {
@@ -555,7 +635,8 @@ export function createSponsorHub({
                           headers: {
                               Accept: 'application/json',
                               'X-API-Key': sofaCreds.adminKey
-                          }
+                          },
+                          ...signalInit
                       },
                       {
                           allowedProtocols: ['https:'],
@@ -570,7 +651,7 @@ export function createSponsorHub({
             sofaCreds.hasExternalApi
                 ? safeFetch(
                       `${sofaCreds.apiBaseUrl}/v2/external-api/health`,
-                      { method: 'GET', headers: extHeaders },
+                      { method: 'GET', headers: extHeaders, ...signalInit },
                       {
                           allowedProtocols: ['https:'],
                           allowedHosts: [sofaApiHost],
@@ -608,14 +689,14 @@ export function createSponsorHub({
             }
         }
 
-        if (healthRes) {
+        if (healthRes && !signal?.aborted) {
             if (healthRes.ok && healthRes.data.status >= 200 && healthRes.data.status < 300) {
                 await readTextWithTimeout(healthRes.data.response, 3000).catch(() => '');
                 let workOrderTotal = null;
                 let matchedLiveWorkOrder = null;
                 const woListRes = await safeFetch(
                     `${sofaCreds.apiBaseUrl}/v2/external-api/work_orders?page=1&page_size=20`,
-                    { method: 'GET', headers: extHeaders },
+                    { method: 'GET', headers: extHeaders, ...signalInit },
                     {
                         allowedProtocols: ['https:'],
                         allowedHosts: [sofaApiHost],
@@ -664,7 +745,7 @@ export function createSponsorHub({
             }
         }
 
-        if (sofaCreds.hasMcp) {
+        if (sofaCreds.hasMcp && !signal?.aborted) {
             const sofaUrl = sofaCreds.mcpUrl;
             let sofaHost = 'api.factory.8090.dev';
             try {
@@ -688,7 +769,8 @@ export function createSponsorHub({
                         id: `deadbolt-sync-${rawId}`,
                         method: 'tools/list',
                         params: {}
-                    })
+                    }),
+                    ...signalInit
                 },
                 {
                     allowedProtocols: ['https:'],
@@ -740,7 +822,7 @@ export function createSponsorHub({
                     autoLinkedWorkOrderId: rawId
                 },
                 blueprintDriftReport,
-                liveMcpSync
+                liveMcpSync: scrubPrivateNetworkStrings(liveMcpSync)
             }
         );
     }
@@ -1077,7 +1159,8 @@ export function createSponsorHub({
         const overrideAttempted = Boolean(forceUntrustedOverride);
         const unauthorizedRepoOverride =
             typeof targetRepo !== 'string' ||
-            !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo);
+            targetRepo.includes('..') ||
+            !SAFE_TARGET_REPO_RE.test(targetRepo);
 
         if (hasInjectionInTitle || unauthorizedRepoOverride || overrideAttempted) {
             return errorEnvelope(
@@ -1480,15 +1563,65 @@ export function createSponsorHub({
         );
     }
 
+    const foremanTtsCache = new Map();
+
+    function getCachedForemanTts(cacheKey) {
+        if (!foremanTtsCache.has(cacheKey)) {
+            return null;
+        }
+        const entry = foremanTtsCache.get(cacheKey);
+        foremanTtsCache.delete(cacheKey);
+        foremanTtsCache.set(cacheKey, entry);
+        return entry;
+    }
+
+    function setCachedForemanTts(cacheKey, entry) {
+        if (foremanTtsCache.has(cacheKey)) {
+            foremanTtsCache.delete(cacheKey);
+        } else if (foremanTtsCache.size >= MAX_FOREMAN_TTS_CACHE) {
+            const oldestKey = foremanTtsCache.keys().next().value;
+            if (oldestKey !== undefined) {
+                foremanTtsCache.delete(oldestKey);
+            }
+        }
+        foremanTtsCache.set(cacheKey, entry);
+    }
+
+    function sanitizeForemanSpeechText(rawText, rawReason, eventType) {
+        const candidateRaw =
+            typeof rawText === 'string' && rawText.trim().length > 0
+                ? rawText
+                : typeof rawReason === 'string' && rawReason.trim().length > 0
+                  ? rawReason
+                  : '';
+        const cleaned = scrubPrivateNetworkStrings(
+            String(candidateRaw)
+                .replace(FOREMAN_UNSAFE_TEXT_RE, ' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+        )
+            .slice(0, MAX_FOREMAN_SPEECH_CHARS)
+            .trim();
+        if (cleaned && /[A-Za-z0-9]/.test(cleaned)) {
+            return cleaned;
+        }
+        return String(defaultForemanTranscript(eventType))
+            .replace(FOREMAN_UNSAFE_TEXT_RE, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, MAX_FOREMAN_SPEECH_CHARS);
+    }
+
     /**
      * Synthesize Factory Foreman audio telemetry via ElevenLabs streaming TTS (safeFetch)
      * or crisp offline 22050 Hz PCM16 WAV industrial breaker chime (encodeWavPcm16 + parseWavHeader).
      */
-    async function synthesizeForemanAlert({ text = '', eventType = 'WORKAROUND_REJECTED' } = {}) {
-        const transcript =
-            typeof text === 'string' && text.trim().length > 0
-                ? text.trim().slice(0, 1000)
-                : defaultForemanTranscript(eventType);
+    async function synthesizeForemanAlert({
+        text = '',
+        reason = '',
+        eventType = 'WORKAROUND_REJECTED'
+    } = {}) {
+        const cleanSpeechText = sanitizeForemanSpeechText(text, reason, eventType);
 
         const voiceId = SAFE_VOICE_ID_RE.test(String(safeConfig.elevenlabsVoiceId || ''))
             ? String(safeConfig.elevenlabsVoiceId)
@@ -1499,6 +1632,25 @@ export function createSponsorHub({
             const resolvedModelId =
                 String(safeConfig.elevenlabsModelId || DEFAULT_ELEVENLABS_MODEL_ID).trim() ||
                 DEFAULT_ELEVENLABS_MODEL_ID;
+            const speechHash = crypto.createHash('sha256').update(cleanSpeechText, 'utf8').digest('hex');
+            const cacheKey = `${voiceId}:${resolvedModelId}:${speechHash}`;
+            const cachedEntry = getCachedForemanTts(cacheKey);
+            if (cachedEntry) {
+                return okEnvelope(
+                    'deadbolt.sponsors.foreman_tts',
+                    `Loaded cached ElevenLabs Foreman voice alert (${cachedEntry.byteLength} bytes).`,
+                    {
+                        mode: cachedEntry.mode,
+                        eventType,
+                        transcript: cleanSpeechText,
+                        mimeType: cachedEntry.mimeType,
+                        byteLength: cachedEntry.byteLength,
+                        audioBase64: cachedEntry.audioBase64,
+                        cached: true
+                    }
+                );
+            }
+
             const ttsRes = await safeFetch(
                 ttsUrl,
                 {
@@ -1509,7 +1661,7 @@ export function createSponsorHub({
                         'xi-api-key': safeConfig.elevenlabsApiKey.trim()
                     },
                     body: JSON.stringify({
-                        text: transcript,
+                        text: cleanSpeechText,
                         model_id: resolvedModelId,
                         ...(resolvedModelId === 'eleven_turbo_v2_5' ? { language_code: 'en' } : {}),
                         voice_settings: {
@@ -1544,16 +1696,24 @@ export function createSponsorHub({
                     ]);
                     if (mp3ArrayBuffer.byteLength > 0 && mp3ArrayBuffer.byteLength <= 5 * 1024 * 1024) {
                         const mp3Buffer = Buffer.from(mp3ArrayBuffer);
+                        const audioBase64 = mp3Buffer.toString('base64');
+                        setCachedForemanTts(cacheKey, {
+                            audioBase64,
+                            mimeType: 'audio/mpeg',
+                            mode: 'elevenlabs_live',
+                            byteLength: mp3Buffer.byteLength
+                        });
                         return okEnvelope(
                             'deadbolt.sponsors.foreman_tts',
                             `Synthesized live ElevenLabs Foreman voice alert (${mp3Buffer.byteLength} bytes).`,
                             {
                                 mode: 'elevenlabs_live',
                                 eventType,
-                                transcript,
+                                transcript: cleanSpeechText,
                                 mimeType: 'audio/mpeg',
                                 byteLength: mp3Buffer.byteLength,
-                                audioBase64: mp3Buffer.toString('base64')
+                                audioBase64,
+                                cached: false
                             }
                         );
                     }
@@ -1586,7 +1746,7 @@ export function createSponsorHub({
             {
                 mode: 'pcm16_breaker_synth',
                 eventType,
-                transcript,
+                transcript: cleanSpeechText,
                 mimeType: 'audio/wav',
                 byteLength: wavBuffer.byteLength,
                 audioBase64: wavBuffer.toString('base64'),
@@ -1741,6 +1901,7 @@ export function createSponsorHub({
     const SOFA_SNAPSHOT_TTL_MS = 15000;
     const SOFA_LIVE_WO_REUSE_MS = 60000;
     let governanceSnapshotCache = null;
+    let inFlightGovernancePromise = null;
 
     function buildOfflineSofaGovernanceData(sofaCreds, fallbackReason = null) {
         return {
@@ -1960,311 +2121,322 @@ export function createSponsorHub({
             return governanceSnapshotCache.envelope;
         }
 
-        const sofaCreds = resolveSofaCredentials();
-        if (!sofaCreds.hasOrgAdmin && !sofaCreds.hasExternalApi) {
-            const offlineData = scrubPrivateNetworkStrings(
-                buildOfflineSofaGovernanceData(sofaCreds)
-            );
-            const offlineEnv = okEnvelope(
-                'deadbolt.sponsors.sofa_governance',
-                'Loaded deterministic local 8090 Software Factory governance manifest.',
-                offlineData
-            );
-            governanceSnapshotCache = {
-                fetchedAtMs: nowMs,
-                expiresAtMs: nowMs + SOFA_SNAPSHOT_TTL_MS,
-                envelope: offlineEnv,
-                liveRawWorkOrders: null
-            };
-            return offlineEnv;
+        if (inFlightGovernancePromise) {
+            return inFlightGovernancePromise;
         }
 
-        let sofaApiHost = 'api.factory.8090.dev';
-        try {
-            sofaApiHost = new URL(sofaCreds.apiBaseUrl).hostname;
-        } catch {
-            sofaApiHost = 'api.factory.8090.dev';
-        }
+        inFlightGovernancePromise = (async () => {
+            const refreshStartedMs = Date.now();
+            const sofaCreds = resolveSofaCredentials();
+            if (!sofaCreds.hasOrgAdmin && !sofaCreds.hasExternalApi) {
+                const offlineData = scrubPrivateNetworkStrings(
+                    buildOfflineSofaGovernanceData(sofaCreds)
+                );
+                const offlineEnv = okEnvelope(
+                    'deadbolt.sponsors.sofa_governance',
+                    'Loaded deterministic local 8090 Software Factory governance manifest.',
+                    offlineData
+                );
+                governanceSnapshotCache = {
+                    fetchedAtMs: refreshStartedMs,
+                    expiresAtMs: refreshStartedMs + SOFA_SNAPSHOT_TTL_MS,
+                    envelope: offlineEnv,
+                    liveRawWorkOrders: null
+                };
+                return offlineEnv;
+            }
 
-        const nowIso = new Date(nowMs).toISOString();
-        const monthStartUtc = `${nowIso.slice(0, 7)}-01`;
-        const tomorrowUtc = new Date(nowMs + 86400000).toISOString().slice(0, 10);
+            let sofaApiHost = 'api.factory.8090.dev';
+            try {
+                sofaApiHost = new URL(sofaCreds.apiBaseUrl).hostname;
+            } catch {
+                sofaApiHost = 'api.factory.8090.dev';
+            }
 
-        const adminHeaders = sofaCreds.hasOrgAdmin
-            ? { Accept: 'application/json', 'X-API-Key': sofaCreds.adminKey }
-            : null;
-        const extHeaders = sofaCreds.hasExternalApi
-            ? { Accept: 'application/json', Authorization: `Bearer ${sofaCreds.externalKey}` }
-            : null;
+            const nowIso = new Date(refreshStartedMs).toISOString();
+            const monthStartUtc = `${nowIso.slice(0, 7)}-01`;
+            const tomorrowUtc = new Date(refreshStartedMs + 86400000).toISOString().slice(0, 10);
 
-        const [
-            spendRes,
-            usageRes,
-            woRes,
-            bpRes,
-            reqRes,
-            skillRes,
-            fbRes,
-            autoRes,
-            convRes
-        ] = await Promise.all([
-            adminHeaders
-                ? fetchSofaJson(
-                      `${sofaCreds.apiBaseUrl}/v2/organization-api/spend-status`,
-                      adminHeaders,
-                      sofaApiHost,
-                      'deadbolt.sponsors.sofa_spend'
-                  )
-                : Promise.resolve({ ok: false, json: null }),
-            adminHeaders
-                ? fetchSofaJson(
-                      `${sofaCreds.apiBaseUrl}/v2/organization-api/usage?start_date=${monthStartUtc}&end_date=${tomorrowUtc}`,
-                      adminHeaders,
-                      sofaApiHost,
-                      'deadbolt.sponsors.sofa_usage'
-                  )
-                : Promise.resolve({ ok: false, json: null }),
-            extHeaders
-                ? fetchSofaJson(
-                      `${sofaCreds.apiBaseUrl}/v2/external-api/work_orders?page=1&page_size=20`,
-                      extHeaders,
-                      sofaApiHost,
-                      'deadbolt.sponsors.sofa_wos'
-                  )
-                : Promise.resolve({ ok: false, json: null }),
-            extHeaders
-                ? fetchSofaJson(
-                      `${sofaCreds.apiBaseUrl}/v2/external-api/blueprints?page=1&page_size=20`,
-                      extHeaders,
-                      sofaApiHost,
-                      'deadbolt.sponsors.sofa_blueprints'
-                  )
-                : Promise.resolve({ ok: false, json: null }),
-            extHeaders
-                ? fetchSofaJson(
-                      `${sofaCreds.apiBaseUrl}/v2/external-api/requirements?page=1&page_size=20`,
-                      extHeaders,
-                      sofaApiHost,
-                      'deadbolt.sponsors.sofa_requirements'
-                  )
-                : Promise.resolve({ ok: false, json: null }),
-            extHeaders
-                ? fetchSofaJson(
-                      `${sofaCreds.apiBaseUrl}/v2/external-api/skills?page=1&page_size=50`,
-                      extHeaders,
-                      sofaApiHost,
-                      'deadbolt.sponsors.sofa_skills'
-                  )
-                : Promise.resolve({ ok: false, json: null }),
-            extHeaders
-                ? fetchSofaJson(
-                      `${sofaCreds.apiBaseUrl}/v2/external-api/feedback/items?page=1&page_size=20`,
-                      extHeaders,
-                      sofaApiHost,
-                      'deadbolt.sponsors.sofa_feedback_list'
-                  )
-                : Promise.resolve({ ok: false, json: null }),
-            extHeaders
-                ? fetchSofaJson(
-                      `${sofaCreds.apiBaseUrl}/v2/external-api/automations`,
-                      extHeaders,
-                      sofaApiHost,
-                      'deadbolt.sponsors.sofa_automations'
-                  )
-                : Promise.resolve({ ok: false, json: null }),
-            extHeaders
-                ? fetchSofaJson(
-                      `${sofaCreds.apiBaseUrl}/v2/external-api/agent_conversations?page=1&page_size=20`,
-                      extHeaders,
-                      sofaApiHost,
-                      'deadbolt.sponsors.sofa_conversations'
-                  )
-                : Promise.resolve({ ok: false, json: null })
-        ]);
+            const adminHeaders = sofaCreds.hasOrgAdmin
+                ? { Accept: 'application/json', 'X-API-Key': sofaCreds.adminKey }
+                : null;
+            const extHeaders = sofaCreds.hasExternalApi
+                ? { Accept: 'application/json', Authorization: `Bearer ${sofaCreds.externalKey}` }
+                : null;
 
-        const anyLive = Boolean(spendRes.ok || usageRes.ok || woRes.ok || bpRes.ok || autoRes.ok);
-        if (!anyLive) {
-            const fallbackData = scrubPrivateNetworkStrings(
-                buildOfflineSofaGovernanceData(sofaCreds, 'SOFA_API_UNREACHABLE')
+            const [
+                spendRes,
+                usageRes,
+                woRes,
+                bpRes,
+                reqRes,
+                skillRes,
+                fbRes,
+                autoRes,
+                convRes
+            ] = await Promise.all([
+                adminHeaders
+                    ? fetchSofaJson(
+                          `${sofaCreds.apiBaseUrl}/v2/organization-api/spend-status`,
+                          adminHeaders,
+                          sofaApiHost,
+                          'deadbolt.sponsors.sofa_spend'
+                      )
+                    : Promise.resolve({ ok: false, json: null }),
+                adminHeaders
+                    ? fetchSofaJson(
+                          `${sofaCreds.apiBaseUrl}/v2/organization-api/usage?start_date=${monthStartUtc}&end_date=${tomorrowUtc}`,
+                          adminHeaders,
+                          sofaApiHost,
+                          'deadbolt.sponsors.sofa_usage'
+                      )
+                    : Promise.resolve({ ok: false, json: null }),
+                extHeaders
+                    ? fetchSofaJson(
+                          `${sofaCreds.apiBaseUrl}/v2/external-api/work_orders?page=1&page_size=20`,
+                          extHeaders,
+                          sofaApiHost,
+                          'deadbolt.sponsors.sofa_wos'
+                      )
+                    : Promise.resolve({ ok: false, json: null }),
+                extHeaders
+                    ? fetchSofaJson(
+                          `${sofaCreds.apiBaseUrl}/v2/external-api/blueprints?page=1&page_size=20`,
+                          extHeaders,
+                          sofaApiHost,
+                          'deadbolt.sponsors.sofa_blueprints'
+                      )
+                    : Promise.resolve({ ok: false, json: null }),
+                extHeaders
+                    ? fetchSofaJson(
+                          `${sofaCreds.apiBaseUrl}/v2/external-api/requirements?page=1&page_size=20`,
+                          extHeaders,
+                          sofaApiHost,
+                          'deadbolt.sponsors.sofa_requirements'
+                      )
+                    : Promise.resolve({ ok: false, json: null }),
+                extHeaders
+                    ? fetchSofaJson(
+                          `${sofaCreds.apiBaseUrl}/v2/external-api/skills?page=1&page_size=50`,
+                          extHeaders,
+                          sofaApiHost,
+                          'deadbolt.sponsors.sofa_skills'
+                      )
+                    : Promise.resolve({ ok: false, json: null }),
+                extHeaders
+                    ? fetchSofaJson(
+                          `${sofaCreds.apiBaseUrl}/v2/external-api/feedback/items?page=1&page_size=20`,
+                          extHeaders,
+                          sofaApiHost,
+                          'deadbolt.sponsors.sofa_feedback_list'
+                      )
+                    : Promise.resolve({ ok: false, json: null }),
+                extHeaders
+                    ? fetchSofaJson(
+                          `${sofaCreds.apiBaseUrl}/v2/external-api/automations`,
+                          extHeaders,
+                          sofaApiHost,
+                          'deadbolt.sponsors.sofa_automations'
+                      )
+                    : Promise.resolve({ ok: false, json: null }),
+                extHeaders
+                    ? fetchSofaJson(
+                          `${sofaCreds.apiBaseUrl}/v2/external-api/agent_conversations?page=1&page_size=20`,
+                          extHeaders,
+                          sofaApiHost,
+                          'deadbolt.sponsors.sofa_conversations'
+                      )
+                    : Promise.resolve({ ok: false, json: null })
+            ]);
+
+            const anyLive = Boolean(spendRes.ok || usageRes.ok || woRes.ok || bpRes.ok || autoRes.ok);
+            if (!anyLive) {
+                const fallbackData = scrubPrivateNetworkStrings(
+                    buildOfflineSofaGovernanceData(sofaCreds, 'SOFA_API_UNREACHABLE')
+                );
+                const fallbackEnv = okEnvelope(
+                    'deadbolt.sponsors.sofa_governance',
+                    '8090 Software Factory API unreachable; serving deterministic local governance manifest.',
+                    fallbackData
+                );
+                governanceSnapshotCache = {
+                    fetchedAtMs: refreshStartedMs,
+                    expiresAtMs: refreshStartedMs + 5000,
+                    envelope: fallbackEnv,
+                    liveRawWorkOrders: null
+                };
+                return fallbackEnv;
+            }
+
+            const fullRawWoItems = Array.isArray(woRes.json?.items) ? woRes.json.items : [];
+            const rawWoItems = fullRawWoItems.slice(0, 8);
+            const commentResults =
+                extHeaders && rawWoItems.length > 0
+                    ? await Promise.all(
+                          rawWoItems.map((wo) => {
+                              const rawWoUuid = String(wo?.id || '').trim();
+                              if (!SAFE_WORK_ORDER_ID_RE.test(rawWoUuid)) {
+                                  return Promise.resolve({ ok: false, json: null });
+                              }
+                              return fetchSofaJson(
+                                  `${sofaCreds.apiBaseUrl}/v2/external-api/work_orders/${encodeURIComponent(rawWoUuid)}/comments`,
+                                  extHeaders,
+                                  sofaApiHost,
+                                  'deadbolt.sponsors.sofa_wo_comments'
+                              );
+                          })
+                      )
+                    : [];
+
+            const spendData = spendRes.json?.data || spendRes.json || {};
+            const usageItems = Array.isArray(usageRes.json?.items) ? usageRes.json.items : [];
+            let requestCount = 0;
+            let inputTokens = 0;
+            let outputTokens = 0;
+            let cacheReadTokens = 0;
+            let usageCostSum = 0;
+            for (const rec of usageItems) {
+                requestCount += Number(rec?.request_count || 0);
+                inputTokens += Number(rec?.input_tokens || 0);
+                outputTokens += Number(rec?.output_tokens || 0);
+                cacheReadTokens += Number(rec?.cache_read_tokens || 0);
+                usageCostSum += Number(rec?.token_cost_usd || 0);
+            }
+            const rawSpendUsd = Number(
+                spendData?.current_spend_usd ?? spendData?.current_period_spend_usd ?? usageCostSum
             );
-            const fallbackEnv = okEnvelope(
-                'deadbolt.sponsors.sofa_governance',
-                '8090 Software Factory API unreachable; serving deterministic local governance manifest.',
-                fallbackData
+            const spendUsd = Number.isFinite(rawSpendUsd) ? Number(rawSpendUsd.toFixed(6)) : 0;
+
+            const bpItems = Array.isArray(bpRes.json?.items) ? bpRes.json.items : [];
+            const reqItems = Array.isArray(reqRes.json?.items) ? reqRes.json.items : [];
+            const skillItems = Array.isArray(skillRes.json?.items) ? skillRes.json.items : [];
+            const fbItems = Array.isArray(fbRes.json?.items) ? fbRes.json.items : [];
+            const autoItems = Array.isArray(autoRes.json?.items) ? autoRes.json.items : [];
+            const convItems = Array.isArray(convRes.json?.items) ? convRes.json.items : [];
+
+            const matchedSkill = skillItems.find((s) =>
+                String(s?.title || s?.name || '').toLowerCase().includes('deadbolt')
             );
-            governanceSnapshotCache = {
-                fetchedAtMs: nowMs,
-                expiresAtMs: nowMs + 5000,
-                envelope: fallbackEnv,
-                liveRawWorkOrders: null
-            };
-            return fallbackEnv;
-        }
 
-        const fullRawWoItems = Array.isArray(woRes.json?.items) ? woRes.json.items : [];
-        const rawWoItems = fullRawWoItems.slice(0, 8);
-        const commentResults =
-            extHeaders && rawWoItems.length > 0
-                ? await Promise.all(
-                      rawWoItems.map((wo) => {
-                          const rawWoUuid = String(wo?.id || '').trim();
-                          if (!SAFE_WORK_ORDER_ID_RE.test(rawWoUuid)) {
-                              return Promise.resolve({ ok: false, json: null });
-                          }
-                          return fetchSofaJson(
-                              `${sofaCreds.apiBaseUrl}/v2/external-api/work_orders/${encodeURIComponent(rawWoUuid)}/comments`,
-                              extHeaders,
-                              sofaApiHost,
-                              'deadbolt.sponsors.sofa_wo_comments'
-                          );
-                      })
-                  )
-                : [];
+            const normalizedWorkOrders = rawWoItems.map((wo, idx) => {
+                const cJson = commentResults[idx]?.json;
+                const cList = Array.isArray(cJson?.items)
+                    ? cJson.items
+                    : Array.isArray(cJson?.data)
+                      ? cJson.data
+                      : [];
+                const matchedReceipt = findLatestGovernanceReceiptComment(cList);
+                const preferredComment =
+                    matchedReceipt || (cList.length > 0 ? cList[cList.length - 1] : null);
+                const preferredMarkdown =
+                    preferredComment?.markdown_content ??
+                    preferredComment?.body ??
+                    preferredComment?.content ??
+                    '';
+                return {
+                    workOrderNumber: wo?.work_order_number ?? idx + 1,
+                    code: extractWorkOrderCode(wo?.title, wo?.work_order_number ?? idx + 1),
+                    title: String(wo?.title || `Work Order #${idx + 1}`),
+                    status: String(wo?.status || 'ready'),
+                    priority: String(wo?.priority || 'medium'),
+                    type: String(wo?.type || 'fix'),
+                    commentCount: cList.length,
+                    hasVerifiedReceipt: Boolean(matchedReceipt),
+                    latestGovernanceHeading: extractCommentHeading(preferredMarkdown)
+                };
+            });
 
-        const spendData = spendRes.json?.data || spendRes.json || {};
-        const usageItems = Array.isArray(usageRes.json?.items) ? usageRes.json.items : [];
-        let requestCount = 0;
-        let inputTokens = 0;
-        let outputTokens = 0;
-        let cacheReadTokens = 0;
-        let usageCostSum = 0;
-        for (const rec of usageItems) {
-            requestCount += Number(rec?.request_count || 0);
-            inputTokens += Number(rec?.input_tokens || 0);
-            outputTokens += Number(rec?.output_tokens || 0);
-            cacheReadTokens += Number(rec?.cache_read_tokens || 0);
-            usageCostSum += Number(rec?.token_cost_usd || 0);
-        }
-        const rawSpendUsd = Number(
-            spendData?.current_spend_usd ?? spendData?.current_period_spend_usd ?? usageCostSum
-        );
-        const spendUsd = Number.isFinite(rawSpendUsd) ? Number(rawSpendUsd.toFixed(6)) : 0;
+            const normalizedAutomations = autoItems.map((auto) => ({
+                name: String(auto?.name || '8090 Automation'),
+                enabled: Boolean(auto?.enabled),
+                model: String(auto?.model || 'sonnet-5.5'),
+                triggers: Array.isArray(auto?.triggers)
+                    ? auto.triggers
+                          .map((t) => String(t?.trigger_type || '').trim())
+                          .filter(Boolean)
+                    : [],
+                permissionOverrides: Array.isArray(auto?.tool_kit?.permission_overrides)
+                    ? auto.tool_kit.permission_overrides.map((po) => ({
+                          domain: String(po?.domain || ''),
+                          restriction: String(po?.restriction || '')
+                      }))
+                    : [],
+                totalRuns30d: Number(auto?.total_runs_30d || 0),
+                successfulRuns30d: Number(auto?.successful_runs_30d || 0)
+            }));
 
-        const bpItems = Array.isArray(bpRes.json?.items) ? bpRes.json.items : [];
-        const reqItems = Array.isArray(reqRes.json?.items) ? reqRes.json.items : [];
-        const skillItems = Array.isArray(skillRes.json?.items) ? skillRes.json.items : [];
-        const fbItems = Array.isArray(fbRes.json?.items) ? fbRes.json.items : [];
-        const autoItems = Array.isArray(autoRes.json?.items) ? autoRes.json.items : [];
-        const convItems = Array.isArray(convRes.json?.items) ? convRes.json.items : [];
+            const normalizedAgentRuns = convItems.slice(0, 6).map((conv) => ({
+                title: String(conv?.title || 'Factory Agent Run'),
+                automationName: String(conv?.automation?.automation_name || conv?.title || ''),
+                status: String(conv?.automation?.run_status || 'success'),
+                completedAt: conv?.automation?.run_completed_at || conv?.updated_at || null
+            }));
 
-        const matchedSkill = skillItems.find((s) =>
-            String(s?.title || s?.name || '').toLowerCase().includes('deadbolt')
-        );
-
-        const normalizedWorkOrders = rawWoItems.map((wo, idx) => {
-            const cJson = commentResults[idx]?.json;
-            const cList = Array.isArray(cJson?.items)
-                ? cJson.items
-                : Array.isArray(cJson?.data)
-                  ? cJson.data
-                  : [];
-            const matchedReceipt = findLatestGovernanceReceiptComment(cList);
-            const preferredComment =
-                matchedReceipt || (cList.length > 0 ? cList[cList.length - 1] : null);
-            const preferredMarkdown =
-                preferredComment?.markdown_content ??
-                preferredComment?.body ??
-                preferredComment?.content ??
-                '';
-            return {
-                workOrderNumber: wo?.work_order_number ?? idx + 1,
-                code: extractWorkOrderCode(wo?.title, wo?.work_order_number ?? idx + 1),
-                title: String(wo?.title || `Work Order #${idx + 1}`),
-                status: String(wo?.status || 'ready'),
-                priority: String(wo?.priority || 'medium'),
-                type: String(wo?.type || 'fix'),
-                commentCount: cList.length,
-                hasVerifiedReceipt: Boolean(matchedReceipt),
-                latestGovernanceHeading: extractCommentHeading(preferredMarkdown)
-            };
-        });
-
-        const normalizedAutomations = autoItems.map((auto) => ({
-            name: String(auto?.name || '8090 Automation'),
-            enabled: Boolean(auto?.enabled),
-            model: String(auto?.model || 'sonnet-5.5'),
-            triggers: Array.isArray(auto?.triggers)
-                ? auto.triggers
-                      .map((t) => String(t?.trigger_type || '').trim())
-                      .filter(Boolean)
-                : [],
-            permissionOverrides: Array.isArray(auto?.tool_kit?.permission_overrides)
-                ? auto.tool_kit.permission_overrides.map((po) => ({
-                      domain: String(po?.domain || ''),
-                      restriction: String(po?.restriction || '')
-                  }))
-                : [],
-            totalRuns30d: Number(auto?.total_runs_30d || 0),
-            successfulRuns30d: Number(auto?.successful_runs_30d || 0)
-        }));
-
-        const normalizedAgentRuns = convItems.slice(0, 6).map((conv) => ({
-            title: String(conv?.title || 'Factory Agent Run'),
-            automationName: String(conv?.automation?.automation_name || conv?.title || ''),
-            status: String(conv?.automation?.run_status || 'success'),
-            completedAt: conv?.automation?.run_completed_at || conv?.updated_at || null
-        }));
-
-        const snapshotData = scrubPrivateNetworkStrings({
-            liveConnected: true,
-            mode: sofaCreds.mode,
-            endpoint: sanitizeEndpointForDisplay(
-                sofaCreds.apiBaseUrl,
-                DEFAULT_SOFA_API_BASE_URL
-            ),
-            orgUsage: {
-                commercialModel: String(spendData?.commercial_model || 'enterprise'),
-                billingPeriod: {
-                    startDate: String(
-                        spendData?.current_billing_period?.start_date || monthStartUtc
-                    ),
-                    endDate: String(spendData?.current_billing_period?.end_date || tomorrowUtc)
+            const snapshotData = scrubPrivateNetworkStrings({
+                liveConnected: true,
+                mode: sofaCreds.mode,
+                endpoint: sanitizeEndpointForDisplay(
+                    sofaCreds.apiBaseUrl,
+                    DEFAULT_SOFA_API_BASE_URL
+                ),
+                orgUsage: {
+                    commercialModel: String(spendData?.commercial_model || 'enterprise'),
+                    billingPeriod: {
+                        startDate: String(
+                            spendData?.current_billing_period?.start_date || monthStartUtc
+                        ),
+                        endDate: String(spendData?.current_billing_period?.end_date || tomorrowUtc)
+                    },
+                    spendUsd,
+                    requestCount,
+                    inputTokens,
+                    outputTokens,
+                    cacheReadTokens,
+                    totalTokens: inputTokens + outputTokens,
+                    asOf:
+                        usageRes.json?.usage_freshness?.as_of ||
+                        spendData?.usage_freshness?.as_of ||
+                        nowIso
                 },
-                spendUsd,
-                requestCount,
-                inputTokens,
-                outputTokens,
-                cacheReadTokens,
-                totalTokens: inputTokens + outputTokens,
-                asOf:
-                    usageRes.json?.usage_freshness?.as_of ||
-                    spendData?.usage_freshness?.as_of ||
-                    nowIso
-            },
-            inventory: {
-                workOrderCount: Number(woRes.json?.total ?? normalizedWorkOrders.length),
-                blueprintCount: Number(bpRes.json?.total ?? bpItems.length),
-                requirementCount: Number(reqRes.json?.total ?? reqItems.length),
-                skillCount: Number(skillRes.json?.total ?? skillItems.length),
-                feedbackCount: Number(fbRes.json?.total ?? fbItems.length),
-                blueprints: bpItems.slice(0, 6).map((b) => ({
-                    title: String(b?.title || 'Blueprint')
-                })),
-                requirements: reqItems.slice(0, 8).map((r) => ({
-                    title: String(r?.title || 'Requirement'),
-                    documentType: String(r?.document_type || 'FEATURE')
-                })),
-                governedSkillTitle: matchedSkill
-                    ? String(matchedSkill.title || matchedSkill.name)
-                    : 'DEADBOLT Stage 4 Governance & SOX-Style Reconciliation'
-            },
-            workOrders: normalizedWorkOrders,
-            automations: normalizedAutomations,
-            agentRuns: normalizedAgentRuns
+                inventory: {
+                    workOrderCount: Number(woRes.json?.total ?? normalizedWorkOrders.length),
+                    blueprintCount: Number(bpRes.json?.total ?? bpItems.length),
+                    requirementCount: Number(reqRes.json?.total ?? reqItems.length),
+                    skillCount: Number(skillRes.json?.total ?? skillItems.length),
+                    feedbackCount: Number(fbRes.json?.total ?? fbItems.length),
+                    blueprints: bpItems.slice(0, 6).map((b) => ({
+                        title: String(b?.title || 'Blueprint')
+                    })),
+                    requirements: reqItems.slice(0, 8).map((r) => ({
+                        title: String(r?.title || 'Requirement'),
+                        documentType: String(r?.document_type || 'FEATURE')
+                    })),
+                    governedSkillTitle: matchedSkill
+                        ? String(matchedSkill.title || matchedSkill.name)
+                        : 'DEADBOLT Stage 4 Governance & SOX-Style Reconciliation'
+                },
+                workOrders: normalizedWorkOrders,
+                automations: normalizedAutomations,
+                agentRuns: normalizedAgentRuns
+            });
+
+            const liveEnv = okEnvelope(
+                'deadbolt.sponsors.sofa_governance',
+                `Loaded live 8090 Software Factory governance state (${snapshotData.inventory.workOrderCount} WOs, ${snapshotData.automations.length} locked automations, $${spendUsd.toFixed(4)} org spend).`,
+                snapshotData
+            );
+            governanceSnapshotCache = {
+                fetchedAtMs: refreshStartedMs,
+                expiresAtMs: refreshStartedMs + SOFA_SNAPSHOT_TTL_MS,
+                envelope: liveEnv,
+                liveRawWorkOrders: woRes.ok ? fullRawWoItems : null
+            };
+            return liveEnv;
+        })().finally(() => {
+            inFlightGovernancePromise = null;
         });
 
-        const liveEnv = okEnvelope(
-            'deadbolt.sponsors.sofa_governance',
-            `Loaded live 8090 Software Factory governance state (${snapshotData.inventory.workOrderCount} WOs, ${snapshotData.automations.length} locked automations, $${spendUsd.toFixed(4)} org spend).`,
-            snapshotData
-        );
-        governanceSnapshotCache = {
-            fetchedAtMs: nowMs,
-            expiresAtMs: nowMs + SOFA_SNAPSHOT_TTL_MS,
-            envelope: liveEnv,
-            liveRawWorkOrders: woRes.ok ? fullRawWoItems : null
-        };
-        return liveEnv;
+        return inFlightGovernancePromise;
     }
 
     function formatStage4GovernanceReceiptMarkdown({

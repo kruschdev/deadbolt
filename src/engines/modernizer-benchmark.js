@@ -7,6 +7,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,7 +22,8 @@ import {
 import { scoreLegoBrickCoverage } from '@krusch/toolkit/catalog';
 import { safeFetch, validateOutboundUrl } from '@krusch/toolkit/security';
 import { chat } from '@krusch/toolkit/llm';
-import { normalizeGitHubRepoInput } from './planner-graph.js';
+import { scrubPrivateNetworkStrings } from '../connectors/hydradb-graph.js';
+import { normalizeGitHubRepoInput, scrubPrivateIpLiterals } from './planner-graph.js';
 import { parseReviewerVerdictPayload } from './validator-gate.js';
 
 const execFileAsync = promisify(execFile);
@@ -122,12 +124,8 @@ function hasMeasuredTokenUsage(usage) {
 
 function deriveRepoVertexId(repoSlug, relPath) {
     const seed = `${repoSlug}::${relPath}`;
-    let hash = 2166136261;
-    for (let i = 0; i < seed.length; i += 1) {
-        hash ^= seed.charCodeAt(i);
-        hash = Math.imul(hash, 16777619);
-    }
-    return 100_000 + ((hash >>> 0) % 800_000);
+    const digest = crypto.createHash('sha256').update(seed, 'utf8').digest();
+    return (digest.readUIntBE(0, 6) % 900_000_000_000) + 1_000_000;
 }
 
 function extractCleanCodeBlock(rawText = '') {
@@ -538,7 +536,7 @@ export function isStructurallyCompleteGoldenBrickModule(rawCode = '') {
     }
 }
 
-const DIRECT_ESM_TARGET_EXT_RE = /\.(?:js|mjs|ts)$/i;
+const DIRECT_ESM_TARGET_EXT_RE = /\.(?:js|mjs)$/i;
 const EXEMPT_OR_TEST_SEGMENT_RE =
     /^(?:krusch_toolkit|krusch-stack|tests?|__tests__|benchmarks?|node_modules|site-packages|__pycache__|vendor|third_party|_?archive|archive_scratch|scratch)$/i;
 const TEST_OR_CONFIG_NOISE_RE =
@@ -657,8 +655,19 @@ function buildDeterministicGoldenBrickModule({ relPath, targetPath, findings = [
         /[^A-Za-z0-9._/-]/g,
         ''
     );
-    const ruleSummary = findings.map((f) => f.ruleId || 'legacy-hazard').slice(0, 3).join(', ') || 'legacy-plumbing';
-    const hopSummary = neighborPaths.slice(0, 3).join(', ') || 'leaf-module';
+    const ruleSummary =
+        findings
+            .map((f) => f.ruleId || 'legacy-hazard')
+            .slice(0, 3)
+            .join(', ')
+            .replace(/[^A-Za-z0-9._/, -]+/g, ' ')
+            .trim() || 'legacy-plumbing';
+    const hopSummary =
+        neighborPaths
+            .slice(0, 3)
+            .join(', ')
+            .replace(/[^A-Za-z0-9._/, -]+/g, ' ')
+            .trim() || 'leaf-module';
 
     const usesMonetaryMath =
         DOMAIN_CRITICAL_HINT_RE.test(safeSource) ||
@@ -1066,10 +1075,25 @@ export function createModernizerBenchmarkEngine({
                 await execFileAsync(
                     'git',
                     [
+                        '-c',
+                        'credential.helper=',
+                        '-c',
+                        'core.askPass=',
+                        '-c',
+                        'core.symlinks=false',
+                        '-c',
+                        'protocol.file.allow=never',
+                        '-c',
+                        'filter.lfs.smudge=',
+                        '-c',
+                        'filter.lfs.process=',
+                        '-c',
+                        'filter.lfs.required=false',
                         'clone',
                         '--depth',
                         '1',
                         '--single-branch',
+                        '--no-tags',
                         '--filter=blob:limit=256k',
                         '--',
                         cleanHttpsUrl,
@@ -1079,14 +1103,24 @@ export function createModernizerBenchmarkEngine({
                         timeout: 12_000,
                         killSignal: 'SIGKILL',
                         maxBuffer: 4 * 1024 * 1024,
-                        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+                        env: {
+                            PATH: process.env.PATH || '/usr/bin:/bin',
+                            HOME: os.tmpdir(),
+                            GIT_TERMINAL_PROMPT: '0',
+                            GIT_ASKPASS: '',
+                            SSH_ASKPASS: '',
+                            GIT_CONFIG_NOSYSTEM: '1'
+                        }
                     }
                 );
             } catch (err) {
                 fs.rmSync(cloneDir, { recursive: true, force: true });
+                const scrubbedCloneErr = scrubPrivateIpLiterals(
+                    String(scrubPrivateNetworkStrings(String(err?.message || 'clone error')))
+                );
                 return errorEnvelope(
                     'GIT_CLONE_FAILED',
-                    `Shallow git clone failed for ${repoSlug}: ${err?.message || 'clone error'}`,
+                    `Shallow git clone failed for ${repoSlug}: ${scrubbedCloneErr}`,
                     { repo: repoSlug },
                     'deadbolt.modernizer'
                 );
@@ -1265,10 +1299,10 @@ export function createModernizerBenchmarkEngine({
                     .queryOpenCypher(
                         [
                             'MATCH (src:CodeFile {id: $start})-[:DEPENDED_ON_BY*1..2]->(dst:CodeFile)',
-                            'WHERE dst.id <> $start',
+                            'WHERE dst.id <> $start AND src.repo = $repo AND dst.repo = $repo',
                             'RETURN dst.path AS filePath'
                         ].join('\n'),
-                        { start: startId }
+                        { start: startId, repo: repoSlug }
                     )
                     .catch(() => null);
                 if (!blastRes?.ok) {
@@ -1419,13 +1453,18 @@ export function createModernizerBenchmarkEngine({
         const { repoDir, ownedTempDir, repoSlug, displayTarget, hintedFile = '' } = matEnv.data;
 
         try {
+            const effectiveRequestedFile = String(targetFile || hintedFile || '').trim();
             const scanEnv = await planner.scanExternalRepository({
                 repoUrlOrPath: repoDir,
-                maxFiles
+                maxFiles,
+                hintedFile: effectiveRequestedFile
             });
             if (!scanEnv.ok) {
                 return scanEnv;
             }
+
+            const fullScanEdges =
+                scanEnv.data?.dependencyEdges || scanEnv.data?.dependencyPreview || [];
 
             // Collect full source contents for all scanned files from repoDir
             const topPaths = new Set();
@@ -1438,7 +1477,7 @@ export function createModernizerBenchmarkEngine({
             for (const tf of scanEnv.data?.topFiles || []) {
                 if (tf.filePath) topPaths.add(tf.filePath);
             }
-            for (const edge of scanEnv.data?.dependencyPreview || []) {
+            for (const edge of fullScanEdges) {
                 if (edge.from) topPaths.add(edge.from);
                 if (edge.to) topPaths.add(edge.to);
             }
@@ -1463,13 +1502,16 @@ export function createModernizerBenchmarkEngine({
             }
 
             const findings = scanEnv.data?.slopAudit?.findings || [];
-            const edges = scanEnv.data?.dependencyPreview || [];
-            const effectiveRequestedFile = String(targetFile || hintedFile || '').trim();
+            const edges = fullScanEdges;
+            const resolvedWaveHint =
+                typeof scanEnv.data?.hintedFile === 'string'
+                    ? scanEnv.data.hintedFile.trim()
+                    : effectiveRequestedFile;
             const { wave } = selectModernizationWave({
                 fileEntries,
                 findings,
                 edges,
-                requestedFile: effectiveRequestedFile
+                requestedFile: resolvedWaveHint
             });
 
             if (wave.length === 0) {
@@ -1532,19 +1574,24 @@ export function createModernizerBenchmarkEngine({
                       };
 
             async function callFrontierWithFailover(sysPrompt, usrPrompt, opts = {}) {
-                const { timeoutMs = 14_000, signal: externalSignal, ...restOpts } = opts;
+                const {
+                    timeoutMs = 10_000,
+                    backupTimeoutMs = 8_000,
+                    signal: externalSignal,
+                    ...restOpts
+                } = opts;
                 if (externalSignal?.aborted) {
                     return { res: null, usedCfg: frontierBackupConfig, failed: true };
                 }
-                const buildSignal = () =>
+                const buildSignal = (hopTimeoutMs) =>
                     externalSignal && !externalSignal.aborted
-                        ? AbortSignal.any([AbortSignal.timeout(timeoutMs), externalSignal])
-                        : AbortSignal.timeout(timeoutMs);
+                        ? AbortSignal.any([AbortSignal.timeout(hopTimeoutMs), externalSignal])
+                        : AbortSignal.timeout(hopTimeoutMs);
 
                 try {
                     const primaryRes = await callImpl(sysPrompt, usrPrompt, frontierConfig, {
                         ...restOpts,
-                        signal: buildSignal()
+                        signal: buildSignal(timeoutMs)
                     });
                     return { res: primaryRes, usedCfg: frontierConfig, failed: false };
                 } catch {
@@ -1554,7 +1601,7 @@ export function createModernizerBenchmarkEngine({
                     try {
                         const backupRes = await callImpl(sysPrompt, usrPrompt, frontierBackupConfig, {
                             ...restOpts,
-                            signal: buildSignal()
+                            signal: buildSignal(backupTimeoutMs)
                         });
                         return { res: backupRes, usedCfg: frontierBackupConfig, failed: false };
                     } catch {
@@ -1699,9 +1746,10 @@ export function createModernizerBenchmarkEngine({
                         const { res, usedCfg } = await callFrontierWithFailover(sysPrompt, usrPrompt, {
                             returnFullResponse: true,
                             bypassCascade: true,
-                            maxTokens: 900,
+                            maxTokens: 2048,
                             temperature: 0.1,
-                            timeoutMs: 14_000
+                            timeoutMs: 10_000,
+                            backupTimeoutMs: 8_000
                         });
                         const code =
                             extractCleanCodeBlock(res?.text) ||
@@ -1750,9 +1798,10 @@ export function createModernizerBenchmarkEngine({
                     const { res: revRes, usedCfg: revCfg } = await callFrontierWithFailover(revSys, revUsr, {
                         returnFullResponse: true,
                         bypassCascade: true,
-                        maxTokens: 250,
+                        maxTokens: 1024,
                         temperature: 0.0,
-                        timeoutMs: 12_000
+                        timeoutMs: 10_000,
+                        backupTimeoutMs: 8_000
                     });
                     const measuredRev = hasMeasuredTokenUsage(revRes?.usage);
                     reviewUsageEstimated = !measuredRev;
@@ -1839,7 +1888,7 @@ export function createModernizerBenchmarkEngine({
                 if (
                     hasLiveApi &&
                     localFastConfig &&
-                    routedWave.some((w) => w.role !== 'domain_seam')
+                    (routedWave.some((w) => w.role !== 'domain_seam') || !llmConfig.openRouterApiKey)
                 ) {
                     ollamaProbeReachable = await probeOllamaTagsReachable(llmConfig.ollamaUrl);
                 }
@@ -1920,9 +1969,9 @@ export function createModernizerBenchmarkEngine({
                             res = await callImpl(sysPrompt, usrPrompt, primaryCfg, {
                                 returnFullResponse: true,
                                 bypassCascade: true,
-                                maxTokens: 1200,
+                                maxTokens: 2048,
                                 temperature: 0.0,
-                                signal: AbortSignal.timeout(isDomain ? 14_000 : 7_500)
+                                signal: AbortSignal.timeout(isDomain ? 10_000 : 7_500)
                             });
                         } catch {
                             // Automatic Cascade Circuit-Breaker failover (local GPU -> fast cloud -> backup cloud, or primary frontier -> backup frontier)
@@ -1935,9 +1984,9 @@ export function createModernizerBenchmarkEngine({
                                 res = await callImpl(sysPrompt, usrPrompt, usedCfg, {
                                     returnFullResponse: true,
                                     bypassCascade: true,
-                                    maxTokens: 1200,
+                                    maxTokens: 2048,
                                     temperature: 0.0,
-                                    signal: AbortSignal.timeout(12_000)
+                                    signal: AbortSignal.timeout(8_000)
                                 });
                             } catch {
                                 res = null;
@@ -2000,24 +2049,91 @@ export function createModernizerBenchmarkEngine({
                     })
                 );
 
-                // Stage all modernized files in isolated Stage 3 Foundry workspace to produce a real unified diff
+                // Stage all modernized files in a lightweight wave-only staging directory to produce a real unified diff
                 const edits = fileReceipts.map((r) => ({
                     file_path: r.targetPath,
                     content: r.code
                 }));
-                const stageEnv = foundry.stageWorkOrderEdits({
-                    workOrderId: 'WO-101',
-                    goal: `HydraDB + Cascade modernization of ${repoSlug}`,
-                    repoDir,
-                    edits
-                });
-                const stagedTaskId = stageEnv?.ok ? stageEnv.data?.taskId ?? null : null;
-                const stagedUnifiedDiff = stageEnv?.ok ? stageEnv.data?.unifiedDiff ?? '' : '';
-                if (stageEnv?.ok && stageEnv.data?.taskId) {
+                const waveStageRepoDir = fs.mkdtempSync(
+                    path.join(os.tmpdir(), 'deadbolt-wave-stage-')
+                );
+                let stagedTaskId = null;
+                let stagedUnifiedDiff = '';
+                try {
+                    const waveRelCandidates = new Set();
+                    for (const wItem of routedWave) {
+                        if (wItem.filePath) waveRelCandidates.add(wItem.filePath);
+                        if (wItem.targetPath) waveRelCandidates.add(wItem.targetPath);
+                    }
+                    for (const rawRel of waveRelCandidates) {
+                        const cleanRel = String(rawRel || '')
+                            .replace(/\\/g, '/')
+                            .replace(/^\/+/, '');
+                        if (!cleanRel || cleanRel.includes('\0')) continue;
+                        const segs = cleanRel.split('/').filter(Boolean);
+                        if (segs.length === 0 || segs.some((seg) => seg === '.' || seg === '..')) {
+                            continue;
+                        }
+                        const srcAbs = path.resolve(resolvedRepoRoot, cleanRel);
+                        const dstAbs = path.resolve(waveStageRepoDir, cleanRel);
+                        if (
+                            !srcAbs.startsWith(resolvedRepoRoot + path.sep) ||
+                            !dstAbs.startsWith(waveStageRepoDir + path.sep)
+                        ) {
+                            continue;
+                        }
+                        let curPath = resolvedRepoRoot;
+                        let safeRegularFile = true;
+                        for (let i = 0; i < segs.length; i += 1) {
+                            curPath = path.join(curPath, segs[i]);
+                            try {
+                                const st = fs.lstatSync(curPath);
+                                if (st.isSymbolicLink()) {
+                                    safeRegularFile = false;
+                                    break;
+                                }
+                                if (i < segs.length - 1 && !st.isDirectory()) {
+                                    safeRegularFile = false;
+                                    break;
+                                }
+                                if (
+                                    i === segs.length - 1 &&
+                                    (!st.isFile() || st.size > 262_144)
+                                ) {
+                                    safeRegularFile = false;
+                                    break;
+                                }
+                            } catch {
+                                safeRegularFile = false;
+                                break;
+                            }
+                        }
+                        if (safeRegularFile) {
+                            fs.mkdirSync(path.dirname(dstAbs), { recursive: true });
+                            fs.copyFileSync(srcAbs, dstAbs);
+                        }
+                    }
+
+                    const stageEnv = foundry.stageWorkOrderEdits({
+                        workOrderId: 'WO-101',
+                        goal: `HydraDB + Cascade modernization of ${repoSlug}`,
+                        repoDir: waveStageRepoDir,
+                        edits
+                    });
+                    stagedTaskId = stageEnv?.ok ? stageEnv.data?.taskId ?? null : null;
+                    stagedUnifiedDiff = stageEnv?.ok ? stageEnv.data?.unifiedDiff ?? '' : '';
+                    if (stageEnv?.ok && stageEnv.data?.taskId) {
+                        try {
+                            foundry.releaseStage?.(stageEnv.data.taskId);
+                        } catch {
+                            // Best-effort cleanup of ephemeral stage scratch workspace
+                        }
+                    }
+                } finally {
                     try {
-                        foundry.releaseStage?.(stageEnv.data.taskId);
+                        fs.rmSync(waveStageRepoDir, { recursive: true, force: true });
                     } catch {
-                        // Best-effort cleanup of ephemeral stage scratch workspace
+                        // Best-effort cleanup of lightweight wave stage directory
                     }
                 }
 
@@ -2025,7 +2141,7 @@ export function createModernizerBenchmarkEngine({
                     fileReceipts.map((r) => ({ filePath: r.targetPath, content: r.code }))
                 );
 
-                // Stage 4: Separate-family 2-model cross-verification (DeepSeek + Gemini Flash-Lite)
+                // Stage 4: Separate-family 2-model cross-verification (DeepSeek + Gemini Flash-Lite, or Gemini + Local Ollama / Structural)
                 const deterministicVerdict =
                     slopVerify.data.slopFindingCount === 0 ? 'APPROVE' : 'REJECT';
                 const deterministicRationale =
@@ -2059,7 +2175,7 @@ export function createModernizerBenchmarkEngine({
                     costUsd: 0
                 };
 
-                if (hasLiveApi && llmConfig.openRouterApiKey) {
+                if (hasLiveApi) {
                     const revSys = [
                         'You are an independent Software Factory validator in DEADBOLT Stage 4.',
                         'Evaluate ONLY objective Golden Brick compliance on the complete generated Node.js ESM modules below:',
@@ -2073,119 +2189,337 @@ export function createModernizerBenchmarkEngine({
                         .map((e) => `FILE ${e.file_path}:\n${String(e.content || '').slice(0, 8000)}`)
                         .join('\n---\n');
 
-                    const callReviewerWithModelFallback = async (primaryModel, fallbackModel, familyLabel) => {
-                        const primaryReviewerCfg = {
-                            provider: 'openrouter',
-                            familyLabel,
-                            apiKey: llmConfig.openRouterApiKey,
-                            model: primaryModel
-                        };
-                        try {
-                            const res = await callImpl(revSys, revUsr, primaryReviewerCfg, {
-                                returnFullResponse: true,
-                                bypassCascade: true,
-                                maxTokens: 1024,
-                                temperature: 0.0,
-                                signal: AbortSignal.timeout(10_000)
-                            });
-                            return { res, model: primaryReviewerCfg.model };
-                        } catch (primaryErr) {
-                            if (!fallbackModel || fallbackModel === primaryModel) {
-                                throw primaryErr;
-                            }
-                            const fallbackReviewerCfg = {
+                    if (llmConfig.openRouterApiKey) {
+                        const callReviewerWithModelFallback = async (
+                            primaryModel,
+                            fallbackModel,
+                            familyLabel
+                        ) => {
+                            const primaryReviewerCfg = {
                                 provider: 'openrouter',
                                 familyLabel,
                                 apiKey: llmConfig.openRouterApiKey,
-                                model: fallbackModel
+                                model: primaryModel
                             };
-                            const res = await callImpl(revSys, revUsr, fallbackReviewerCfg, {
-                                returnFullResponse: true,
-                                bypassCascade: true,
-                                maxTokens: 1024,
-                                temperature: 0.0,
-                                signal: AbortSignal.timeout(10_000)
-                            });
-                            return { res, model: fallbackReviewerCfg.model };
-                        }
-                    };
-
-                    try {
-                        const [outRevA, outRevB] = await Promise.all([
-                            callReviewerWithModelFallback(
-                                reviewerPrimaryModelA,
-                                reviewerFallbackModelA,
-                                'deepseek'
-                            ),
-                            callReviewerWithModelFallback(
-                                reviewerPrimaryModelB,
-                                reviewerFallbackModelB,
-                                'google-gemini'
-                            )
-                        ]);
-                        const rA = outRevA.res;
-                        const rB = outRevB.res;
-                        const parsedA = parseReviewerVerdictPayload(rA?.text);
-                        const parsedB = parseReviewerVerdictPayload(rB?.text);
-                        const measuredRevA = hasMeasuredTokenUsage(rA?.usage);
-                        const measuredRevB = hasMeasuredTokenUsage(rB?.usage);
-                        const inA = Number(rA?.usage?.inputTokens || 0);
-                        const outA = Number(rA?.usage?.outputTokens || 0);
-                        const inB = Number(rB?.usage?.inputTokens || 0);
-                        const outB = Number(rB?.usage?.outputTokens || 0);
-                        const cA = computeExactCallCostUsd(outRevA.model, 'openrouter', rA?.usage);
-                        const cB = computeExactCallCostUsd(outRevB.model, 'openrouter', rB?.usage);
-                        reviewData = {
-                            mode: 'live_api',
-                            usageEstimated: !measuredRevA || !measuredRevB,
-                            reviewers: [
-                                {
-                                    family: 'deepseek',
-                                    model: outRevA.model,
-                                    mode: 'live_api',
-                                    verdict: parsedA.verdict,
-                                    rationale: parsedA.rationale,
-                                    costUsd: cA
-                                },
-                                {
-                                    family: 'google-gemini',
-                                    model: outRevB.model,
-                                    mode: 'live_api',
-                                    verdict: parsedB.verdict,
-                                    rationale: parsedB.rationale,
-                                    costUsd: cB
+                            try {
+                                const res = await callImpl(revSys, revUsr, primaryReviewerCfg, {
+                                    returnFullResponse: true,
+                                    bypassCascade: true,
+                                    maxTokens: 1024,
+                                    temperature: 0.0,
+                                    signal: AbortSignal.timeout(10_000)
+                                });
+                                return { res, model: primaryReviewerCfg.model };
+                            } catch (primaryErr) {
+                                if (!fallbackModel || fallbackModel === primaryModel) {
+                                    throw primaryErr;
                                 }
-                            ],
-                            inputTokens: inA + inB,
-                            outputTokens: outA + outB,
-                            costUsd: cA + cB
+                                const fallbackReviewerCfg = {
+                                    provider: 'openrouter',
+                                    familyLabel,
+                                    apiKey: llmConfig.openRouterApiKey,
+                                    model: fallbackModel
+                                };
+                                const res = await callImpl(revSys, revUsr, fallbackReviewerCfg, {
+                                    returnFullResponse: true,
+                                    bypassCascade: true,
+                                    maxTokens: 1024,
+                                    temperature: 0.0,
+                                    signal: AbortSignal.timeout(8_000)
+                                });
+                                return { res, model: fallbackReviewerCfg.model };
+                            }
                         };
-                    } catch {
-                        reviewData = {
-                            mode: 'deterministic_fallback_after_timeout',
-                            usageEstimated: true,
-                            reviewers: reviewData.reviewers.map((r) => ({
-                                ...r,
-                                mode: 'deterministic_fallback_after_timeout'
-                            })),
-                            inputTokens: 0,
-                            outputTokens: 0,
-                            costUsd: 0
+
+                        try {
+                            const [outRevA, outRevB] = await Promise.all([
+                                callReviewerWithModelFallback(
+                                    reviewerPrimaryModelA,
+                                    reviewerFallbackModelA,
+                                    'deepseek'
+                                ),
+                                callReviewerWithModelFallback(
+                                    reviewerPrimaryModelB,
+                                    reviewerFallbackModelB,
+                                    'google-gemini'
+                                )
+                            ]);
+                            const rA = outRevA.res;
+                            const rB = outRevB.res;
+                            const parsedA = parseReviewerVerdictPayload(rA?.text);
+                            const parsedB = parseReviewerVerdictPayload(rB?.text);
+                            const measuredRevA = hasMeasuredTokenUsage(rA?.usage);
+                            const measuredRevB = hasMeasuredTokenUsage(rB?.usage);
+                            const inA = Number(rA?.usage?.inputTokens || 0);
+                            const outA = Number(rA?.usage?.outputTokens || 0);
+                            const inB = Number(rB?.usage?.inputTokens || 0);
+                            const outB = Number(rB?.usage?.outputTokens || 0);
+                            const cA = computeExactCallCostUsd(outRevA.model, 'openrouter', rA?.usage);
+                            const cB = computeExactCallCostUsd(outRevB.model, 'openrouter', rB?.usage);
+                            reviewData = {
+                                mode: 'live_api',
+                                usageEstimated: !measuredRevA || !measuredRevB,
+                                reviewers: [
+                                    {
+                                        family: 'deepseek',
+                                        model: outRevA.model,
+                                        mode: 'live_api',
+                                        verdict: parsedA.verdict,
+                                        rationale: parsedA.rationale,
+                                        costUsd: cA
+                                    },
+                                    {
+                                        family: 'google-gemini',
+                                        model: outRevB.model,
+                                        mode: 'live_api',
+                                        verdict: parsedB.verdict,
+                                        rationale: parsedB.rationale,
+                                        costUsd: cB
+                                    }
+                                ],
+                                inputTokens: inA + inB,
+                                outputTokens: outA + outB,
+                                costUsd: cA + cB
+                            };
+                        } catch {
+                            reviewData = {
+                                mode: 'deterministic_fallback_after_timeout',
+                                usageEstimated: true,
+                                reviewers: reviewData.reviewers.map((r) => ({
+                                    ...r,
+                                    mode: 'deterministic_fallback_after_timeout'
+                                })),
+                                inputTokens: 0,
+                                outputTokens: 0,
+                                costUsd: 0
+                            };
+                        }
+                    } else if (llmConfig.geminiApiKey) {
+                        const primaryGemModel =
+                            llmConfig.geminiReviewerModel || 'gemini-3.8-flash';
+                        const fallbackGemModel = 'gemini-2.5-flash';
+
+                        const callDirectGeminiReviewer = async () => {
+                            const primaryGemCfg = {
+                                provider: 'gemini',
+                                familyLabel: 'google-gemini',
+                                apiKey: llmConfig.geminiApiKey,
+                                model: primaryGemModel
+                            };
+                            try {
+                                const res = await callImpl(revSys, revUsr, primaryGemCfg, {
+                                    returnFullResponse: true,
+                                    bypassCascade: true,
+                                    maxTokens: 1024,
+                                    temperature: 0.0,
+                                    signal: AbortSignal.timeout(10_000)
+                                });
+                                return { res, model: primaryGemCfg.model };
+                            } catch (primaryErr) {
+                                if (primaryGemModel === fallbackGemModel) {
+                                    throw primaryErr;
+                                }
+                                const fallbackGemCfg = {
+                                    provider: 'gemini',
+                                    familyLabel: 'google-gemini',
+                                    apiKey: llmConfig.geminiApiKey,
+                                    model: fallbackGemModel
+                                };
+                                const res = await callImpl(revSys, revUsr, fallbackGemCfg, {
+                                    returnFullResponse: true,
+                                    bypassCascade: true,
+                                    maxTokens: 1024,
+                                    temperature: 0.0,
+                                    signal: AbortSignal.timeout(8_000)
+                                });
+                                return { res, model: fallbackGemCfg.model };
+                            }
                         };
+
+                        try {
+                            if (activeLocalFastConfig) {
+                                const ollamaRevCfg = {
+                                    ...activeLocalFastConfig,
+                                    familyLabel: 'qwen-local',
+                                    model: llmConfig.ollamaModel || activeLocalFastConfig.model
+                                };
+                                const [outOllama, outGem] = await Promise.all([
+                                    callImpl(revSys, revUsr, ollamaRevCfg, {
+                                        returnFullResponse: true,
+                                        bypassCascade: true,
+                                        maxTokens: 1024,
+                                        temperature: 0.0,
+                                        signal: AbortSignal.timeout(10_000)
+                                    })
+                                        .then((res) => ({ res, model: ollamaRevCfg.model, ok: true }))
+                                        .catch(() => ({ res: null, model: ollamaRevCfg.model, ok: false })),
+                                    callDirectGeminiReviewer()
+                                ]);
+
+                                const rGem = outGem.res;
+                                const parsedGem = parseReviewerVerdictPayload(rGem?.text);
+                                const measuredGem = hasMeasuredTokenUsage(rGem?.usage);
+                                const inGem = Number(rGem?.usage?.inputTokens || 0);
+                                const outGemTok = Number(rGem?.usage?.outputTokens || 0);
+                                const cGem = computeExactCallCostUsd(
+                                    outGem.model,
+                                    'gemini',
+                                    rGem?.usage
+                                );
+
+                                if (outOllama.ok && outOllama.res?.text) {
+                                    const rLoc = outOllama.res;
+                                    const parsedLoc = parseReviewerVerdictPayload(rLoc?.text);
+                                    const measuredLoc = hasMeasuredTokenUsage(rLoc?.usage);
+                                    const inLoc = Number(rLoc?.usage?.inputTokens || 0);
+                                    const outLocTok = Number(rLoc?.usage?.outputTokens || 0);
+                                    const cLoc = computeExactCallCostUsd(
+                                        outOllama.model,
+                                        'ollama',
+                                        rLoc?.usage
+                                    );
+                                    reviewData = {
+                                        mode: 'live_api',
+                                        usageEstimated: !measuredGem || !measuredLoc,
+                                        reviewers: [
+                                            {
+                                                family: 'qwen-local',
+                                                model: outOllama.model,
+                                                mode: 'live_api',
+                                                verdict: parsedLoc.verdict,
+                                                rationale: parsedLoc.rationale,
+                                                costUsd: cLoc
+                                            },
+                                            {
+                                                family: 'google-gemini',
+                                                model: outGem.model,
+                                                mode: 'live_api',
+                                                verdict: parsedGem.verdict,
+                                                rationale: parsedGem.rationale,
+                                                costUsd: cGem
+                                            }
+                                        ],
+                                        inputTokens: inLoc + inGem,
+                                        outputTokens: outLocTok + outGemTok,
+                                        costUsd: cLoc + cGem
+                                    };
+                                } else {
+                                    reviewData = {
+                                        mode: 'live_gemini_single_family',
+                                        usageEstimated: !measuredGem,
+                                        reviewers: [
+                                            {
+                                                family: 'deterministic-structural',
+                                                model: 'golden-brick-structural-gate',
+                                                mode: 'deterministic_structural',
+                                                verdict: deterministicVerdict,
+                                                rationale: deterministicRationale,
+                                                costUsd: 0
+                                            },
+                                            {
+                                                family: 'google-gemini',
+                                                model: outGem.model,
+                                                mode: 'live_api',
+                                                verdict: parsedGem.verdict,
+                                                rationale: parsedGem.rationale,
+                                                costUsd: cGem
+                                            }
+                                        ],
+                                        inputTokens: inGem,
+                                        outputTokens: outGemTok,
+                                        costUsd: cGem
+                                    };
+                                }
+                            } else {
+                                const outGem = await callDirectGeminiReviewer();
+                                const rGem = outGem.res;
+                                const parsedGem = parseReviewerVerdictPayload(rGem?.text);
+                                const measuredGem = hasMeasuredTokenUsage(rGem?.usage);
+                                const inGem = Number(rGem?.usage?.inputTokens || 0);
+                                const outGemTok = Number(rGem?.usage?.outputTokens || 0);
+                                const cGem = computeExactCallCostUsd(
+                                    outGem.model,
+                                    'gemini',
+                                    rGem?.usage
+                                );
+                                reviewData = {
+                                    mode: 'live_gemini_single_family',
+                                    usageEstimated: !measuredGem,
+                                    reviewers: [
+                                        {
+                                            family: 'deterministic-structural',
+                                            model: 'golden-brick-structural-gate',
+                                            mode: 'deterministic_structural',
+                                            verdict: deterministicVerdict,
+                                            rationale: deterministicRationale,
+                                            costUsd: 0
+                                        },
+                                        {
+                                            family: 'google-gemini',
+                                            model: outGem.model,
+                                            mode: 'live_api',
+                                            verdict: parsedGem.verdict,
+                                            rationale: parsedGem.rationale,
+                                            costUsd: cGem
+                                        }
+                                    ],
+                                    inputTokens: inGem,
+                                    outputTokens: outGemTok,
+                                    costUsd: cGem
+                                };
+                            }
+                        } catch {
+                            reviewData = {
+                                mode: 'deterministic_fallback_after_timeout',
+                                usageEstimated: true,
+                                reviewers: [
+                                    {
+                                        family: 'deterministic-structural',
+                                        model: 'golden-brick-structural-gate',
+                                        mode: 'deterministic_fallback_after_timeout',
+                                        verdict: deterministicVerdict,
+                                        rationale: deterministicRationale,
+                                        costUsd: 0
+                                    },
+                                    {
+                                        family: 'google-gemini',
+                                        model: primaryGemModel,
+                                        mode: 'deterministic_fallback_after_timeout',
+                                        verdict: deterministicVerdict,
+                                        rationale: deterministicRationale,
+                                        costUsd: 0
+                                    }
+                                ],
+                                inputTokens: 0,
+                                outputTokens: 0,
+                                costUsd: 0
+                            };
+                        }
                     }
                 }
 
                 const allApprove = reviewData.reviewers.every((r) => r.verdict === 'APPROVE');
                 const hasDisagreement =
                     new Set(reviewData.reviewers.map((r) => r.verdict)).size > 1;
+                const allFilesFellBackOnLlmFailure =
+                    fileReceipts.length > 0 &&
+                    fileReceipts.every(
+                        (r) => Boolean(r.usageEstimated) && Boolean(r.repairedBySlopBreaker)
+                    );
+                const liveVerificationIncomplete =
+                    hasLiveApi &&
+                    (reviewData.mode !== 'live_api' || allFilesFellBackOnLlmFailure);
+
                 const armBVerdict =
                     slopVerify.data.slopFindingCount > 0
                         ? 'REJECTED'
                         : hasDisagreement
                           ? 'ESCALATE_TO_HUMAN'
-                          : allApprove
-                            ? 'VERIFIED'
-                            : 'GATE_REJECTED';
+                          : !allApprove
+                            ? 'GATE_REJECTED'
+                            : liveVerificationIncomplete
+                              ? 'ESCALATE_TO_HUMAN'
+                              : 'VERIFIED';
 
                 // Write `:SUPERSEDES` migration edges back into HydraDB OpenCypher + Cloud feedback ONLY when VERIFIED
                 const lineageWrite =
@@ -2217,7 +2551,9 @@ export function createModernizerBenchmarkEngine({
                           ? 'live_partial_estimated'
                           : 'offline_rate_sheet_estimate';
                 const costPerVerifiedTaskUsd =
-                    hasLiveApi && armBVerdict === 'VERIFIED' ? totalCostUsd : null;
+                    hasLiveApi && !armBUsageEstimated && armBVerdict === 'VERIFIED'
+                        ? totalCostUsd
+                        : null;
 
                 return {
                     strategy: 'DEADBOLT (HydraDB 2-Hop Graph + <25us Cascade + Golden Bricks)',
@@ -2306,7 +2642,7 @@ export function createModernizerBenchmarkEngine({
                       ? 'live_partial_estimated'
                       : 'offline_rate_sheet_estimate';
             const costPerVerifiedTaskUsd =
-                hasLiveApi && deadboltCascade.verdict === 'VERIFIED'
+                hasLiveApi && !deadboltCascade.usageEstimated && deadboltCascade.verdict === 'VERIFIED'
                     ? deadboltCascade.totalCostUsd
                     : null;
 
@@ -2319,7 +2655,7 @@ export function createModernizerBenchmarkEngine({
                         deadboltCascade.verdict === 'VERIFIED'
                             ? 'modernizer.verified'
                             : 'modernizer.rejected',
-                    resource: String(repoSlug),
+                    resource: `repo:${repoSlug}`,
                     outcome: deadboltCascade.verdict === 'VERIFIED' ? 'SUCCESS' : 'DENIED',
                     metadata: {
                         verdict: deadboltCascade.verdict,

@@ -22,6 +22,15 @@ import {
 const FEATURE_REQUIREMENTS_TITLE = 'Billing Settlement Governance & SOX-Style Reconciliation';
 const COMPONENT_BLUEPRINT_TITLE = 'DEADBOLT 4-Stage Factory Governance Engine';
 const PROJECT_SKILL_TITLE = 'DEADBOLT Stage 4 Governance & SOX-Style Reconciliation';
+const SAFE_UPSTREAM_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+function requireSafeUpstreamId(rawId, label = 'entity') {
+    const clean = String(rawId ?? '').trim();
+    if (!SAFE_UPSTREAM_ID_RE.test(clean)) {
+        throw new Error(`Invalid upstream 8090 ${label} identifier.`);
+    }
+    return clean;
+}
 
 const FEATURE_REQUIREMENTS_MARKDOWN = `## Overview
 
@@ -471,12 +480,14 @@ export async function seedLive8090Project({
     for (const spec of WORK_ORDER_SPECS) {
         const match = liveWos.find((wo) => String(wo.title || '').startsWith(`[${spec.code}]`));
         if (!match) continue;
+        const safeMatchId = requireSafeUpstreamId(match.id, 'Work Order');
+        const encodedMatchId = encodeURIComponent(safeMatchId);
 
         if (!match.description_snippet) {
             await callSofaJson(
                 baseUrl,
                 apiHost,
-                `/v2/external-api/work_orders/${match.id}/description`,
+                `/v2/external-api/work_orders/${encodedMatchId}/description`,
                 {
                     method: 'PATCH',
                     headers: extHeaders,
@@ -490,7 +501,7 @@ export async function seedLive8090Project({
             linkOps.push({
                 operation_id: `link-req-${spec.code.toLowerCase()}`,
                 operation_type: 'LinkRequirements',
-                target: { work_order_id: match.id },
+                target: { work_order_id: safeMatchId },
                 patch: { requirements_document_ids: [requirementId] }
             });
         }
@@ -498,7 +509,7 @@ export async function seedLive8090Project({
             linkOps.push({
                 operation_id: `link-bp-${spec.code.toLowerCase()}`,
                 operation_type: 'LinkBlueprints',
-                target: { work_order_id: match.id },
+                target: { work_order_id: safeMatchId },
                 patch: { blueprint_ids: [blueprintId] }
             });
         }
@@ -517,7 +528,7 @@ export async function seedLive8090Project({
             const commentsRes = await callSofaJson(
                 baseUrl,
                 apiHost,
-                `/v2/external-api/work_orders/${match.id}/comments`,
+                `/v2/external-api/work_orders/${encodedMatchId}/comments`,
                 { headers: extHeaders }
             );
             const existingComments = commentsRes.json?.items || commentsRes.json?.data || [];
@@ -530,7 +541,7 @@ export async function seedLive8090Project({
                 await callSofaJson(
                     baseUrl,
                     apiHost,
-                    `/v2/external-api/work_orders/${match.id}/comments`,
+                    `/v2/external-api/work_orders/${encodedMatchId}/comments`,
                     {
                         method: 'POST',
                         headers: extHeaders,
@@ -547,7 +558,7 @@ export async function seedLive8090Project({
         }
 
         seededWorkOrders.push({
-            id: match.id,
+            id: safeMatchId,
             code: spec.code,
             workOrderNumber: match.work_order_number,
             title: match.title,
@@ -594,10 +605,12 @@ export async function seedLive8090Project({
     const firstFb = (fbList.json?.items || [])[0];
     const wo101Record = seededWorkOrders.find((w) => w.code === 'WO-101');
     if (firstFb?.id && wo101Record?.id) {
+        const safeFirstFbId = requireSafeUpstreamId(firstFb.id, 'Feedback Item');
+        const encodedFirstFbId = encodeURIComponent(safeFirstFbId);
         const linkFbRes = await callSofaJson(
             baseUrl,
             apiHost,
-            `/v2/external-api/feedback/items/${firstFb.id}/work_orders`,
+            `/v2/external-api/feedback/items/${encodedFirstFbId}/work_orders`,
             {
                 method: 'POST',
                 headers: extHeaders,

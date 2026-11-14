@@ -7,7 +7,7 @@ services:
     container_name: deadbolt
     restart: unless-stopped
     ports:
-      - "${PORT:-4090}:4090"
+      - "${BIND_HOST:-127.0.0.1}:${PORT:-4090}:4090"
     environment:
       PORT: "4090"
       DB_PATH: /app/data/deadbolt.db

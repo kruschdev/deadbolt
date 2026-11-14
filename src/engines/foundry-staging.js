@@ -115,31 +115,115 @@ function copyWorkspaceTree(sourceDir, destDir) {
 }
 
 /**
- * Atomically write a verified staged file into a target directory with fsync + rename.
+ * Resolve and validate a relative file target inside `rootDir`, enforcing `fs.lstatSync`
+ * no-symlink checks across all existing path segments and `fs.realpathSync` containment.
+ *
  * @param {string} rootDir
  * @param {string} relFilePath
- * @param {string} content
+ * @returns {{ resolvedRoot: string, realRoot: string, normalizedRel: string, targetAbs: string }}
  */
-function atomicSyncVerifiedFile(rootDir, relFilePath, content) {
+function resolveContainedRepoTarget(rootDir, relFilePath) {
   const resolvedRoot = path.resolve(rootDir);
-  const targetAbs = path.resolve(resolvedRoot, relFilePath);
-  const relCheck = path.relative(resolvedRoot, targetAbs);
-  if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
+  if (!fs.existsSync(resolvedRoot)) {
+    throw new Error('Target repository directory does not exist.');
+  }
+  const rootLstat = fs.lstatSync(resolvedRoot);
+  if (!rootLstat.isDirectory()) {
+    throw new Error('Target repository root is not a directory.');
+  }
+  const realRoot = fs.realpathSync(resolvedRoot);
+
+  const rawRel = String(relFilePath || '').replace(/\\/g, '/').trim();
+  if (!rawRel || rawRel.includes('\0')) {
+    throw new Error(`Invalid relative target file path: ${relFilePath}`);
+  }
+  const strippedRel = rawRel.replace(/^(?:\.\/+|\/+)+/, '');
+  const normalizedRel = strippedRel ? path.posix.normalize(strippedRel) : '';
+  if (
+    !normalizedRel ||
+    normalizedRel === '.' ||
+    normalizedRel === '..' ||
+    normalizedRel.startsWith('../')
+  ) {
     throw new Error(`Refusing path traversal outside target repository: ${relFilePath}`);
   }
 
+  const targetAbs = path.resolve(resolvedRoot, normalizedRel);
+  const relCheck = path.relative(resolvedRoot, targetAbs);
+  if (!relCheck || relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
+    throw new Error(`Refusing path traversal outside target repository: ${relFilePath}`);
+  }
+
+  const segments = normalizedRel.split('/').filter(Boolean);
+  let cursor = resolvedRoot;
+  let deepestExisting = resolvedRoot;
+  for (let i = 0; i < segments.length; i += 1) {
+    cursor = path.join(cursor, segments[i]);
+    try {
+      const stat = fs.lstatSync(cursor);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`Refusing symlink segment while syncing "${normalizedRel}".`);
+      }
+      if (i === segments.length - 1 && stat.isDirectory()) {
+        throw new Error(`Refusing directory target while syncing "${normalizedRel}".`);
+      }
+      if (i < segments.length - 1 && !stat.isDirectory()) {
+        throw new Error(`Non-directory ancestor segment while syncing "${normalizedRel}".`);
+      }
+      deepestExisting = cursor;
+    } catch (err) {
+      if (err?.code === 'ENOENT') {
+        break;
+      }
+      throw err;
+    }
+  }
+
+  const realDeepest = fs.realpathSync(deepestExisting);
+  if (realDeepest !== realRoot && !realDeepest.startsWith(`${realRoot}${path.sep}`)) {
+    throw new Error(`Refusing ancestor escaping repository realpath: ${normalizedRel}`);
+  }
+
+  return { resolvedRoot, realRoot, normalizedRel, targetAbs };
+}
+
+/**
+ * Atomically write a verified staged file into a target directory with fsync + rename.
+ * @param {string} rootDir
+ * @param {string} relFilePath
+ * @param {string|Buffer} content
+ */
+function atomicSyncVerifiedFile(rootDir, relFilePath, content) {
+  const { realRoot, normalizedRel, targetAbs } = resolveContainedRepoTarget(rootDir, relFilePath);
+
   const parentDir = path.dirname(targetAbs);
   fs.mkdirSync(parentDir, { recursive: true });
+  const realParent = fs.realpathSync(parentDir);
+  if (realParent !== realRoot && !realParent.startsWith(`${realRoot}${path.sep}`)) {
+    throw new Error(`Refusing parent directory escaping repository realpath: ${normalizedRel}`);
+  }
+
   const tempPath = path.join(
     parentDir,
     `.${path.basename(targetAbs)}.deadbolt-sync-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
   );
 
   let fd = null;
+  let renamed = false;
   try {
-    fd = fs.openSync(tempPath, 'w', 0o600);
-    fs.writeFileSync(fd, content, 'utf8');
+    fd = fs.openSync(tempPath, 'wx', 0o600);
+    if (Buffer.isBuffer(content)) {
+      fs.writeFileSync(fd, content);
+    } else {
+      fs.writeFileSync(fd, String(content ?? ''), 'utf8');
+    }
     fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+
+    fs.renameSync(tempPath, targetAbs);
+    renamed = true;
+    fsyncDirectory(parentDir);
   } finally {
     if (fd !== null) {
       try {
@@ -148,10 +232,14 @@ function atomicSyncVerifiedFile(rootDir, relFilePath, content) {
         // Ignore descriptor close error
       }
     }
+    if (!renamed) {
+      try {
+        fs.rmSync(tempPath, { force: true });
+      } catch {
+        // Ignore temp file cleanup error
+      }
+    }
   }
-
-  fs.renameSync(tempPath, targetAbs);
-  fsyncDirectory(parentDir);
 }
 
 /**
@@ -453,11 +541,66 @@ export function createFoundryEngine({ stack = null } = {}) {
 
     let syncedToRepoDir = false;
     if (applyToRepoDir && record?.stagingDir && record?.repoDir) {
-      for (const relFile of appliedFiles) {
-        const verifiedContent = fs.readFileSync(path.join(record.stagingDir, relFile), 'utf8');
-        atomicSyncVerifiedFile(record.repoDir, relFile, verifiedContent);
+      /** @type {Array<{ relFile: string, targetAbs: string, existed: boolean, originalBytes: Buffer | null }>} */
+      const preSyncSnapshots = [];
+      /** @type {Array<{ relFile: string, targetAbs: string, existed: boolean, originalBytes: Buffer | null }>} */
+      const syncedEntries = [];
+      try {
+        for (const relFile of appliedFiles) {
+          const { normalizedRel, targetAbs } = resolveContainedRepoTarget(record.repoDir, relFile);
+          let existed = false;
+          let originalBytes = null;
+          try {
+            const existingStat = fs.lstatSync(targetAbs);
+            if (existingStat.isSymbolicLink() || existingStat.isDirectory()) {
+              throw new Error(`Refusing non-regular file target "${normalizedRel}".`);
+            }
+            existed = true;
+            originalBytes = fs.readFileSync(targetAbs);
+          } catch (statErr) {
+            if (statErr?.code !== 'ENOENT') {
+              throw statErr;
+            }
+          }
+          preSyncSnapshots.push({ relFile: normalizedRel, targetAbs, existed, originalBytes });
+        }
+
+        for (const snap of preSyncSnapshots) {
+          const stagedFileInfo = resolveContainedRepoTarget(record.stagingDir, snap.relFile);
+          const verifiedBytes = fs.readFileSync(stagedFileInfo.targetAbs);
+          atomicSyncVerifiedFile(record.repoDir, snap.relFile, verifiedBytes);
+          syncedEntries.push(snap);
+        }
+        syncedToRepoDir = true;
+      } catch (syncErr) {
+        let rollbackClean = true;
+        for (let idx = syncedEntries.length - 1; idx >= 0; idx -= 1) {
+          const prev = syncedEntries[idx];
+          try {
+            if (prev.existed && prev.originalBytes !== null) {
+              atomicSyncVerifiedFile(record.repoDir, prev.relFile, prev.originalBytes);
+            } else {
+              fs.rmSync(prev.targetAbs, { force: true });
+              fsyncDirectory(path.dirname(prev.targetAbs));
+            }
+          } catch {
+            rollbackClean = false;
+          }
+        }
+        return errorEnvelope(
+          'REPO_SYNC_FAILED',
+          syncErr instanceof Error
+            ? `Failed to sync verified stage to repository: ${syncErr.message}`
+            : 'Failed to sync verified stage to repository.',
+          {
+            taskId: cleanTaskId,
+            workOrderId: record?.workOrderId || null,
+            rolledBackCount: syncedEntries.length,
+            rollbackClean
+          },
+          'deadbolt.foundry.apply'
+        );
       }
-      syncedToRepoDir = true;
     }
 
     const summary = `Atomically applied ${appliedFiles.length} verified file(s) for ${cleanTaskId}.`;
