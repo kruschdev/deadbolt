@@ -9,6 +9,7 @@ import {
     decodeHydraQueryResult,
     createHydraGraphClient
 } from '../src/connectors/hydradb-graph.js';
+import { createSponsorHub } from '../src/connectors/sponsors.js';
 import { createDeadboltOrchestrator } from '../src/orchestrator.js';
 import {
     DEADBOLT_MCP_TOOLS,
@@ -440,4 +441,81 @@ test('HTTP + SSE + Static Breaker Panel server routes (/health, /api/status, /ap
     const auditJson = await auditRes.json();
     assert.equal(auditJson.ok, true);
     assert.equal(auditJson.data.valid, true);
+});
+
+test('8090 Software Factory v2 Organization Admin (sofa-admin-*) and External API (sofa-ext-*) connectors', async () => {
+    const captured = [];
+    const mockSofaFetch = async (url, init = {}) => {
+        const parsed = new URL(url);
+        captured.push({
+            pathname: parsed.pathname,
+            search: parsed.search,
+            headers: init.headers || {}
+        });
+
+        if (parsed.pathname === '/v2/organization-api/spend-status') {
+            return new Response(
+                JSON.stringify({
+                    current_period_spend_usd: '4.18',
+                    on_demand_limit_usd: '50.00'
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
+        if (parsed.pathname === '/v2/external-api/health') {
+            return new Response(JSON.stringify({ status: 'healthy' }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        if (parsed.pathname === '/v2/external-api/work_orders') {
+            return new Response(
+                JSON.stringify({
+                    items: [{ id: 'wo-uuid-101', title: 'WO-101 Fee Residual' }],
+                    total: 3,
+                    page: 1,
+                    page_size: 5,
+                    total_pages: 1
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
+        return new Response(JSON.stringify({ detail: 'not found' }), { status: 404 });
+    };
+
+    const sponsorHub = createSponsorHub({
+        config: {
+            sofaApiBaseUrl: 'https://api.factory.8090.dev',
+            sofaAdminApiKey: 'sofa-admin-unit-fixture',
+            sofaApiKey: 'sofa-ext-unit-fixture'
+        },
+        lookupFn: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetchImpl: mockSofaFetch
+    });
+
+    const statusEnv = sponsorHub.getConnectorStatuses();
+    assert.equal(statusEnv.ok, true);
+    assert.equal(statusEnv.data.connectors.softwareFactory8090.liveConfigured, true);
+    assert.equal(statusEnv.data.connectors.softwareFactory8090.mode, 'sofa_dual_api_live');
+
+    const syncEnv = await sponsorHub.syncSoftwareFactoryWorkOrder({
+        workOrder: { id: 'WO-101', title: 'Fix fee residual allocation' }
+    });
+    assert.equal(syncEnv.ok, true);
+    assert.equal(syncEnv.data.liveMcpSync.connected, true);
+    assert.equal(syncEnv.data.liveMcpSync.mode, 'sofa_dual_api_live');
+    assert.equal(syncEnv.data.liveMcpSync.externalApiHealthy, true);
+    assert.equal(syncEnv.data.liveMcpSync.externalWorkOrderCount, 3);
+    assert.equal(syncEnv.data.liveMcpSync.orgSpendStatus.current_period_spend_usd, '4.18');
+
+    const orgReq = captured.find((r) => r.pathname === '/v2/organization-api/spend-status');
+    assert.ok(orgReq);
+    assert.equal(orgReq.headers['X-API-Key'], 'sofa-admin-unit-fixture');
+
+    const extReq = captured.find((r) => r.pathname === '/v2/external-api/health');
+    assert.ok(extReq);
+    assert.equal(extReq.headers.Authorization, 'Bearer sofa-ext-unit-fixture');
 });

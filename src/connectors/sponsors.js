@@ -18,6 +18,7 @@ import { delimitUntrustedContent } from '@krusch/toolkit/harness-engineering';
 import { sanitizeAgentMessage } from '@krusch/toolkit/trajectory-guard';
 import { createHydraGraphClient } from './hydradb-graph.js';
 
+const DEFAULT_SOFA_API_BASE_URL = 'https://api.factory.8090.dev';
 const DEFAULT_SOFA_MCP_URL = 'https://api.factory.8090.dev/v2/mcp';
 const DEFAULT_HYDRADB_BASE_URL = 'https://api.hydradb.com';
 const DEFAULT_COMPOSIO_BASE_URL = 'https://backend.composio.dev/api/v3';
@@ -121,8 +122,66 @@ function buildCockpitBreakerChimeWav({ eventType = 'WORKAROUND_REJECTED' } = {})
  * @param {object} [options.config={}] - Runtime configuration object.
  * @param {object|null} [options.hydraClient=null] - Optional injected HydraDbClient instance.
  */
-export function createSponsorHub({ config = {}, hydraClient = null, hydraGraphClient = null } = {}) {
+export function createSponsorHub({
+    config = {},
+    hydraClient = null,
+    hydraGraphClient = null,
+    fetchImpl = null,
+    lookupFn = null
+} = {}) {
     const safeConfig = config && typeof config === 'object' ? config : {};
+    const extraSafeFetchOpts = {
+        ...(typeof fetchImpl === 'function' ? { fetchImpl } : {}),
+        ...(typeof lookupFn === 'function' ? { lookupFn } : {})
+    };
+
+    function resolveSofaCredentials() {
+        const rawPrimary = String(safeConfig.sofaApiKey || '').trim();
+        const rawAdmin = String(safeConfig.sofaAdminApiKey || '').trim();
+        const projectId = String(safeConfig.sofaProjectId || '').trim();
+        const apiBaseUrl = String(safeConfig.sofaApiBaseUrl || DEFAULT_SOFA_API_BASE_URL)
+            .trim()
+            .replace(/\/+$/, '');
+        const mcpUrl = String(safeConfig.sofaMcpUrl || DEFAULT_SOFA_MCP_URL).trim();
+
+        const adminKey =
+            rawAdmin || (rawPrimary.startsWith('sofa-admin-') ? rawPrimary : '');
+        const externalKey = rawPrimary.startsWith('sofa-ext-') ? rawPrimary : '';
+        const mcpBearerKey =
+            rawPrimary && !rawPrimary.startsWith('sofa-admin-') && !rawPrimary.startsWith('sofa-ext-')
+                ? rawPrimary
+                : '';
+
+        const hasOrgAdmin = Boolean(adminKey);
+        const hasExternalApi = Boolean(externalKey);
+        const hasMcp = Boolean(mcpBearerKey && projectId);
+        const liveConfigured = hasOrgAdmin || hasExternalApi || hasMcp;
+
+        let mode = 'sw_factory_manifest_local';
+        if (hasOrgAdmin && hasExternalApi) {
+            mode = 'sofa_dual_api_live';
+        } else if (hasOrgAdmin) {
+            mode = 'sofa_org_admin_live';
+        } else if (hasExternalApi) {
+            mode = 'sofa_external_api_live';
+        } else if (hasMcp) {
+            mode = 'sofa_mcp_live';
+        }
+
+        return {
+            adminKey,
+            externalKey,
+            mcpBearerKey,
+            projectId,
+            apiBaseUrl,
+            mcpUrl,
+            hasOrgAdmin,
+            hasExternalApi,
+            hasMcp,
+            liveConfigured,
+            mode
+        };
+    }
     const receiptHmacKey =
         typeof safeConfig.auditHmacSecret === 'string' && safeConfig.auditHmacSecret.trim().length > 0
             ? safeConfig.auditHmacSecret.trim()
@@ -156,7 +215,8 @@ export function createSponsorHub({ config = {}, hydraClient = null, hydraGraphCl
      * Return clean, zero-secret status descriptors for all 6 integrations.
      */
     function getConnectorStatuses() {
-        const sofaLive = Boolean(safeConfig.sofaApiKey && safeConfig.sofaProjectId);
+        const sofaCreds = resolveSofaCredentials();
+        const sofaLive = sofaCreds.liveConfigured;
         const hydraV2Live = Boolean(resolvedHydra?.isConfigured?.());
         const hydraGraphLive = Boolean(resolvedHydraGraph?.isConfigured?.());
         const hydraLive = hydraV2Live || hydraGraphLive;
@@ -186,13 +246,15 @@ export function createSponsorHub({ config = {}, hydraClient = null, hydraGraphCl
             softwareFactory8090: {
                 id: 'softwareFactory8090',
                 name: '8090 Software Factory',
-                role: 'Work Orders, Blueprint Drift Bot & SOFA MCP',
+                role: 'Work Orders, Org Spend Governance & SOFA API/MCP',
                 liveConfigured: sofaLive,
-                mode: sofaLive ? 'sofa_mcp_live' : 'sw_factory_manifest_local',
+                mode: sofaCreds.mode,
                 status: 'healthy',
                 endpoint: sanitizeEndpointForDisplay(
-                    safeConfig.sofaMcpUrl || DEFAULT_SOFA_MCP_URL,
-                    DEFAULT_SOFA_MCP_URL
+                    sofaCreds.hasOrgAdmin || sofaCreds.hasExternalApi
+                        ? sofaCreds.apiBaseUrl
+                        : sofaCreds.mcpUrl,
+                    DEFAULT_SOFA_API_BASE_URL
                 )
             },
             hydradb: {
@@ -320,15 +382,125 @@ export function createSponsorHub({ config = {}, hydraClient = null, hydraGraphCl
             fs.writeFileSync(manifestPath, `${JSON.stringify(manifestPayload, null, 2)}\n`, 'utf8');
         }
 
+        const sofaCreds = resolveSofaCredentials();
         let liveMcpSync = {
             attempted: false,
             connected: false,
             mode: 'sw_factory_manifest_local',
-            toolCount: null
+            toolCount: null,
+            orgSpendStatus: null,
+            externalApiHealthy: null,
+            externalWorkOrderCount: null
         };
 
-        if (safeConfig.sofaApiKey && safeConfig.sofaProjectId) {
-            const sofaUrl = safeConfig.sofaMcpUrl || DEFAULT_SOFA_MCP_URL;
+        let sofaApiHost = 'api.factory.8090.dev';
+        try {
+            sofaApiHost = new URL(sofaCreds.apiBaseUrl).hostname;
+        } catch {
+            sofaApiHost = 'api.factory.8090.dev';
+        }
+
+        if (sofaCreds.hasOrgAdmin) {
+            liveMcpSync.attempted = true;
+            const spendRes = await safeFetch(
+                `${sofaCreds.apiBaseUrl}/v2/organization-api/spend-status`,
+                {
+                    method: 'GET',
+                    headers: {
+                        Accept: 'application/json',
+                        'X-API-Key': sofaCreds.adminKey
+                    }
+                },
+                {
+                    allowedProtocols: ['https:'],
+                    allowedHosts: [sofaApiHost],
+                    timeoutMs: 4000,
+                    maxRedirects: 0,
+                    tool: 'deadbolt.sponsors.sofa_org_admin',
+                    ...extraSafeFetchOpts
+                }
+            );
+
+            if (spendRes.ok && spendRes.data.status >= 200 && spendRes.data.status < 300) {
+                let spendJson = null;
+                try {
+                    spendJson = await spendRes.data.response.json();
+                } catch {
+                    spendJson = null;
+                }
+                liveMcpSync.connected = true;
+                liveMcpSync.mode = 'sofa_org_admin_live';
+                liveMcpSync.status = spendRes.data.status;
+                liveMcpSync.orgSpendStatus = spendJson;
+            } else {
+                liveMcpSync.fallbackReason = spendRes.ok
+                    ? `HTTP_${spendRes.data.status}`
+                    : spendRes.error?.code || 'SOFA_ORG_API_UNREACHABLE';
+            }
+        }
+
+        if (sofaCreds.hasExternalApi) {
+            liveMcpSync.attempted = true;
+            const extHeaders = {
+                Accept: 'application/json',
+                Authorization: `Bearer ${sofaCreds.externalKey}`
+            };
+            const healthRes = await safeFetch(
+                `${sofaCreds.apiBaseUrl}/v2/external-api/health`,
+                { method: 'GET', headers: extHeaders },
+                {
+                    allowedProtocols: ['https:'],
+                    allowedHosts: [sofaApiHost],
+                    timeoutMs: 4000,
+                    maxRedirects: 0,
+                    tool: 'deadbolt.sponsors.sofa_external_health',
+                    ...extraSafeFetchOpts
+                }
+            );
+
+            if (healthRes.ok && healthRes.data.status >= 200 && healthRes.data.status < 300) {
+                let workOrderTotal = null;
+                const woListRes = await safeFetch(
+                    `${sofaCreds.apiBaseUrl}/v2/external-api/work_orders?page=1&page_size=5`,
+                    { method: 'GET', headers: extHeaders },
+                    {
+                        allowedProtocols: ['https:'],
+                        allowedHosts: [sofaApiHost],
+                        timeoutMs: 4000,
+                        maxRedirects: 0,
+                        tool: 'deadbolt.sponsors.sofa_external_work_orders',
+                        ...extraSafeFetchOpts
+                    }
+                );
+                if (woListRes.ok && woListRes.data.status >= 200 && woListRes.data.status < 300) {
+                    try {
+                        const woJson = await woListRes.data.response.json();
+                        workOrderTotal = Number.isFinite(Number(woJson?.total))
+                            ? Number(woJson.total)
+                            : Array.isArray(woJson?.items)
+                              ? woJson.items.length
+                              : null;
+                    } catch {
+                        workOrderTotal = null;
+                    }
+                }
+                liveMcpSync.connected = true;
+                liveMcpSync.externalApiHealthy = true;
+                liveMcpSync.externalWorkOrderCount = workOrderTotal;
+                liveMcpSync.status = healthRes.data.status;
+                liveMcpSync.mode =
+                    liveMcpSync.mode === 'sofa_org_admin_live'
+                        ? 'sofa_dual_api_live'
+                        : 'sofa_external_api_live';
+            } else if (!liveMcpSync.connected) {
+                liveMcpSync.fallbackReason = healthRes.ok
+                    ? `HTTP_${healthRes.data.status}`
+                    : healthRes.error?.code || 'SOFA_EXTERNAL_API_UNREACHABLE';
+            }
+        }
+
+        if (sofaCreds.hasMcp) {
+            const sofaUrl = sofaCreds.mcpUrl;
             let sofaHost = 'api.factory.8090.dev';
             try {
                 sofaHost = new URL(sofaUrl).hostname;
@@ -343,8 +515,8 @@ export function createSponsorHub({ config = {}, hydraClient = null, hydraGraphCl
                     headers: {
                         'Content-Type': 'application/json',
                         Accept: 'application/json',
-                        Authorization: `Bearer ${safeConfig.sofaApiKey}`,
-                        'X-Sofa-Mcp-Project-Id': String(safeConfig.sofaProjectId)
+                        Authorization: `Bearer ${sofaCreds.mcpBearerKey}`,
+                        'X-Sofa-Mcp-Project-Id': String(sofaCreds.projectId)
                     },
                     body: JSON.stringify({
                         jsonrpc: '2.0',
@@ -358,7 +530,8 @@ export function createSponsorHub({ config = {}, hydraClient = null, hydraGraphCl
                     allowedHosts: [sofaHost],
                     timeoutMs: 4000,
                     maxRedirects: 0,
-                    tool: 'deadbolt.sponsors.sofa_sync'
+                    tool: 'deadbolt.sponsors.sofa_sync',
+                    ...extraSafeFetchOpts
                 }
             );
 
@@ -370,21 +543,16 @@ export function createSponsorHub({ config = {}, hydraClient = null, hydraGraphCl
                 } catch {
                     parsedTools = null;
                 }
-                liveMcpSync = {
-                    attempted: true,
-                    connected: true,
-                    mode: 'sofa_mcp_live',
-                    status: rpcRes.data.status,
-                    toolCount: parsedTools
-                };
-            } else {
-                liveMcpSync = {
-                    attempted: true,
-                    connected: false,
-                    mode: 'sw_factory_manifest_local',
-                    fallbackReason: rpcRes.ok ? `HTTP_${rpcRes.data.status}` : rpcRes.error?.code || 'SOFA_UNREACHABLE',
-                    toolCount: null
-                };
+                liveMcpSync.attempted = true;
+                liveMcpSync.connected = true;
+                liveMcpSync.mode = 'sofa_mcp_live';
+                liveMcpSync.status = rpcRes.data.status;
+                liveMcpSync.toolCount = parsedTools;
+            } else if (!liveMcpSync.connected) {
+                liveMcpSync.attempted = true;
+                liveMcpSync.fallbackReason = rpcRes.ok
+                    ? `HTTP_${rpcRes.data.status}`
+                    : rpcRes.error?.code || 'SOFA_UNREACHABLE';
             }
         }
 
