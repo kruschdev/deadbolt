@@ -1480,3 +1480,237 @@ test('PE+CSO audit remediation regressions: private-IP scrubbing, fail-closed re
     assert.equal(latestEntry.action, 'modernizer.rejected');
     assert.equal(latestEntry.outcome, 'DENIED');
 });
+
+test('8090 Software Factory Tri-API governance snapshot, PII redaction, idempotent receipt sync, and HTTP routes', async (t) => {
+    let wo1Comments = [];
+    const postedBodies = [];
+
+    const mockTriFetch = async (url, init = {}) => {
+        const parsed = new URL(String(url));
+        const method = String(init.method || 'GET').toUpperCase();
+
+        if (parsed.pathname === '/v2/organization-api/spend-status') {
+            return new Response(
+                JSON.stringify({
+                    data: {
+                        commercial_model: 'enterprise',
+                        current_billing_period: { start_date: '2026-11-01', end_date: '2026-11-30' },
+                        current_spend_usd: '0.281909'
+                    }
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        if (parsed.pathname === '/v2/organization-api/usage') {
+            return new Response(
+                JSON.stringify({
+                    items: [
+                        {
+                            request_count: 13,
+                            input_tokens: 220299,
+                            output_tokens: 7816,
+                            cache_read_tokens: 173052,
+                            token_cost_usd: '0.281909'
+                        }
+                    ],
+                    usage_freshness: { as_of: '2026-11-14T15:46:34Z' }
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        if (parsed.pathname === '/v2/external-api/work_orders') {
+            return new Response(
+                JSON.stringify({
+                    total: 2,
+                    items: [
+                        {
+                            id: 'wo-uuid-101',
+                            work_order_number: 1,
+                            title: '[WO-101] Fix integer basis-point residual allocation in src/fee-engine.js',
+                            status: 'in_review',
+                            priority: 'urgent',
+                            type: 'fix'
+                        },
+                        {
+                            id: 'wo-uuid-104',
+                            work_order_number: 4,
+                            title: '[WO-104] Modernize legacy PHP PDO CRUD routes',
+                            status: 'in_review',
+                            priority: 'high',
+                            type: 'build'
+                        }
+                    ]
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        if (parsed.pathname === '/v2/external-api/work_orders/wo-uuid-101/comments') {
+            if (method === 'POST') {
+                const bodyObj = JSON.parse(String(init.body || '{}'));
+                postedBodies.push(bodyObj);
+                wo1Comments = [{ markdown_content: bodyObj.markdown_content, author: { email: 'secret-owner@example.com' } }];
+                return new Response(JSON.stringify({ id: 'comment-1' }), {
+                    status: 201,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            return new Response(JSON.stringify({ items: wo1Comments }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        if (parsed.pathname === '/v2/external-api/work_orders/wo-uuid-104/comments') {
+            return new Response(
+                JSON.stringify({
+                    items: [{ markdown_content: '### Stage 1-2 Refinery & Blast-Radius Plan\nDetails...' }]
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        if (parsed.pathname === '/v2/external-api/blueprints') {
+            return new Response(
+                JSON.stringify({
+                    total: 2,
+                    items: [
+                        { id: 'bp-1', title: 'DEADBOLT 4-Stage Factory Governance Engine' },
+                        { id: 'bp-2', title: 'Billing Settlement Governance & SOX-Style Reconciliation' }
+                    ]
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        if (parsed.pathname === '/v2/external-api/requirements') {
+            return new Response(
+                JSON.stringify({
+                    total: 7,
+                    items: [{ id: 'req-1', title: 'Billing Settlement Governance', document_type: 'FEATURE' }]
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        if (parsed.pathname === '/v2/external-api/skills') {
+            return new Response(
+                JSON.stringify({
+                    total: 48,
+                    items: [{ title: 'DEADBOLT Stage 4 Governance & SOX-Style Reconciliation' }]
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        if (parsed.pathname === '/v2/external-api/feedback/items') {
+            return new Response(JSON.stringify({ total: 4, items: [{ status: 'to_process' }] }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+        if (parsed.pathname === '/v2/external-api/automations') {
+            return new Response(
+                JSON.stringify({
+                    items: [
+                        {
+                            name: 'DEADBOLT Stage 4 Validator & Blueprint Drift Gate',
+                            enabled: true,
+                            model: 'sonnet-5.5',
+                            triggers: [{ trigger_type: 'work_order_edited' }],
+                            tool_kit: {
+                                permission_overrides: [
+                                    { domain: 'tests', restriction: 'cannot_edit_or_create' },
+                                    { domain: 'blueprints', restriction: 'cannot_edit_or_create' }
+                                ]
+                            },
+                            owner: { display_name: 'Owner', email: 'secret-owner@example.com' },
+                            total_runs_30d: 1,
+                            successful_runs_30d: 1
+                        }
+                    ]
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        if (parsed.pathname === '/v2/external-api/agent_conversations') {
+            return new Response(
+                JSON.stringify({
+                    items: [
+                        {
+                            title: 'DEADBOLT Stage 4 Validator & Blueprint Drift Gate',
+                            automation: {
+                                automation_name: 'DEADBOLT Stage 4 Validator & Blueprint Drift Gate',
+                                run_status: 'success',
+                                run_completed_at: '2026-11-14T15:32:09Z'
+                            }
+                        }
+                    ]
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+        return new Response(JSON.stringify({ detail: 'not found' }), { status: 404 });
+    };
+
+    const liveHub = createSponsorHub({
+        config: {
+            sofaApiBaseUrl: 'https://api.factory.8090.dev',
+            sofaAdminApiKey: 'sofa-admin-unit-fixture',
+            sofaApiKey: 'sofa-ext-unit-fixture',
+            sofaReportingApiKey: 'sf-rpt-unit-fixture'
+        },
+        lookupFn: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetchImpl: mockTriFetch
+    });
+
+    const snap1 = await liveHub.getSoftwareFactoryGovernanceSnapshot({ forceRefresh: true });
+    assert.equal(snap1.ok, true);
+    assert.equal(snap1.data.liveConnected, true);
+    assert.equal(snap1.data.mode, 'sofa_tri_api_live');
+    assert.equal(snap1.data.orgUsage.inputTokens, 220299);
+    assert.equal(snap1.data.orgUsage.outputTokens, 7816);
+    assert.equal(snap1.data.orgUsage.totalTokens, 228115);
+    assert.equal(snap1.data.inventory.workOrderCount, 2);
+    assert.equal(snap1.data.inventory.blueprintCount, 2);
+    assert.equal(snap1.data.inventory.skillCount, 48);
+    assert.equal(snap1.data.automations[0].permissionOverrides.length, 2);
+    assert.equal(
+        JSON.stringify(snap1).includes('secret-owner@example.com'),
+        false,
+        'Owner/author email PII must never leak into governance snapshot'
+    );
+
+    // First sync posts receipt comment; second sync idempotently verifies existing comment without duplicating
+    const sync1 = await liveHub.syncGovernanceReceiptTo8090({ workOrderId: 'WO-101' });
+    assert.equal(sync1.ok, true);
+    assert.equal(sync1.data.commentAction, 'posted_live_comment');
+    assert.equal(postedBodies.length, 1);
+    assert.equal(
+        sync1.data.snapshot.workOrders[0].latestGovernanceHeading,
+        'DEADBOLT Stage 4 Governance Receipt'
+    );
+
+    const sync2 = await liveHub.syncGovernanceReceiptTo8090({ workOrderId: 'WO-101' });
+    assert.equal(sync2.ok, true);
+    assert.equal(sync2.data.commentAction, 'verified_existing_live_comment');
+    assert.equal(postedBodies.length, 1, 'Second sync must not post duplicate comment');
+
+    // Ephemeral HTTP server routes check
+    const { server, close } = buildServer({ dbPath: ':memory:' });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(async () => {
+        await new Promise((resolve) => server.close(resolve));
+        close();
+    });
+    const { port } = server.address();
+    const govHttpRes = await fetch(`http://127.0.0.1:${port}/api/sofa/governance`);
+    assert.equal(govHttpRes.status, 200);
+    const govHttpJson = await govHttpRes.json();
+    assert.equal(govHttpJson.ok, true);
+    assert.equal(govHttpJson.data.inventory.workOrderCount, 4);
+
+    const syncHttpRes = await fetch(`http://127.0.0.1:${port}/api/sofa/sync-receipt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workOrderId: 'WO-101' })
+    });
+    assert.equal(syncHttpRes.status, 200);
+    const syncHttpJson = await syncHttpRes.json();
+    assert.equal(syncHttpJson.ok, true);
+    assert.equal(syncHttpJson.data.workOrderId, 'WO-101');
+});

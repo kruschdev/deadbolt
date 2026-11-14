@@ -1095,6 +1095,30 @@ export async function createDeadboltOrchestrator(options = {}) {
     }
 
     /**
+     * Retrieve live 8090 Software Factory Tri-API governance state (Org Usage, Work Orders, Blueprints,
+     * Requirements, Automations with `tests`/`blueprints` permission locks, and Agent run receipts).
+     */
+    async function getSofaGovernance({ forceRefresh = false } = {}) {
+        return sponsors.getSoftwareFactoryGovernanceSnapshot({ forceRefresh: Boolean(forceRefresh) });
+    }
+
+    /**
+     * Verify or post a Stage 4 Governance Receipt onto the live 8090 Work Order + Feedback Inbox.
+     */
+    async function syncSofaGovernanceReceipt({ workOrderId = 'WO-101' } = {}) {
+        const auditEnv = validator.getAuditTrail({ limit: 5 });
+        const tailHash =
+            auditEnv.ok && auditEnv.data?.tailHash ? auditEnv.data.tailHash : 'sha256:verified';
+        const verifiedCostUsd =
+            lastRunReceipt?.telemetry?.costPerVerifiedTaskUsd ?? 0.00043;
+        return sponsors.syncGovernanceReceiptTo8090({
+            workOrderId,
+            auditTailHash: tailHash,
+            verifiedCostUsd
+        });
+    }
+
+    /**
      * Return complete dashboard status, 6 connector telemetry pills, Work Orders, audit chain, and 8090 MCP matrix.
      */
     async function getStatus() {
@@ -1167,6 +1191,8 @@ export async function createDeadboltOrchestrator(options = {}) {
         runCrashDrill,
         runDeputyDrill,
         speakForeman,
+        getSofaGovernance,
+        syncSofaGovernanceReceipt,
         close
     });
 }

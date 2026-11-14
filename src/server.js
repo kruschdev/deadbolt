@@ -364,6 +364,32 @@ export function buildServer({
                 return result;
             },
 
+            'GET /api/sofa/governance': async (ctx) => {
+                const orch = await getOrchestrator();
+                const forceRefresh =
+                    ctx.query?.refresh === '1' || ctx.query?.refresh === 'true';
+                const result = await orch.getSofaGovernance({ forceRefresh });
+                if (!result.ok) {
+                    ctx.sendJson(resolveErrorHttpStatus(result), result);
+                    return;
+                }
+                return result;
+            },
+
+            'POST /api/sofa/sync-receipt': async (ctx) => {
+                const orch = await getOrchestrator();
+                const workOrderId = String(ctx.body?.workOrderId || 'WO-101').trim();
+                telemetryDb.run('INSERT INTO events (label) VALUES (?)', [
+                    `sofa-sync:${workOrderId.slice(0, 48)}`
+                ]);
+                const result = await orch.syncSofaGovernanceReceipt({ workOrderId });
+                if (!result.ok) {
+                    ctx.sendJson(resolveErrorHttpStatus(result), result);
+                    return;
+                }
+                return result;
+            },
+
             // Baseline metrics + SSE smoke endpoints
             'GET /api/metrics': () => {
                 const row = telemetryDb.query('SELECT COUNT(*) AS count FROM events')[0];
