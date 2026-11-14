@@ -264,7 +264,7 @@ export function BreakerCockpit() {
   const sofaGovQuery = useApiQuery('/api/sofa/governance');
   const runStream = useSSEStream('/api/run/stream');
 
-  const [activeTab, setActiveTab] = useState('breaker');
+  const [activeTab, setActiveTab] = useState('gate');
   const [showConnectors, setShowConnectors] = useState(false);
 
   const [sofaOverride, setSofaOverride] = useState(null);
@@ -301,10 +301,12 @@ export function BreakerCockpit() {
   const activeAudioRef = useRef(null);
   const foremanAbortRef = useRef(null);
   const audioMutedRef = useRef(false);
+  const activeTabRef = useRef('gate');
   const runIdRef = useRef(0);
   const spokenAlertKeysRef = useRef(new Set());
 
   audioMutedRef.current = audioMuted;
+  activeTabRef.current = activeTab;
 
   const statusError = statusQuery.error;
 
@@ -385,6 +387,7 @@ export function BreakerCockpit() {
       } else if (ev.includes('attempt1') || payload?.attempt === 1) {
         stages.attempt1 = payload;
       } else if (
+        ev === 'validator.workaround_blocked' ||
         ev.includes('workaround') ||
         payload?.verdict === 'WORKAROUND_REJECTED' ||
         payload?.attempt === 2
@@ -460,6 +463,9 @@ export function BreakerCockpit() {
 
   const triggerForemanVoiceAlert = useCallback(
     async ({ isAuto = false } = {}) => {
+      if (isAuto && (audioMutedRef.current || activeTabRef.current !== 'gate')) {
+        return;
+      }
       if (foremanAbortRef.current) {
         foremanAbortRef.current.abort();
       }
@@ -497,7 +503,12 @@ export function BreakerCockpit() {
           triggeredBy: isAuto ? 'auto-breaker' : 'manual'
         });
 
-        if (audioBase64 && !audioMutedRef.current && typeof Audio !== 'undefined') {
+        if (
+          audioBase64 &&
+          !audioMutedRef.current &&
+          (!isAuto || activeTabRef.current === 'gate') &&
+          typeof Audio !== 'undefined'
+        ) {
           try {
             if (activeAudioRef.current) {
               activeAudioRef.current.pause?.();
@@ -507,7 +518,25 @@ export function BreakerCockpit() {
               : `data:${mimeType};base64,${audioBase64}`;
             const player = new Audio(src);
             activeAudioRef.current = player;
-            await player.play();
+            await new Promise((resolve) => {
+              let settled = false;
+              const finish = () => {
+                if (settled) return;
+                settled = true;
+                if (activeAudioRef.current === player) {
+                  activeAudioRef.current = null;
+                }
+                resolve();
+              };
+              player.onended = finish;
+              player.onerror = finish;
+              player.onpause = finish;
+              controller.signal.addEventListener('abort', finish, { once: true });
+              const playPromise = player.play();
+              if (playPromise && typeof playPromise.catch === 'function') {
+                playPromise.catch(finish);
+              }
+            });
           } catch {
             // Safe fallback if browser blocks autoplay: transcript stays visible
           }
@@ -549,6 +578,7 @@ export function BreakerCockpit() {
 
   const handleSelectTab = useCallback(
     (nextTab) => {
+      activeTabRef.current = nextTab;
       if (nextTab !== activeTab) {
         stopActiveForemanAudio();
         setForemanBusy(false);
@@ -559,23 +589,45 @@ export function BreakerCockpit() {
   );
 
   useEffect(() => {
-    if (
-      streamBlockKey &&
-      !audioMuted &&
-      !spokenAlertKeysRef.current.has(streamBlockKey)
-    ) {
-      spokenAlertKeysRef.current.add(streamBlockKey);
+    if (!streamBlockKey || spokenAlertKeysRef.current.has(streamBlockKey)) {
+      return;
+    }
+    spokenAlertKeysRef.current.add(streamBlockKey);
+    if (!audioMuted && activeTab === 'gate') {
       triggerForemanVoiceAlert({ isAuto: true });
     }
-  }, [streamBlockKey, audioMuted, triggerForemanVoiceAlert]);
+  }, [streamBlockKey, audioMuted, activeTab, triggerForemanVoiceAlert]);
 
   useEffect(() => {
-    if (runStream.status === 'done') {
+    if (streamState.done) {
       statusQuery.reload();
+      sofaGovQuery.reload();
+    } else if (
+      runStream.status === 'done' &&
+      runStream.events.length > 0 &&
+      !streamState.done &&
+      !syncRunResult
+    ) {
+      setRunError('Live SSE stream ended before Stage 4 completion. Click Retry Sync to finish.');
     }
-  }, [runStream.status, statusQuery.reload]);
+  }, [
+    streamState.done,
+    runStream.status,
+    runStream.events.length,
+    syncRunResult,
+    statusQuery.reload,
+    sofaGovQuery.reload
+  ]);
 
-  const handleRunLiveStream = async () => {
+  useEffect(() => {
+    if (runStream.error) {
+      stopActiveForemanAudio();
+      setForemanBusy(false);
+    }
+  }, [runStream.error, stopActiveForemanAudio]);
+
+  const handleRunHeadToHead = async () => {
+    setLiveAudit(null);
     setForemanAlert(null);
     stopActiveForemanAudio();
     setRunError(null);
@@ -585,6 +637,7 @@ export function BreakerCockpit() {
   };
 
   const handleRunSyncFallback = async () => {
+    setLiveAudit(null);
     setForemanAlert(null);
     stopActiveForemanAudio();
     setRunError(null);
@@ -600,11 +653,12 @@ export function BreakerCockpit() {
       });
       const unwrapped = unwrapEnvelopeData(raw) || raw;
       setSyncRunResult(unwrapped);
-      if (!audioMutedRef.current) {
+      if (!audioMutedRef.current && activeTabRef.current === 'gate') {
         spokenAlertKeysRef.current.add(`sync-${runIdRef.current}`);
         triggerForemanVoiceAlert({ isAuto: true });
       }
       statusQuery.reload();
+      sofaGovQuery.reload();
     } catch (err) {
       setRunError(err?.message || 'Synchronous head-to-head run failed.');
     } finally {
@@ -746,23 +800,85 @@ export function BreakerCockpit() {
     try {
       const raw = await fetchApiJson('/api/sofa/sync-receipt', {
         method: 'POST',
+        unwrapEnvelope: false,
         body: { workOrderId: selectedWo || 'WO-101' }
       });
+      if (raw && raw.ok === false) {
+        const errCode = String(raw.error?.code || '');
+        const errMsg = String(raw.error?.message || '').trim();
+        setSofaSyncBanner({
+          tone: 'amber',
+          heading:
+            errCode === 'WORK_ORDER_NOT_FOUND'
+              ? 'Work Order Lookup Blocked:'
+              : 'Stage 4 Receipt Required:',
+          message:
+            errCode === 'UNVERIFIED_STAGE_BLOCKED' || !errMsg
+              ? `Run WO-101 Head-to-Head on Tab 1 first so Stage 4 mints a signed SHA-256 receipt before syncing to 8090.${errMsg ? ` (${errMsg})` : ''}`
+              : errMsg
+        });
+        return;
+      }
+
       const synced = unwrapEnvelopeData(raw) || raw || {};
       if (synced.snapshot) {
         setSofaOverride(synced.snapshot);
       }
-      setSofaSyncBanner({
-        workOrderId: synced.workOrderId || 'WO-101',
-        workOrderNumber: synced.workOrderNumber ?? 1,
-        commentAction: synced.commentAction || 'verified_existing_live_comment',
-        commentCount: synced.commentCount ?? 1,
-        feedbackCount: synced.feedbackCount ?? 4,
-        liveConnected: Boolean(synced.liveConnected)
-      });
+      const woId = synced.workOrderId || selectedWo || 'WO-101';
+      const woNum = synced.workOrderNumber ?? 1;
+      const action = String(synced.commentAction || '');
+      const liveConnected = Boolean(synced.liveConnected);
+      const commentCount = synced.commentCount ?? 1;
+      const feedbackCount = synced.feedbackCount ?? 1;
+
+      if (liveConnected && (action === 'posted' || action === 'posted_live_comment')) {
+        setSofaSyncBanner({
+          tone: 'emerald',
+          heading: `8090 Live Receipt Posted on Work Order #${woNum} ([${woId}]):`,
+          message: `Posted signed Stage 4 SHA-256 Governance Receipt to live 8090 Work Order (${commentCount} comment${commentCount === 1 ? '' : 's'}) and synced ${feedbackCount} Feedback Inbox item${feedbackCount === 1 ? '' : 's'}.`
+        });
+      } else if (
+        liveConnected &&
+        (action === 'already_verified_idempotent' || action === 'verified_existing_live_comment')
+      ) {
+        setSofaSyncBanner({
+          tone: 'cyan',
+          heading: `8090 Receipt Already Verified on Work Order #${woNum} ([${woId}]):`,
+          message: `Stage 4 SHA-256 Governance Receipt is already verified on 8090 Work Order (${commentCount} comment${commentCount === 1 ? '' : 's'}, idempotent with zero duplicate comments; ${feedbackCount} Feedback Inbox item${feedbackCount === 1 ? '' : 's'}).`
+        });
+      } else {
+        setSofaSyncBanner({
+          tone: 'amber',
+          heading: `Offline Governance Preview for Work Order #${woNum} ([${woId}]):`,
+          message: `Verified local Stage 4 receipt manifest (liveConnected: false, action: ${action || 'local_manifest_verified'}). Configure live 8090 credentials to post directly to api.factory.8090.dev.`
+        });
+      }
       statusQuery.reload();
     } catch (err) {
-      setDrillError(err?.message || 'Failed to sync Stage 4 receipt to 8090 Software Factory.');
+      const status = Number(err?.status || 0);
+      const errCode = String(err?.code || err?.payload?.error?.code || '');
+      const backendMsg = String(err?.payload?.error?.message || err?.message || '').trim();
+      if (
+        status === 409 ||
+        status === 404 ||
+        errCode === 'UNVERIFIED_STAGE_BLOCKED' ||
+        errCode === 'WORK_ORDER_NOT_FOUND'
+      ) {
+        setSofaSyncBanner({
+          tone: 'amber',
+          heading:
+            status === 404 || errCode === 'WORK_ORDER_NOT_FOUND'
+              ? 'Work Order Lookup Blocked:'
+              : 'Stage 4 Receipt Required:',
+          message:
+            errCode === 'UNVERIFIED_STAGE_BLOCKED'
+              ? `Run WO-101 Head-to-Head on Tab 1 first so Stage 4 mints a signed SHA-256 receipt before syncing to 8090.${backendMsg ? ` (${backendMsg})` : ''}`
+              : backendMsg ||
+                'Run WO-101 Head-to-Head on Tab 1 first so Stage 4 mints a signed SHA-256 receipt before syncing to 8090.'
+        });
+      } else {
+        setDrillError(backendMsg || 'Failed to sync Stage 4 receipt to 8090 Software Factory.');
+      }
     } finally {
       setSofaSyncLoading(false);
     }
@@ -778,8 +894,102 @@ export function BreakerCockpit() {
     const usage = raw.orgUsage || {};
     const autos = Array.isArray(raw.automations) ? raw.automations : [];
     const wos = Array.isArray(raw.workOrders) ? raw.workOrders : [];
+    const agentRuns = Array.isArray(raw.agentRuns) ? raw.agentRuns : [];
     const totalRuns = autos.reduce((s, a) => s + Number(a?.totalRuns30d || 0), 0);
     const greenRuns = autos.reduce((s, a) => s + Number(a?.successfulRuns30d || 0), 0);
+    const totalAgentRuns = agentRuns.length > 0 ? agentRuns.length : totalRuns;
+    const completedAgentRuns =
+      agentRuns.length > 0
+        ? agentRuns.filter((r) => {
+            const st = String(r?.status || 'success').toLowerCase();
+            return (
+              st === 'success' ||
+              st === 'completed' ||
+              st === 'succeeded' ||
+              st === 'verified'
+            );
+          }).length
+        : greenRuns;
+    const distinctRunModels = Array.from(
+      new Set(
+        [
+          ...agentRuns.map((r) => String(r?.model || '').trim()),
+          ...autos.map((a) => String(a?.model || '').trim())
+        ].filter(Boolean)
+      )
+    );
+    const runSummaryLabel =
+      totalAgentRuns > 0
+        ? distinctRunModels.length > 0
+          ? `${totalAgentRuns} factory run${totalAgentRuns === 1 ? '' : 's'} (${distinctRunModels.join(', ')})`
+          : `${totalAgentRuns} factory run${totalAgentRuns === 1 ? '' : 's'} tracked`
+        : 'DEADBOLT <4k Refinery + $0.00043 verified task';
+
+    const effectiveWorkOrders =
+      wos.length > 0
+        ? wos
+        : [
+            {
+              workOrderNumber: 1,
+              code: 'WO-101',
+              title: '[WO-101] Fix integer basis-point residual allocation in src/fee-engine.js',
+              status: 'in_review',
+              hasVerifiedReceipt: true,
+              latestGovernanceHeading: 'DEADBOLT Stage 4 Governance Receipt'
+            },
+            {
+              workOrderNumber: 2,
+              code: 'WO-102',
+              title: '[WO-102] Replace timing-vulnerable webhook HMAC comparison in src/webhook-handler.js',
+              status: 'in_review',
+              hasVerifiedReceipt: false,
+              latestGovernanceHeading: 'Stage 4 Blueprint Drift & Governance Audit'
+            },
+            {
+              workOrderNumber: 3,
+              code: 'WO-103',
+              title: '[WO-103] Enforce HMAC-signed keyset pagination cursors in src/invoice-list.js',
+              status: 'ready',
+              hasVerifiedReceipt: false,
+              latestGovernanceHeading: null
+            },
+            {
+              workOrderNumber: 4,
+              code: 'WO-104',
+              title: '[WO-104] Modernize legacy PHP PDO CRUD routes (taniarascia/pdo)',
+              status: 'in_review',
+              hasVerifiedReceipt: false,
+              latestGovernanceHeading: 'Stage 1-2 Refinery & Blast-Radius Plan'
+            }
+          ];
+
+    const verifiedReceiptWoCount = effectiveWorkOrders.filter(
+      (wo) =>
+        wo?.hasVerifiedReceipt === true ||
+        (typeof wo?.latestGovernanceHeading === 'string' &&
+          wo.latestGovernanceHeading.includes('DEADBOLT Stage 4 Governance Receipt'))
+    ).length;
+
+    const effectiveAutomations =
+      autos.length > 0
+        ? autos
+        : [
+            {
+              name: 'Stage 4 SOX-Style Drift Gate',
+              enabled: true,
+              model: 'sonnet-5.5',
+              totalRuns30d: 1,
+              successfulRuns30d: 1
+            },
+            {
+              name: 'Golden-Brick Blueprint Verifier',
+              enabled: true,
+              model: 'sonnet-5.5',
+              totalRuns30d: 1,
+              successfulRuns30d: 1
+            }
+          ];
+
     const totalTokens = Number(
       usage.totalTokens ?? Number(usage.inputTokens || 0) + Number(usage.outputTokens || 0)
     );
@@ -796,7 +1006,7 @@ export function BreakerCockpit() {
       liveConnected: Boolean(raw.liveConnected),
       mode: raw.mode || 'sofa_tri_api_live',
       endpoint: raw.endpoint || 'https://api.factory.8090.dev',
-      workOrderCount: Number(inv.workOrderCount ?? (wos.length || 4)),
+      workOrderCount: Number(inv.workOrderCount ?? effectiveWorkOrders.length),
       blueprintCount: Number(inv.blueprintCount ?? blueprints.length),
       requirementCount: Number(inv.requirementCount ?? 7),
       skillCount: Number(inv.skillCount ?? 48),
@@ -804,11 +1014,16 @@ export function BreakerCockpit() {
       blueprints,
       governedSkillTitle:
         inv.governedSkillTitle || 'DEADBOLT Stage 4 Governance & SOX-Style Reconciliation',
-      automationCount: autos.length || 2,
-      totalRuns: totalRuns || 2,
-      greenRuns: greenRuns || 2,
-      automations: autos,
-      workOrders: wos,
+      automationCount: effectiveAutomations.length,
+      totalRuns: totalRuns || effectiveAutomations.length,
+      greenRuns: greenRuns || effectiveAutomations.length,
+      totalAgentRuns,
+      completedAgentRuns,
+      runSummaryLabel,
+      verifiedReceiptWoCount,
+      automations: effectiveAutomations,
+      workOrders: effectiveWorkOrders,
+      agentRuns,
       spendUsd: Number.isFinite(spendUsd) ? spendUsd : 0,
       inputTokens: Number(usage.inputTokens || 0),
       outputTokens: Number(usage.outputTokens || 0),
@@ -818,7 +1033,7 @@ export function BreakerCockpit() {
   }, [sofaOverride, sofaGovQuery.data]);
 
   const isStreaming = runStream.status === 'streaming' || syncRunning;
-  const hasCompletedRun = Boolean(activeRun) || runStream.status === 'done';
+  const hasCompletedRun = Boolean(activeRun) || streamState.done;
 
   const conveyorStages = useMemo(() => {
     const rDone = Boolean(streamState.refinery || hasCompletedRun);
@@ -1031,7 +1246,16 @@ export function BreakerCockpit() {
     if (syncRunning) {
       return { label: 'RUNNING GATE...', badgeClass: 'db-badge-cyan' };
     }
-    if (activeRun || streamState.done || streamState.verified || runStream.status === 'done') {
+    if (
+      runStream.error ||
+      (runStream.status === 'done' &&
+        runStream.events.length > 0 &&
+        !streamState.done &&
+        !syncRunResult)
+    ) {
+      return { label: 'STREAM INTERRUPTED', badgeClass: 'db-badge-warn' };
+    }
+    if (activeRun || streamState.done || streamState.verified) {
       return {
         label: governedData.attempt3.verdict || 'VERIFIED',
         badgeClass: 'db-badge-ok'
@@ -1040,7 +1264,10 @@ export function BreakerCockpit() {
     return { label: 'GATE ARMED', badgeClass: 'db-badge-cyan' };
   }, [
     runStream.status,
+    runStream.error,
+    runStream.events.length,
     syncRunning,
+    syncRunResult,
     streamState.verified,
     streamState.done,
     streamState.workaroundBlocked,
@@ -1067,6 +1294,44 @@ export function BreakerCockpit() {
     (armA.slopFindingCount ?? armA.slopViolationCount ?? 1) > 0
       ? 'db-badge-danger'
       : 'db-badge-warn';
+
+  const armB = modernizeResult?.deadboltCascade || {};
+  const armBVerdict = armB?.verdict || 'VERIFIED';
+  const armBBadgeClass =
+    armBVerdict === 'VERIFIED'
+      ? 'db-badge-emerald'
+      : armBVerdict === 'ESCALATE_TO_HUMAN'
+        ? 'db-badge-amber'
+        : 'db-badge-crimson';
+  const armBCardClass =
+    armBVerdict === 'VERIFIED'
+      ? 'db-card-emerald'
+      : armBVerdict === 'ESCALATE_TO_HUMAN'
+        ? 'db-card-amber'
+        : 'db-card-crimson';
+  const armBHeroClass =
+    armBVerdict === 'VERIFIED'
+      ? 'is-emerald'
+      : armBVerdict === 'ESCALATE_TO_HUMAN'
+        ? 'is-amber'
+        : 'is-crimson';
+  const rawPromptTokenReductionPct = Number(
+    modernizerComparison.promptTokenReductionPct ??
+      modernizerComparison.inputTokenReductionPct ??
+      0
+  );
+  const rawCostReductionPct = Number(
+    modernizerComparison.costReductionPct ?? modernizerComparison.costSavingsPct ?? 0
+  );
+  const hasBoundedVerificationOverhead =
+    rawPromptTokenReductionPct < 0 || rawCostReductionPct < 0;
+
+  const activeTabLabel =
+    activeTab === 'gate'
+      ? '1. Work Order Gate'
+      : activeTab === 'scanner'
+        ? '2. GitHub Modernizer'
+        : '3. 8090 Factory & Safety';
 
   const att1Pending = isStreaming && !streamState.attempt1 && !hasCompletedRun;
   const att2Pending = isStreaming && !streamState.workaroundBlocked && !hasCompletedRun;
@@ -1107,17 +1372,21 @@ export function BreakerCockpit() {
 
           <nav className="db-nav db-tabs" role="tablist" aria-label="Workspace Mode">
             <button
+              id="db-tab-gate"
               type="button"
               role="tab"
-              aria-selected={activeTab === 'breaker'}
-              className={cn('db-nav-tab', activeTab === 'breaker' && 'is-active')}
-              onClick={() => handleSelectTab('breaker')}
+              aria-controls="db-tabpanel-active"
+              aria-selected={activeTab === 'gate'}
+              className={cn('db-nav-tab', activeTab === 'gate' && 'is-active')}
+              onClick={() => handleSelectTab('gate')}
             >
               1. Work Order Gate
             </button>
             <button
+              id="db-tab-scanner"
               type="button"
               role="tab"
+              aria-controls="db-tabpanel-active"
               aria-selected={activeTab === 'scanner'}
               className={cn('db-nav-tab', activeTab === 'scanner' && 'is-active')}
               onClick={() => handleSelectTab('scanner')}
@@ -1125,8 +1394,10 @@ export function BreakerCockpit() {
               2. GitHub Modernizer
             </button>
             <button
+              id="db-tab-resilience"
               type="button"
               role="tab"
+              aria-controls="db-tabpanel-active"
               aria-selected={activeTab === 'resilience'}
               className={cn('db-nav-tab', activeTab === 'resilience' && 'is-active')}
               onClick={() => handleSelectTab('resilience')}
@@ -1183,10 +1454,16 @@ export function BreakerCockpit() {
           </div>
         )}
 
+        <div
+          id="db-tabpanel-active"
+          role="tabpanel"
+          aria-label={activeTabLabel}
+          className={cn('db-tabpanel', activeTab === 'resilience' && 'db-tabpanel-compact')}
+        >
         {/* =========================================================
-            TAB 1: WORK ORDER GATE (WO-101 SELF-REJECTION & SOX LEDGER)
+            TAB 1: WORK ORDER GATE (WO-101 SELF-REJECTION & SOX-STYLE LEDGER)
             ========================================================= */}
-        {activeTab === 'breaker' && (
+        {activeTab === 'gate' && (
           <>
             <div className="db-toolbar">
               <div className="db-toolbar-group">
@@ -1221,7 +1498,7 @@ export function BreakerCockpit() {
                   type="button"
                   className="db-btn db-btn-primary"
                   disabled={isStreaming}
-                  onClick={handleRunLiveStream}
+                  onClick={handleRunHeadToHead}
                 >
                   {runStream.status === 'streaming'
                     ? `Running ${selectedWo}...`
@@ -1406,7 +1683,7 @@ export function BreakerCockpit() {
                     </div>
                     <div className="db-attempt-desc">
                       {att1Pending
-                        ? 'Running Stage 4 deterministic SOX batch reconciliation...'
+                        ? 'Running Stage 4 deterministic SOX-style batch reconciliation...'
                         : `INV-FIN-03 caught ${formatSignedCents(governedData.attempt1.deltaCents)} split-invoice drift missed by unit tests.`}
                     </div>
                   </div>
@@ -1677,36 +1954,41 @@ export function BreakerCockpit() {
                   <div className="db-kpi-box">
                     <div className="db-kicker">Prompt Token Reduction</div>
                     <div className="db-kpi-val tabular-nums" style={{ color: '#38bdf8' }}>
-                      {Number(modernizerComparison.inputTokenReductionPct ?? 0) >= 0
-                        ? `-${modernizerComparison.inputTokenReductionPct ?? 0}%`
-                        : `Bounded ${modernizerComparison.filesModernized || 1}-File Slice`}
+                      {hasBoundedVerificationOverhead
+                        ? 'Bounded Slice'
+                        : `-${rawPromptTokenReductionPct}%`}
                     </div>
                     <div className="db-hero-caption">
-                      HydraDB 2-hop slice vs. full-repo stuffing
+                      {hasBoundedVerificationOverhead
+                        ? '2-Family Verified (Bounded Overhead)'
+                        : 'HydraDB 2-hop slice vs. full-repo stuffing'}
                     </div>
                   </div>
 
                   <div className="db-kpi-box">
                     <div className="db-kicker">Cascade Cost Advantage</div>
                     <div className="db-kpi-val tabular-nums" style={{ color: '#34d399' }}>
-                      {Number(modernizeResult.comparison?.costMultiplier ?? 1) >= 1
-                        ? `${modernizeResult.comparison?.costMultiplier ?? 1}x Cheaper`
-                        : 'Parity'}
+                      {hasBoundedVerificationOverhead
+                        ? 'Bounded Overhead'
+                        : Number(modernizerComparison.costMultiplier ?? 1) >= 1
+                          ? `${modernizerComparison.costMultiplier ?? 1}x Cheaper`
+                          : 'Parity'}
                     </div>
                     <div className="db-hero-caption">
-                      {Number(modernizeResult.comparison?.costReductionPct ?? 0) >= 0
-                        ? `-${modernizeResult.comparison?.costReductionPct ?? 0}% total inference spend`
-                        : 'Verified 2-family cross-check'}
+                      {hasBoundedVerificationOverhead
+                        ? '2-Family Verified (Bounded Overhead)'
+                        : `-${rawCostReductionPct}% total inference spend`}
                     </div>
                   </div>
 
                   <div className="db-kpi-box">
                     <div className="db-kicker">DEADBOLT Golden Bricks</div>
                     <div className="db-kpi-val tabular-nums" style={{ color: '#34d399' }}>
-                      {modernizeResult.deadboltCascade?.sealedCoveragePct ?? 100}%
+                      {armB.sealedCoveragePct ?? 100}%
                     </div>
                     <div className="db-hero-caption">
-                      0 slop findings · +{modernizeResult.hydraGraph?.supersedesEdgesWritten ?? 0} :SUPERSEDES edges
+                      {armB.slopFindingCount ?? 0} slop findings · +
+                      {modernizeResult.hydraGraph?.supersedesEdgesWritten ?? 0} :SUPERSEDES edges
                     </div>
                   </div>
                 </div>
@@ -1757,26 +2039,26 @@ export function BreakerCockpit() {
                   </article>
 
                   {/* ARM B */}
-                  <article className="db-card db-card-emerald">
+                  <article className={cn('db-card', armBCardClass)}>
                     <div className="db-card-head">
                       <div>
                         <div className="db-kicker">Arm B: HydraDB 2-Hop + &lt;25us Cascade</div>
                         <h3 className="db-card-title">DEADBOLT Governed Cascade</h3>
                       </div>
-                      <span className="db-badge db-badge-emerald">
-                        {modernizeResult.deadboltCascade?.verdict || 'VERIFIED'}
+                      <span className={cn('db-badge', armBBadgeClass)}>
+                        {armBVerdict}
                       </span>
                     </div>
 
                     <div className="db-hero-stat">
                       <div>
                         <div className="db-kicker">Measured Wave Cost</div>
-                        <div className="db-hero-number is-emerald tabular-nums">
-                          {formatCostUsd(modernizeResult.deadboltCascade?.totalCostUsd)}
+                        <div className={cn('db-hero-number tabular-nums', armBHeroClass)}>
+                          {formatCostUsd(armB.totalCostUsd)}
                         </div>
                       </div>
                       <div className="db-hero-caption tabular-nums">
-                        {modernizeResult.deadboltCascade?.inputTokens ?? 0} input tokens
+                        {armB.inputTokens ?? 0} input tokens
                       </div>
                     </div>
 
@@ -1784,7 +2066,20 @@ export function BreakerCockpit() {
                       <li className="db-list-row">
                         <span>Routing Mix</span>
                         <span className="db-mono" style={{ fontSize: '0.8rem' }}>
-                          {modernizeResult.deadboltCascade?.modelSummary}
+                          {armB.modelSummary}
+                        </span>
+                      </li>
+                      <li className="db-list-row">
+                        <span>Verification Economy</span>
+                        <span
+                          className={cn(
+                            'db-badge',
+                            hasBoundedVerificationOverhead ? 'db-badge-cyan' : 'db-badge-emerald'
+                          )}
+                        >
+                          {hasBoundedVerificationOverhead
+                            ? '2-Family Verified (Bounded Overhead)'
+                            : `${rawPromptTokenReductionPct}% fewer prompt tokens`}
                         </span>
                       </li>
                       <li className="db-list-row">
@@ -1795,8 +2090,16 @@ export function BreakerCockpit() {
                       </li>
                       <li className="db-list-row">
                         <span>Sealed Golden Bricks</span>
-                        <span className="db-badge db-badge-emerald">
-                          {modernizeResult.deadboltCascade?.sealedCoveragePct ?? 100}% (0 Slop)
+                        <span
+                          className={cn(
+                            'db-badge',
+                            (armB.sealedCoveragePct ?? 100) === 100 &&
+                              (armB.slopFindingCount ?? 0) === 0
+                              ? 'db-badge-emerald'
+                              : armBBadgeClass
+                          )}
+                        >
+                          {armB.sealedCoveragePct ?? 100}% ({armB.slopFindingCount ?? 0} Slop)
                         </span>
                       </li>
                     </ul>
@@ -1808,8 +2111,8 @@ export function BreakerCockpit() {
                     <span>
                       Inspect Per-File Cascade Routing &amp; Staged Unified Git Diff
                     </span>
-                    <span className="db-badge db-badge-emerald">
-                      {(modernizeResult.deadboltCascade?.fileReceipts || []).length} Modernized Modules
+                    <span className={cn('db-badge', armBBadgeClass)}>
+                      {(armB.fileReceipts || []).length} Modernized Modules
                     </span>
                   </summary>
                   <div className="db-drawer-body">
@@ -1984,7 +2287,7 @@ export function BreakerCockpit() {
             )}
 
             {/* HERO: LIVE 8090 SOFTWARE FACTORY TRI-API CONTROL PLANE */}
-            <div className="db-card">
+            <div className="db-card db-sofa-panel">
               <div className="db-card-head">
                 <div>
                   <div className="db-kicker">
@@ -1994,7 +2297,7 @@ export function BreakerCockpit() {
                     8090 Workspace, Locked Automations &amp; Governance Loop
                   </h2>
                 </div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.5rem' }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '0.45rem' }}>
                   <span
                     className={cn(
                       'db-badge',
@@ -2025,35 +2328,28 @@ export function BreakerCockpit() {
               {sofaSyncBanner && (
                 <div
                   role="region"
-                  aria-label="8090 Live Sync Confirmation"
-                  style={{
-                    padding: '0.75rem 1rem',
-                    borderRadius: '10px',
-                    border: '1px solid rgba(16, 185, 129, 0.45)',
-                    background: 'rgba(16, 185, 129, 0.1)',
-                    color: '#d1fae5',
-                    fontSize: '0.88rem'
-                  }}
+                  aria-label="8090 Sync Status"
+                  className={cn(
+                    'db-sync-banner',
+                    sofaSyncBanner.tone === 'emerald'
+                      ? 'is-emerald'
+                      : sofaSyncBanner.tone === 'cyan'
+                        ? 'is-cyan'
+                        : 'is-amber'
+                  )}
                 >
-                  <strong>
-                    8090 Live Round-Trip Verified on Work Order #{sofaSyncBanner.workOrderNumber} ([
-                    {sofaSyncBanner.workOrderId}]):
-                  </strong>{' '}
-                  Stage 4 SHA-256 Governance Receipt comment confirmed ({sofaSyncBanner.commentCount}{' '}
-                  comment{sofaSyncBanner.commentCount === 1 ? '' : 's'}),{' '}
-                  {sofaStats.greenRuns}/{sofaStats.totalRuns} Factory Automations green, and{' '}
-                  {sofaSyncBanner.feedbackCount} Feedback Inbox items synced.
+                  <strong>{sofaSyncBanner.heading}</strong> {sofaSyncBanner.message}
                 </div>
               )}
 
-              <div className="db-kpi-row">
+              <div className="db-sofa-kpi-grid">
                 <div className="db-kpi-box">
                   <div className="db-kicker">8090 Factory Artifacts</div>
                   <div className="db-kpi-val tabular-nums" style={{ color: '#38bdf8' }}>
                     {sofaStats.workOrderCount} WOs · {sofaStats.blueprintCount} Blueprints
                   </div>
                   <div className="db-hero-caption tabular-nums">
-                    {sofaStats.requirementCount} Requirements · {sofaStats.skillCount} Skills ·{' '}
+                    {sofaStats.requirementCount} Req · {sofaStats.skillCount} Skills ·{' '}
                     {sofaStats.feedbackCount} Feedback
                   </div>
                 </div>
@@ -2061,7 +2357,7 @@ export function BreakerCockpit() {
                 <div className="db-kpi-box">
                   <div className="db-kicker">Locked 8090 Automations</div>
                   <div className="db-kpi-val tabular-nums" style={{ color: '#34d399' }}>
-                    {sofaStats.automationCount} Active · {sofaStats.greenRuns}/{sofaStats.totalRuns} Runs
+                    {sofaStats.automationCount} Active · {sofaStats.greenRuns}/{sofaStats.totalRuns} Green
                   </div>
                   <div className="db-hero-caption">
                     <code>tests</code> &amp; <code>blueprints</code>: cannot_edit_or_create
@@ -2069,23 +2365,33 @@ export function BreakerCockpit() {
                 </div>
 
                 <div className="db-kpi-box">
-                  <div className="db-kicker">8090 Org Token &amp; Spend Meter</div>
+                  <div className="db-kicker">Agent Execution &amp; Spend</div>
                   <div className="db-kpi-val tabular-nums" style={{ color: '#fcd34d' }}>
                     {sofaStats.spendUsd > 0
-                      ? `$${sofaStats.spendUsd.toFixed(4)} · ${(sofaStats.totalTokens / 1000).toFixed(1)}k tok`
-                      : 'Bounded < 4k tok'}
+                      ? `$${sofaStats.spendUsd.toFixed(4)} · ${sofaStats.completedAgentRuns}/${sofaStats.totalAgentRuns} Runs`
+                      : `${sofaStats.completedAgentRuns}/${sofaStats.totalAgentRuns} Runs · <4k tok`}
                   </div>
                   <div className="db-hero-caption tabular-nums">
                     {sofaStats.spendUsd > 0
-                      ? `2 standard sonnet-5.5 runs vs. DEADBOLT $0.00043 verified task`
-                      : 'DEADBOLT <4k Refinery + $0.00043 verified task'}
+                      ? `${(sofaStats.totalTokens / 1000).toFixed(1)}k tok · ${sofaStats.runSummaryLabel}`
+                      : sofaStats.runSummaryLabel}
+                  </div>
+                </div>
+
+                <div className="db-kpi-box">
+                  <div className="db-kicker">Stage 4 Receipt Gate</div>
+                  <div className="db-kpi-val tabular-nums" style={{ color: '#34d399' }}>
+                    {sofaStats.verifiedReceiptWoCount}/{sofaStats.workOrderCount} Verified
+                  </div>
+                  <div className="db-hero-caption">
+                    Signed SHA-256 Stage 4 receipt required
                   </div>
                 </div>
               </div>
 
-              <div className="db-split-grid">
+              <div className="db-sofa-columns">
                 {/* LEFT: LIVE 8090 WORK ORDERS & BLUEPRINTS */}
-                <div className="db-card" style={{ padding: '1.15rem 1.25rem' }}>
+                <div className="db-card db-sofa-subcard">
                   <div className="db-card-head">
                     <div>
                       <div className="db-kicker">Pulled from api.factory.8090.dev</div>
@@ -2097,129 +2403,107 @@ export function BreakerCockpit() {
                   </div>
 
                   <ul className="db-list">
-                    {(sofaStats.workOrders.length > 0
-                      ? sofaStats.workOrders.slice(0, 4)
-                      : [
-                          {
-                            workOrderNumber: 1,
-                            code: 'WO-101',
-                            title: '[WO-101] Fix integer basis-point residual allocation in src/fee-engine.js',
-                            status: 'in_review',
-                            latestGovernanceHeading: 'DEADBOLT Stage 4 Governance Receipt'
-                          },
-                          {
-                            workOrderNumber: 2,
-                            code: 'WO-102',
-                            title: '[WO-102] Replace timing-vulnerable webhook HMAC comparison in src/webhook-handler.js',
-                            status: 'in_review',
-                            latestGovernanceHeading: 'Stage 4 Blueprint Drift & Governance Audit'
-                          },
-                          {
-                            workOrderNumber: 3,
-                            code: 'WO-103',
-                            title: '[WO-103] Enforce HMAC-signed keyset pagination cursors in src/invoice-list.js',
-                            status: 'ready',
-                            latestGovernanceHeading: null
-                          },
-                          {
-                            workOrderNumber: 4,
-                            code: 'WO-104',
-                            title: '[WO-104] Modernize legacy PHP PDO CRUD routes (taniarascia/pdo)',
-                            status: 'in_review',
-                            latestGovernanceHeading: 'Stage 1-2 Refinery & Blast-Radius Plan'
-                          }
-                        ]
-                    ).map((wo) => {
+                    {sofaStats.workOrders.slice(0, 4).map((wo) => {
                       const cleanTitle = String(wo.title || '').replace(/^\[WO-[^\]]+\]\s*/, '');
-                      const hasReceipt = Boolean(wo.latestGovernanceHeading);
+                      const hasVerifiedStage4Receipt =
+                        wo.hasVerifiedReceipt === true ||
+                        (typeof wo.latestGovernanceHeading === 'string' &&
+                          wo.latestGovernanceHeading.includes('DEADBOLT Stage 4 Governance Receipt'));
                       return (
                         <li
                           key={`${wo.code}-${wo.workOrderNumber}`}
-                          className="db-list-row"
-                          style={{ alignItems: 'flex-start', flexDirection: 'column', gap: '0.35rem' }}
+                          className="db-sofa-wo-row"
                         >
-                          <div
-                            style={{
-                              width: '100%',
-                              display: 'flex',
-                              justifyContent: 'space-between',
-                              alignItems: 'center',
-                              gap: '0.5rem'
-                            }}
-                          >
-                            <span style={{ fontWeight: 600, color: '#ffffff' }}>
-                              #{wo.workOrderNumber} <code>{wo.code}</code> {cleanTitle.slice(0, 46)}
-                              {cleanTitle.length > 46 ? '...' : ''}
-                            </span>
+                          <div className="db-sofa-wo-head">
                             <span
-                              className={cn(
-                                'db-badge',
-                                hasReceipt ? 'db-badge-emerald' : 'db-badge-cyan'
-                              )}
+                              className="db-sofa-wo-title"
+                              title={`#${wo.workOrderNumber} ${wo.code} ${cleanTitle}`}
                             >
-                              {wo.status}
+                              #{wo.workOrderNumber} <code>{wo.code}</code> {cleanTitle}
                             </span>
+                            <div className="db-sofa-wo-badges">
+                              {hasVerifiedStage4Receipt && (
+                                <span className="db-badge db-badge-emerald">
+                                  Stage 4 Receipt
+                                </span>
+                              )}
+                              <span className="db-badge db-badge-cyan">
+                                {wo.status}
+                              </span>
+                            </div>
                           </div>
-                          <span style={{ fontSize: '0.79rem', color: '#94a3b8' }}>
-                            {hasReceipt
-                              ? `8090 Comment: ${wo.latestGovernanceHeading}`
-                              : 'Disjoint 2-hop AST cone leased and ready'}
+                          <span className="db-sofa-wo-sub">
+                            {hasVerifiedStage4Receipt
+                              ? '8090 Comment: DEADBOLT Stage 4 Governance Receipt verified'
+                              : wo.latestGovernanceHeading
+                                ? `8090 Note: ${wo.latestGovernanceHeading}`
+                                : 'Disjoint 2-hop AST cone leased; run Stage 4 to mint receipt'}
                           </span>
                         </li>
                       );
                     })}
                   </ul>
 
-                  <div style={{ fontSize: '0.8rem', color: '#94a3b8' }}>
-                    Linked Blueprints:{' '}
-                    {sofaStats.blueprints.map((b) => b.title).join(' · ')}
+                  <div style={{ fontSize: '0.77rem', color: '#94a3b8' }}>
+                    Blueprints: {sofaStats.blueprints.map((b) => b.title).join(' · ')}
                   </div>
                 </div>
 
-                {/* RIGHT: HOW DEADBOLT ACCESSES & ENFORCES 8090 GOVERNANCE */}
-                <div className="db-card db-card-emerald" style={{ padding: '1.15rem 1.25rem' }}>
+                {/* RIGHT: LOCKED AUTOMATIONS & 3-LAYER GOVERNANCE LOOP */}
+                <div className="db-card db-card-emerald db-sofa-subcard">
                   <div className="db-card-head">
                     <div>
                       <div className="db-kicker">Closed-Loop Enforcement</div>
-                      <h3 className="db-card-title">How DEADBOLT Governs 8090 Factory</h3>
+                      <h3 className="db-card-title">Locked Automations &amp; 3-Layer Loop</h3>
                     </div>
-                    <span className="db-badge db-badge-emerald">3-Layer Loop</span>
+                    <span className="db-badge db-badge-emerald">Read-Only Floor</span>
                   </div>
+
+                  <ul className="db-list">
+                    {sofaStats.automations.slice(0, 2).map((auto, idx) => (
+                      <li key={`${auto.name}-${idx}`} className="db-sofa-auto-row">
+                        <span className="db-sofa-auto-title" title={auto.name}>
+                          {auto.name}{' '}
+                          <code style={{ fontSize: '0.73rem', color: '#93c5fd' }}>
+                            {auto.model || 'sonnet-5.5'}
+                          </code>
+                        </span>
+                        <span className="db-badge db-badge-emerald tabular-nums">
+                          {auto.successfulRuns30d ?? 1}/{auto.totalRuns30d ?? 1} Green
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
 
                   <div className="db-attempt-list">
                     <div className="db-attempt-item is-amber">
                       <div className="db-attempt-top">
-                        <span>1. Hydrates 8090 Specs into Bounded Refinery</span>
+                        <span>1. Bounded &lt;4k Refinery Hydration</span>
                         <span className="db-badge db-badge-cyan">/v2/external-api</span>
                       </div>
                       <div className="db-attempt-desc">
-                        Pulls live 8090 Requirements, Blueprints, and Work Orders under a strict{' '}
-                        <code>4,000</code>-token budget with SHA-256 source span drift locks instead of burning{' '}
-                        <code>110k+</code> tokens per run.
+                        Hydrates 8090 Requirements, Blueprints, and Work Orders with SHA-256 span drift locks.
                       </div>
                     </div>
 
                     <div className="db-attempt-item is-crimson">
                       <div className="db-attempt-top">
-                        <span>2. Locks Tests, Blueprints &amp; Reconcilers</span>
-                        <span className="db-badge db-badge-crimson">Read-Only Floor</span>
+                        <span>2. Tests, Blueprints &amp; Reconcilers Locked</span>
+                        <span className="db-badge db-badge-crimson">Policy Floor</span>
                       </div>
                       <div className="db-attempt-desc">
-                        Pairs 8090 Automation overrides (<code>tests</code> &amp; <code>blueprints</code> locked{' '}
-                        <code>cannot_edit_or_create</code>) with DEADBOLT&apos;s Policy Floor on{' '}
-                        <code>src/sox-reconciler.js</code> so agents cannot cheat failing checks.
+                        Enforces <code>cannot_edit_or_create</code> on 8090 tests/blueprints and locks{' '}
+                        <code>src/sox-reconciler.js</code>.
                       </div>
                     </div>
 
                     <div className="db-attempt-item is-emerald">
                       <div className="db-attempt-top">
-                        <span>3. Writes Signed Receipts &amp; Spend Telemetry</span>
+                        <span>3. Signed Receipts &amp; Spend Telemetry</span>
                         <span className="db-badge db-badge-emerald">Tri-API Sync</span>
                       </div>
                       <div className="db-attempt-desc">
-                        Posts SHA-256 Stage 4 receipts onto 8090 Work Orders, sends{' '}
-                        <code>WORKAROUND_REJECTED</code> alerts to 8090&apos;s Feedback Inbox, and meters org spend via{' '}
-                        <code>/v2/organization-api/usage</code>.
+                        Posts Stage 4 SHA-256 receipts on Work Orders, Feedback Inbox alerts, and org spend metrics.
                       </div>
                     </div>
                   </div>
@@ -2405,6 +2689,7 @@ export function BreakerCockpit() {
             </div>
           </>
         )}
+        </div>
       </div>
     </div>
   );

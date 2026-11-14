@@ -21,47 +21,199 @@ const RFC1918_10_IPV4_RE = /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g;
 const RFC1918_192_IPV4_RE = /\b192\.168\.\d{1,3}\.\d{1,3}\b/g;
 const RFC1918_172_IPV4_RE = /\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/g;
 const TAILSCALE_IPV6_RE = /\bfd7a:115c:a1e0:(?:[0-9a-fA-F:]*[0-9a-fA-F]\b|:*)/gi;
-const REDACTED_PRIVATE_HOST = '[redacted-private-host]';
-const MAX_SCRUB_DEPTH = 5;
+const LOOPBACK_INTERNAL_URL_RE =
+    /\bhttps?:\/\/(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0\.0\.0\.0|\[::1\])(?::\d{1,5})?(?:\/[^\s"'`):,\]]*)?/gi;
+const LOOPBACK_HOST_PORT_RE =
+    /\b(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\]):\d{2,5}\b/gi;
+const LOOPBACK_IPV4_RE = /\b127\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g;
+const LOCAL_HOME_PATH_RE = /(?<![A-Za-z0-9._-])\/home\/[A-Za-z0-9._-]+(?:\/[^\s"'`):,\]]+)*/g;
+const LOCAL_USERS_PATH_RE = /(?<![A-Za-z0-9._-])\/Users\/[A-Za-z0-9._-]+(?:\/[^\s"'`):,\]]+)*/g;
+const SECRET_TOKEN_RE =
+    /\b(?:sofa-(?:admin|ext)-[A-Za-z0-9_-]+|sf-rpt-[A-Za-z0-9_-]+|ck_[A-Za-z0-9_-]{8,}|sk-(?:or-v1-)?[A-Za-z0-9_-]{12,}|xi-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,})\b/g;
+const EMAIL_ADDRESS_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 
-function scrubPrivateNetworkRecursive(value, depth) {
+const REDACTED_PRIVATE_HOST = '[redacted-private-host]';
+const REDACTED_PATH = '[REDACTED_PATH]';
+const REDACTED_SECRET = '[REDACTED_SECRET]';
+const REDACTED_EMAIL = '[REDACTED_EMAIL]';
+const MAX_SCRUB_DEPTH = 12;
+const MAX_LEAF_FALLBACK_DEPTH = 32;
+
+function scrubString(str) {
+    return str
+        .replace(SECRET_TOKEN_RE, REDACTED_SECRET)
+        .replace(EMAIL_ADDRESS_RE, REDACTED_EMAIL)
+        .replace(LOCAL_HOME_PATH_RE, REDACTED_PATH)
+        .replace(LOCAL_USERS_PATH_RE, REDACTED_PATH)
+        .replace(LOOPBACK_INTERNAL_URL_RE, REDACTED_PRIVATE_HOST)
+        .replace(LOOPBACK_HOST_PORT_RE, REDACTED_PRIVATE_HOST)
+        .replace(LOOPBACK_IPV4_RE, REDACTED_PRIVATE_HOST)
+        .replace(TAILSCALE_CGNAT_IPV4_RE, REDACTED_PRIVATE_HOST)
+        .replace(RFC1918_10_IPV4_RE, REDACTED_PRIVATE_HOST)
+        .replace(RFC1918_192_IPV4_RE, REDACTED_PRIVATE_HOST)
+        .replace(RFC1918_172_IPV4_RE, REDACTED_PRIVATE_HOST)
+        .replace(TAILSCALE_IPV6_RE, REDACTED_PRIVATE_HOST);
+}
+
+function shallowScrubLeaves(target) {
+    if (Array.isArray(target)) {
+        return target.map((item) => (typeof item === 'string' ? scrubString(item) : item));
+    }
+    const proto = Object.getPrototypeOf(target);
+    if (proto === null || proto === Object.prototype) {
+        const out = {};
+        for (const [k, v] of Object.entries(target)) {
+            out[k] = typeof v === 'string' ? scrubString(v) : v;
+        }
+        return out;
+    }
+    return target;
+}
+
+function scrubPrivateNetworkRecursive(value, depth, ancestors) {
     if (typeof value === 'string') {
-        return value
-            .replace(TAILSCALE_CGNAT_IPV4_RE, REDACTED_PRIVATE_HOST)
-            .replace(RFC1918_10_IPV4_RE, REDACTED_PRIVATE_HOST)
-            .replace(RFC1918_192_IPV4_RE, REDACTED_PRIVATE_HOST)
-            .replace(RFC1918_172_IPV4_RE, REDACTED_PRIVATE_HOST)
-            .replace(TAILSCALE_IPV6_RE, REDACTED_PRIVATE_HOST);
+        return scrubString(value);
     }
     if (value === null || value === undefined || typeof value !== 'object') {
         return value;
     }
-    if (depth >= MAX_SCRUB_DEPTH) {
-        return Array.isArray(value) ? [] : {};
+    if (ancestors.has(value)) {
+        return shallowScrubLeaves(value);
+    }
+    if (depth >= MAX_SCRUB_DEPTH && depth >= MAX_LEAF_FALLBACK_DEPTH) {
+        return shallowScrubLeaves(value);
     }
     if (Array.isArray(value)) {
-        return value.map((item) => scrubPrivateNetworkRecursive(item, depth + 1));
+        ancestors.add(value);
+        try {
+            return value.map((item) => scrubPrivateNetworkRecursive(item, depth + 1, ancestors));
+        } finally {
+            ancestors.delete(value);
+        }
     }
     const proto = Object.getPrototypeOf(value);
     if (proto === null || proto === Object.prototype) {
-        const out = {};
-        for (const [k, v] of Object.entries(value)) {
-            out[k] = scrubPrivateNetworkRecursive(v, depth + 1);
+        ancestors.add(value);
+        try {
+            const out = {};
+            for (const [k, v] of Object.entries(value)) {
+                out[k] = scrubPrivateNetworkRecursive(v, depth + 1, ancestors);
+            }
+            return out;
+        } finally {
+            ancestors.delete(value);
         }
-        return out;
     }
     return value;
 }
 
 /**
- * Recursively redact Tailscale/CGNAT IPv4, RFC1918 IPv4, and Tailscale ULA IPv6 literals
- * across strings, arrays, and plain objects (max depth 5) per INV-DB-08.
+ * Recursively redact private/loopback hosts, local paths, secret tokens, and email addresses
+ * across strings, arrays, and plain objects (depth 12 with leaf-preserving fallback) per INV-DB-08.
+ * Never replaces nested objects or arrays with empty `{}` or `[]`.
  *
- * @param {unknown} input
+ * @param {unknown} value
+ * @param {number} [depth=0]
  * @returns {unknown}
  */
-export function scrubPrivateNetworkStrings(input) {
-    return scrubPrivateNetworkRecursive(input, 0);
+export function scrubPrivateNetworkStrings(value, depth = 0) {
+    const startDepth = Number.isInteger(depth) && depth >= 0 ? depth : 0;
+    return scrubPrivateNetworkRecursive(value, startDepth, new WeakSet());
+}
+
+function resolveResponseTarget(res) {
+    if (!res || typeof res !== 'object') {
+        return null;
+    }
+    if (typeof res.text === 'function' || typeof res.json === 'function') {
+        return res;
+    }
+    const nested = res.data?.response ?? res.response ?? null;
+    if (nested && (typeof nested.text === 'function' || typeof nested.json === 'function')) {
+        return nested;
+    }
+    return null;
+}
+
+/**
+ * Read a Response body as UTF-8 text under a strict post-header timeout so stalled TCP streams cannot hang.
+ *
+ * @param {Response|{data?: {response?: Response}}} res
+ * @param {number} [timeoutMs=2500]
+ * @returns {Promise<string>}
+ */
+export async function readTextWithTimeout(res, timeoutMs = 2500) {
+    const response = resolveResponseTarget(res);
+    if (!response || typeof response.text !== 'function') {
+        throw new Error('Invalid response object passed to readTextWithTimeout.');
+    }
+    const boundedMs =
+        Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+            ? Math.trunc(Number(timeoutMs))
+            : 2500;
+    let timer = null;
+    try {
+        const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+                const err = new Error(`Response text stream timed out after ${boundedMs}ms.`);
+                err.code = 'BODY_READ_TIMEOUT';
+                reject(err);
+            }, boundedMs);
+        });
+        return await Promise.race([response.text(), timeoutPromise]);
+    } catch (err) {
+        response.body?.cancel?.().catch?.(() => {});
+        throw err;
+    } finally {
+        if (timer !== null) {
+            clearTimeout(timer);
+            timer.unref?.();
+        }
+    }
+}
+
+/**
+ * Parse a Response JSON body under a strict post-header timeout so stalled TCP streams cannot hang.
+ *
+ * @param {Response|{data?: {response?: Response}}} res
+ * @param {number} [timeoutMs=2500]
+ * @returns {Promise<any>}
+ */
+export async function readJsonWithTimeout(res, timeoutMs = 2500) {
+    const response = resolveResponseTarget(res);
+    if (!response) {
+        throw new Error('Invalid response object passed to readJsonWithTimeout.');
+    }
+    if (typeof response.json !== 'function' && typeof response.text === 'function') {
+        const rawText = await readTextWithTimeout(response, timeoutMs);
+        return rawText ? JSON.parse(rawText) : null;
+    }
+    if (typeof response.json !== 'function') {
+        throw new Error('Invalid response object passed to readJsonWithTimeout.');
+    }
+    const boundedMs =
+        Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+            ? Math.trunc(Number(timeoutMs))
+            : 2500;
+    let timer = null;
+    try {
+        const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+                const err = new Error(`Response JSON stream timed out after ${boundedMs}ms.`);
+                err.code = 'BODY_READ_TIMEOUT';
+                reject(err);
+            }, boundedMs);
+        });
+        return await Promise.race([response.json(), timeoutPromise]);
+    } catch (err) {
+        response.body?.cancel?.().catch?.(() => {});
+        throw err;
+    } finally {
+        if (timer !== null) {
+            clearTimeout(timer);
+            timer.unref?.();
+        }
+    }
 }
 
 /**
@@ -287,8 +439,20 @@ export function createHydraGraphClient(options = {}) {
 
         let parsed = null;
         try {
-            parsed = await res.data.response.json();
-        } catch {
+            parsed = await readJsonWithTimeout(res.data.response, timeoutMs);
+        } catch (bodyErr) {
+            if (bodyErr?.code === 'BODY_READ_TIMEOUT') {
+                return errorEnvelope(
+                    'HYDRADB_BODY_TIMEOUT',
+                    scrubPrivateNetworkStrings(bodyErr.message),
+                    {
+                        graphId: cleanGraphId,
+                        reasonCode: 'HYDRADB_BODY_TIMEOUT',
+                        status: res.data.status
+                    },
+                    'deadbolt.hydradb.healthz'
+                );
+            }
             parsed = null;
         }
 
@@ -382,8 +546,20 @@ export function createHydraGraphClient(options = {}) {
 
         let rawJson = null;
         try {
-            rawJson = await res.data.response.json();
-        } catch {
+            rawJson = await readJsonWithTimeout(res.data.response, timeoutMs);
+        } catch (bodyErr) {
+            if (bodyErr?.code === 'BODY_READ_TIMEOUT') {
+                return errorEnvelope(
+                    'HYDRADB_BODY_TIMEOUT',
+                    scrubPrivateNetworkStrings(bodyErr.message),
+                    {
+                        graphId: cleanGraphId,
+                        reasonCode: 'HYDRADB_BODY_TIMEOUT',
+                        status: res.data.status
+                    },
+                    'deadbolt.hydradb.query'
+                );
+            }
             rawJson = null;
         }
 

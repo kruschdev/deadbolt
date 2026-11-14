@@ -163,45 +163,54 @@ export function normalizeGitHubRepoInput(rawInput) {
 
   let candidateUrl = raw;
   let isRemoteCandidate = false;
+  const strippedRaw = raw.length > 1 ? raw.replace(/\/+$/, '') : raw;
+  const httpGitHubMatch = /^http:\/\/((?:www\.)?github\.com)(?=[/?#]|$)(.*)$/i.exec(strippedRaw);
 
   // 1. SCP-style SSH URL: git@host:owner/repo.git
-  const scpMatch = /^git@([A-Za-z0-9.-]+):(.+)$/i.exec(raw);
+  const scpMatch = /^git@([A-Za-z0-9.-]+):(.+)$/i.exec(strippedRaw);
   if (scpMatch) {
     isRemoteCandidate = true;
     const sshHost = scpMatch[1].toLowerCase();
-    const sshPath = scpMatch[2].replace(/^\/+/, '');
+    const sshPath = scpMatch[2].replace(/^\/+|\/+$/g, '');
     candidateUrl = `https://${sshHost}/${sshPath}`;
-  } else if (/^ssh:\/\/(?:[^@\/]+@)?([A-Za-z0-9.-]+)\/(.+)$/i.test(raw)) {
-    const sshUrlMatch = /^ssh:\/\/(?:[^@\/]+@)?([A-Za-z0-9.-]+)\/(.+)$/i.exec(raw);
+  } else if (/^ssh:\/\/(?:[^@\/]+@)?([A-Za-z0-9.-]+)\/(.+)$/i.test(strippedRaw)) {
+    const sshUrlMatch = /^ssh:\/\/(?:[^@\/]+@)?([A-Za-z0-9.-]+)\/(.+)$/i.exec(strippedRaw);
     isRemoteCandidate = true;
-    candidateUrl = `https://${sshUrlMatch[1].toLowerCase()}/${sshUrlMatch[2]}`;
+    candidateUrl = `https://${sshUrlMatch[1].toLowerCase()}/${sshUrlMatch[2].replace(/\/+$/g, '')}`;
+  } else if (httpGitHubMatch) {
+    isRemoteCandidate = true;
+    candidateUrl = `https://${httpGitHubMatch[1].toLowerCase()}${httpGitHubMatch[2]}`;
   } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) {
     isRemoteCandidate = true;
-    candidateUrl = raw;
+    candidateUrl = strippedRaw;
   } else if (
-    /^(?:www\.)?github\.com\/.+/i.test(raw) &&
-    !fs.existsSync(path.resolve(raw))
+    /^(?:www\.)?github\.com(?:\/.*)?$/i.test(strippedRaw) &&
+    !fs.existsSync(path.resolve(raw)) &&
+    !fs.existsSync(path.resolve(strippedRaw))
   ) {
     isRemoteCandidate = true;
-    candidateUrl = `https://${raw}`;
+    candidateUrl = `https://${strippedRaw}`;
   } else if (
-    !raw.startsWith('.') &&
-    !raw.startsWith('/') &&
-    !raw.includes('\\') &&
-    GITHUB_OWNER_REPO_RE.test(raw) &&
-    !fs.existsSync(path.resolve(raw))
+    !strippedRaw.startsWith('.') &&
+    !strippedRaw.startsWith('/') &&
+    !strippedRaw.includes('\\') &&
+    GITHUB_OWNER_REPO_RE.test(strippedRaw) &&
+    !fs.existsSync(path.resolve(raw)) &&
+    !fs.existsSync(path.resolve(strippedRaw))
   ) {
-    const [segA, segB] = raw.split('/');
+    const [segA, segB] = strippedRaw.split('/');
+    const cleanSegB = segB.replace(/\.git$/i, '');
     if (
       segA !== '.' &&
       segA !== '..' &&
       segA !== '.git' &&
-      segB !== '.' &&
-      segB !== '..' &&
+      cleanSegB !== '' &&
+      cleanSegB !== '.' &&
+      cleanSegB !== '..' &&
       segB !== '.git'
     ) {
       isRemoteCandidate = true;
-      candidateUrl = `https://github.com/${raw.replace(/\.git$/i, '')}`;
+      candidateUrl = `https://github.com/${segA}/${cleanSegB}`;
     }
   }
 
@@ -251,8 +260,9 @@ export function normalizeGitHubRepoInput(rawInput) {
   const rawPathPortion = raw.split(/[?#]/)[0];
   const hasDotTraversal = /(?:^|[/:\\])\.\.(?:[\/\\]|$)|%2e%2e/i.test(rawPathPortion);
 
-  const rawSegments = parsed.pathname
-    .replace(/^\/+|\/+$/g, '')
+  const cleanPathname = parsed.pathname.replace(/\/+$/, '');
+  const rawSegments = cleanPathname
+    .replace(/^\/+/, '')
     .split('/')
     .filter(Boolean)
     .map((seg) => {
@@ -272,7 +282,7 @@ export function normalizeGitHubRepoInput(rawInput) {
   ) {
     return {
       isRemoteCandidate: true,
-      candidateUrl: `https://${hostLower}${parsed.pathname}`,
+      candidateUrl: `https://${hostLower}${cleanPathname}`,
       repoSlug: null,
       cleanHttpsUrl: null,
       displayTarget: raw,
@@ -296,7 +306,7 @@ export function normalizeGitHubRepoInput(rawInput) {
   ) {
     return {
       isRemoteCandidate: true,
-      candidateUrl: `https://${hostLower}${parsed.pathname}`,
+      candidateUrl: `https://${hostLower}${cleanPathname}`,
       repoSlug: null,
       cleanHttpsUrl: null,
       displayTarget: raw,
@@ -307,7 +317,7 @@ export function normalizeGitHubRepoInput(rawInput) {
 
   let hintedFile = '';
   if (rawSegments[2] === 'blob' && rawSegments.length >= 5) {
-    hintedFile = rawSegments.slice(4).join('/').replace(/^\/+/, '');
+    hintedFile = rawSegments.slice(4).join('/').replace(/^\/+|\/+$/g, '');
   }
 
   const repoSlug = `${owner}/${repo}`;
@@ -452,28 +462,161 @@ function loadAllRepoSymbolsByFile(stack, repoName) {
   return byFile;
 }
 
+const MAX_REPO_WALK_CANDIDATES = 600;
+const MAX_SCANNABLE_FILE_BYTES = 256 * 1024;
+
+const LOW_PRIORITY_SCAN_PATH_RE =
+  /(?:^|\/)(?:test|tests|__tests__|spec|specs|example|examples|benchmark|benchmarks|fixtures|mocks|docs|vendor|third_party)(?:\/|$)/i;
+const LOW_PRIORITY_SCAN_FILE_RE = /(?:\.(?:test|spec)\.[^/]+|_test\.[^/]+)$/i;
+const CORE_PRIORITY_SCAN_DIR_RE =
+  /^(?:src|app|lib|pkg|cmd|internal|server|public|controllers|models|services|routes|api)\//i;
+const CORE_ROOT_ENTRYPOINT_RE = /^(?:index|main|app|server|config)\.[^/]+$/i;
+
 /**
- * Walk a repository directory and collect bounded code files sorted deterministically.
+ * Assign deterministic file scan priority (0 = hintedFile, 1 = core source, 2 = standard, 3 = test/docs/examples).
+ * @param {string} relPath
+ * @param {string} [normalizedHinted='']
+ * @returns {number}
+ */
+function classifyScanFilePriority(relPath, normalizedHinted = '') {
+  if (normalizedHinted && relPath === normalizedHinted) {
+    return 0;
+  }
+  if (LOW_PRIORITY_SCAN_PATH_RE.test(relPath) || LOW_PRIORITY_SCAN_FILE_RE.test(relPath)) {
+    return 3;
+  }
+  if (
+    CORE_PRIORITY_SCAN_DIR_RE.test(relPath) ||
+    (!relPath.includes('/') && CORE_ROOT_ENTRYPOINT_RE.test(relPath))
+  ) {
+    return 1;
+  }
+  return 2;
+}
+
+/**
+ * Deterministic alphabetical path comparator.
+ * @param {string} a
+ * @param {string} b
+ * @returns {number}
+ */
+function compareCodePathsAlpha(a, b) {
+  const cmp = a.localeCompare(b);
+  if (cmp !== 0) return cmp;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Verify that `relPath` resolves safely inside `resolvedRoot` without traversing any symlinks.
+ * @param {string} resolvedRoot
+ * @param {string} relPath
+ * @returns {string|null}
+ */
+function resolveSafeNonSymlinkFile(resolvedRoot, relPath) {
+  const cleanRel = normalizeRelPath(relPath);
+  if (!cleanRel || cleanRel.includes('\0')) return null;
+  const segments = cleanRel.split('/').filter(Boolean);
+  if (segments.length === 0 || segments.some((seg) => seg === '.' || seg === '..')) {
+    return null;
+  }
+  let cur = resolvedRoot;
+  for (let i = 0; i < segments.length; i += 1) {
+    cur = path.join(cur, segments[i]);
+    try {
+      const st = fs.lstatSync(cur);
+      if (st.isSymbolicLink()) return null;
+      if (i < segments.length - 1 && !st.isDirectory()) return null;
+      if (i === segments.length - 1 && !st.isFile()) return null;
+    } catch {
+      return null;
+    }
+  }
+  return cur;
+}
+
+/**
+ * Collect candidate non-binary files (`<= 256 KB`) up to `walkCap`, sort by priority tier
+ * (`0: hintedFile`, `1: core dirs/entrypoints`, `2: normal`, `3: tests/docs/examples/vendor`),
+ * and slice to `maxFiles`.
  * @param {string} rootDir
  * @param {number} maxFiles
- * @returns {string[]}
+ * @param {{ hintedFile?: string, walkCap?: number }} [options={}]
+ * @returns {{ files: string[], truncatedOrFiltered: boolean }}
  */
-function collectRepoCodeFiles(rootDir, maxFiles = 200) {
-  const collected = [];
+function collectPrioritizedRepoFiles(rootDir, maxFiles = 200, options = {}) {
+  const effectiveMaxFiles = Math.max(1, Math.trunc(Number(maxFiles) || 200));
+  const safeWalkCap = Math.max(
+    effectiveMaxFiles,
+    Math.trunc(Number(options?.walkCap) || MAX_REPO_WALK_CANDIDATES)
+  );
+  const normalizedHinted = normalizeRelPath(options?.hintedFile || '');
+  const candidates = [];
+  const candidateSet = new Set();
   const resolvedRoot = path.resolve(rootDir);
+  const probeBuf = Buffer.allocUnsafe(4096);
+  let truncatedOrFiltered = false;
+
+  const isEligibleCodeFile = (fullPath) => {
+    let st = null;
+    try {
+      st = fs.lstatSync(fullPath);
+    } catch {
+      truncatedOrFiltered = true;
+      return false;
+    }
+    if (st.isSymbolicLink() || !st.isFile()) {
+      truncatedOrFiltered = true;
+      return false;
+    }
+    if (st.size > MAX_SCANNABLE_FILE_BYTES) {
+      truncatedOrFiltered = true;
+      return false;
+    }
+    if (st.size === 0) {
+      return true;
+    }
+    let fd = null;
+    try {
+      fd = fs.openSync(fullPath, 'r');
+      const toRead = Math.min(4096, st.size);
+      const bytesRead = fs.readSync(fd, probeBuf, 0, toRead, 0);
+      if (probeBuf.subarray(0, bytesRead).includes(0)) {
+        truncatedOrFiltered = true;
+        return false;
+      }
+      return true;
+    } catch {
+      truncatedOrFiltered = true;
+      return false;
+    } finally {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Ignore close error on probe descriptor
+        }
+      }
+    }
+  };
 
   function walk(currentDir) {
-    if (collected.length >= maxFiles) return;
+    if (candidates.length >= safeWalkCap) {
+      truncatedOrFiltered = true;
+      return;
+    }
     let entries = [];
     try {
       entries = fs.readdirSync(currentDir, { withFileTypes: true });
     } catch {
       return;
     }
-    entries.sort((a, b) => a.name.localeCompare(b.name));
+    entries.sort((a, b) => compareCodePathsAlpha(a.name, b.name));
 
     for (const entry of entries) {
-      if (collected.length >= maxFiles) break;
+      if (candidates.length >= safeWalkCap) {
+        truncatedOrFiltered = true;
+        break;
+      }
       if (entry.name.startsWith('.') || SKIPPED_SCAN_DIRS.has(entry.name)) continue;
       if (entry.isSymbolicLink()) continue;
 
@@ -482,16 +625,60 @@ function collectRepoCodeFiles(rootDir, maxFiles = 200) {
         walk(fullPath);
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
-        if (SCANNABLE_EXTENSIONS.has(ext)) {
+        if (SCANNABLE_EXTENSIONS.has(ext) && isEligibleCodeFile(fullPath)) {
           const rel = path.relative(resolvedRoot, fullPath).replace(/\\/g, '/');
-          collected.push(rel);
+          if (!candidateSet.has(rel)) {
+            candidateSet.add(rel);
+            candidates.push(rel);
+          }
         }
       }
     }
   }
 
   walk(resolvedRoot);
-  return collected;
+
+  if (normalizedHinted && !candidateSet.has(normalizedHinted)) {
+    const hintedExt = path.extname(normalizedHinted).toLowerCase();
+    if (SCANNABLE_EXTENSIONS.has(hintedExt)) {
+      const safeHintedAbs = resolveSafeNonSymlinkFile(resolvedRoot, normalizedHinted);
+      if (safeHintedAbs && isEligibleCodeFile(safeHintedAbs)) {
+        candidateSet.add(normalizedHinted);
+        candidates.push(normalizedHinted);
+      }
+    }
+  }
+
+  candidates.sort((a, b) => {
+    const pa = classifyScanFilePriority(a, normalizedHinted);
+    const pb = classifyScanFilePriority(b, normalizedHinted);
+    if (pa !== pb) return pa - pb;
+    return compareCodePathsAlpha(a, b);
+  });
+
+  if (candidates.length > effectiveMaxFiles) {
+    truncatedOrFiltered = true;
+    return {
+      files: candidates.slice(0, effectiveMaxFiles),
+      truncatedOrFiltered
+    };
+  }
+
+  return {
+    files: candidates,
+    truncatedOrFiltered
+  };
+}
+
+/**
+ * Walk a repository directory and collect bounded code files sorted by scan priority and name.
+ * @param {string} rootDir
+ * @param {number} maxFiles
+ * @param {{ hintedFile?: string, walkCap?: number }} [options={}]
+ * @returns {string[]}
+ */
+function collectRepoCodeFiles(rootDir, maxFiles = 200, options = {}) {
+  return collectPrioritizedRepoFiles(rootDir, maxFiles, options).files;
 }
 
 /**
@@ -551,6 +738,1014 @@ function resolveRelativeImportTarget(importerRelFile, specifier, repoFileSet) {
     }
   }
   return null;
+}
+
+const JS_TS_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx']);
+
+const GO_STDLIB_PACKAGES = new Set([
+  'archive/tar',
+  'archive/zip',
+  'bufio',
+  'bytes',
+  'cmp',
+  'compress/gzip',
+  'container/heap',
+  'container/list',
+  'context',
+  'crypto',
+  'crypto/aes',
+  'crypto/cipher',
+  'crypto/ecdsa',
+  'crypto/ed25519',
+  'crypto/hmac',
+  'crypto/md5',
+  'crypto/rand',
+  'crypto/rsa',
+  'crypto/sha1',
+  'crypto/sha256',
+  'crypto/sha512',
+  'crypto/subtle',
+  'crypto/tls',
+  'crypto/x509',
+  'database/sql',
+  'embed',
+  'encoding/base64',
+  'encoding/binary',
+  'encoding/csv',
+  'encoding/hex',
+  'encoding/json',
+  'encoding/pem',
+  'encoding/xml',
+  'errors',
+  'expvar',
+  'flag',
+  'fmt',
+  'html',
+  'html/template',
+  'io',
+  'io/fs',
+  'io/ioutil',
+  'log',
+  'log/slog',
+  'maps',
+  'math',
+  'math/big',
+  'math/rand',
+  'mime',
+  'mime/multipart',
+  'net',
+  'net/http',
+  'net/http/httptest',
+  'net/mail',
+  'net/netip',
+  'net/smtp',
+  'net/url',
+  'os',
+  'os/exec',
+  'os/signal',
+  'os/user',
+  'path',
+  'path/filepath',
+  'reflect',
+  'regexp',
+  'runtime',
+  'runtime/debug',
+  'slices',
+  'sort',
+  'strconv',
+  'strings',
+  'sync',
+  'sync/atomic',
+  'syscall',
+  'testing',
+  'text/scanner',
+  'text/tabwriter',
+  'text/template',
+  'time',
+  'unicode',
+  'unicode/utf8',
+  'unsafe'
+]);
+
+/**
+ * Strip `//` and `/* ... *\/` comments outside strings in linear time while preserving newlines.
+ * @param {string} source
+ * @param {boolean} [allowBacktickRawStrings=false]
+ * @returns {string}
+ */
+function stripCStyleComments(source, allowBacktickRawStrings = false) {
+  const raw = String(source || '');
+  let out = '';
+  let i = 0;
+  const len = raw.length;
+
+  while (i < len) {
+    const ch = raw[i];
+    const next = raw[i + 1];
+
+    if (allowBacktickRawStrings && ch === '`') {
+      out += ch;
+      i += 1;
+      while (i < len) {
+        out += raw[i];
+        if (raw[i] === '`') {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      out += ch;
+      i += 1;
+      while (i < len) {
+        if (raw[i] === '\\' && i + 1 < len) {
+          out += raw[i] + raw[i + 1];
+          i += 2;
+          continue;
+        }
+        out += raw[i];
+        if (raw[i] === quote || raw[i] === '\n') {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === '/' && next === '*') {
+      out += '  ';
+      i += 2;
+      while (i < len && !(raw[i] === '*' && raw[i + 1] === '/')) {
+        out += raw[i] === '\n' ? '\n' : ' ';
+        i += 1;
+      }
+      if (i < len) {
+        out += '  ';
+        i += 2;
+      }
+      continue;
+    }
+
+    if (ch === '/' && next === '/') {
+      while (i < len && raw[i] !== '\n') {
+        out += ' ';
+        i += 1;
+      }
+      continue;
+    }
+
+    out += ch;
+    i += 1;
+  }
+
+  return out;
+}
+
+/**
+ * Strip `#` line comments outside single, double, or triple-quoted strings while preserving newlines.
+ * @param {string} source
+ * @returns {string}
+ */
+function stripHashComments(source) {
+  const raw = String(source || '');
+  let out = '';
+  let i = 0;
+  const len = raw.length;
+
+  while (i < len) {
+    const ch = raw[i];
+    if (
+      (ch === '"' || ch === "'") &&
+      raw[i + 1] === ch &&
+      raw[i + 2] === ch
+    ) {
+      const triple = ch + ch + ch;
+      out += triple;
+      i += 3;
+      while (i < len) {
+        if (raw[i] === '\\' && i + 1 < len) {
+          out += raw[i] + raw[i + 1];
+          i += 2;
+          continue;
+        }
+        if (raw[i] === ch && raw[i + 1] === ch && raw[i + 2] === ch) {
+          out += triple;
+          i += 3;
+          break;
+        }
+        out += raw[i];
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      out += ch;
+      i += 1;
+      while (i < len) {
+        if (raw[i] === '\\' && i + 1 < len) {
+          out += raw[i] + raw[i + 1];
+          i += 2;
+          continue;
+        }
+        out += raw[i];
+        if (raw[i] === quote || raw[i] === '\n') {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === '#') {
+      while (i < len && raw[i] !== '\n') {
+        out += ' ';
+        i += 1;
+      }
+      continue;
+    }
+
+    out += ch;
+    i += 1;
+  }
+
+  return out;
+}
+
+/**
+ * Resolve a normalized JS/TS module stem (without leading `/` or `..`) against `repoFileSet`.
+ * @param {string} importerRelFile
+ * @param {string} normalizedBase
+ * @param {Set<string>} repoFileSet
+ * @returns {string|null}
+ */
+function resolveJsTsCandidateBase(importerRelFile, normalizedBase, repoFileSet) {
+  const clean = normalizeRelPath(normalizedBase);
+  if (!clean || clean.startsWith('..')) return null;
+
+  const candidates = [
+    clean,
+    `${clean}.ts`,
+    `${clean}.tsx`,
+    `${clean}.js`,
+    `${clean}.jsx`,
+    `${clean}.mjs`,
+    `${clean}.cjs`,
+    `${clean}/index.ts`,
+    `${clean}/index.tsx`,
+    `${clean}/index.js`,
+    `${clean}/index.jsx`,
+    `${clean}/index.mjs`,
+    `${clean}/index.cjs`
+  ];
+
+  const jsExtMatch = /\.(?:js|mjs|cjs|jsx)$/i.exec(clean);
+  if (jsExtMatch) {
+    const stem = clean.slice(0, -jsExtMatch[0].length);
+    candidates.push(`${stem}.ts`, `${stem}.tsx`);
+  }
+
+  for (const cand of candidates) {
+    if (cand !== importerRelFile && repoFileSet.has(cand)) {
+      return cand;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve JS/TS relative (`./`, `../`) and path-alias (`@/`, `~/`) specifiers against `repoFileSet`.
+ * @param {string} importerRelFile
+ * @param {string} rawSpec
+ * @param {Set<string>} repoFileSet
+ * @returns {string|null}
+ */
+function resolveJsTsSpecifier(importerRelFile, rawSpec, repoFileSet) {
+  const spec = String(rawSpec || '').trim().split(/[?#]/)[0].trim();
+  if (!spec) return null;
+
+  if (spec.startsWith('./') || spec.startsWith('../')) {
+    const baseDir = path.posix.dirname(importerRelFile);
+    const joined = path.posix.normalize(path.posix.join(baseDir, spec));
+    if (joined.startsWith('..')) return null;
+    return resolveJsTsCandidateBase(importerRelFile, joined, repoFileSet);
+  }
+
+  if (spec.startsWith('@/') || spec.startsWith('~/')) {
+    const subPath = path.posix.normalize(spec.slice(2).replace(/^\/+/, ''));
+    if (!subPath || subPath === '.' || subPath.startsWith('..')) return null;
+
+    const roots = [];
+    const srcIdx = importerRelFile.indexOf('/src/');
+    if (srcIdx !== -1) {
+      roots.push(`${importerRelFile.slice(0, srcIdx + 4)}/${subPath}`);
+      roots.push(`${importerRelFile.slice(0, srcIdx)}/${subPath}`);
+    }
+    roots.push(`src/${subPath}`, subPath, `app/${subPath}`);
+
+    for (const candidateBase of roots) {
+      const resolved = resolveJsTsCandidateBase(importerRelFile, candidateBase, repoFileSet);
+      if (resolved) return resolved;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Expand Rust `use` trees (including nested `{a, b::c}` brace groups) into flat `::`-delimited paths.
+ * @param {string} rawExpr
+ * @param {number} [depth=0]
+ * @returns {string[]}
+ */
+function expandRustUseTree(rawExpr, depth = 0) {
+  if (depth > 4) return [];
+  const expr = String(rawExpr || '')
+    .trim()
+    .replace(/\s+as\s+[A-Za-z_][A-Za-z0-9_]*$/g, '')
+    .trim();
+  if (!expr) return [];
+
+  const openIdx = expr.indexOf('{');
+  if (openIdx === -1) {
+    return [expr];
+  }
+
+  let braceDepth = 0;
+  let closeIdx = -1;
+  for (let i = openIdx; i < expr.length; i += 1) {
+    if (expr[i] === '{') braceDepth += 1;
+    else if (expr[i] === '}') {
+      braceDepth -= 1;
+      if (braceDepth === 0) {
+        closeIdx = i;
+        break;
+      }
+    }
+  }
+  if (closeIdx === -1) return [];
+
+  const head = expr.slice(0, openIdx).trim().replace(/::$/, '');
+  const inner = expr.slice(openIdx + 1, closeIdx);
+  const parts = [];
+  let cur = '';
+  let innerDepth = 0;
+  for (let i = 0; i < inner.length; i += 1) {
+    const ch = inner[i];
+    if (ch === '{') innerDepth += 1;
+    else if (ch === '}') innerDepth -= 1;
+    if (ch === ',' && innerDepth === 0) {
+      if (cur.trim()) parts.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur.trim()) parts.push(cur.trim());
+
+  const expanded = [];
+  for (const part of parts) {
+    if (expanded.length >= 24) break;
+    if (part === 'self') {
+      if (head) expanded.push(head);
+      continue;
+    }
+    const subPaths = expandRustUseTree(part, depth + 1);
+    for (const sub of subPaths) {
+      if (expanded.length >= 24) break;
+      expanded.push(head ? `${head}::${sub}` : sub);
+    }
+  }
+  return expanded;
+}
+
+/**
+ * Extract deterministic static import/dependency edges across polyglot source files
+ * (TS/JS path aliases & relative imports, Python, Go, Rust, Java, Kotlin, C#, Ruby, and PHP).
+ * Emits `{ from, to, type: 'IMPORTS' }` where `from !== to` and `to` exists in `scannedFiles`,
+ * deduplicated by `${from}->${to}`.
+ *
+ * @param {Array<{ filePath?: string, file_path?: string, path?: string, content?: string, code?: string }>|Record<string, string>} scannedFiles
+ * @returns {Array<{ from: string, to: string, type: 'IMPORTS' }>}
+ */
+export function extractPolyglotDependencyEdges(scannedFiles = []) {
+  const entries = [];
+  if (Array.isArray(scannedFiles)) {
+    for (const item of scannedFiles) {
+      if (!item || typeof item !== 'object') continue;
+      const fp = normalizeRelPath(item.filePath ?? item.file_path ?? item.path ?? '');
+      if (!fp) continue;
+      entries.push({
+        filePath: fp,
+        content: String(item.content ?? item.code ?? '')
+      });
+    }
+  } else if (scannedFiles && typeof scannedFiles === 'object') {
+    for (const [rawPath, rawContent] of Object.entries(scannedFiles)) {
+      const fp = normalizeRelPath(rawPath);
+      if (!fp) continue;
+      entries.push({
+        filePath: fp,
+        content: String(rawContent ?? '')
+      });
+    }
+  }
+
+  if (entries.length < 2) return [];
+
+  const repoFileSet = new Set(entries.map((e) => e.filePath));
+  const sortedPaths = [...repoFileSet].sort(compareCodePathsAlpha);
+  const goFiles = sortedPaths.filter((p) => p.endsWith('.go'));
+  const jvmFiles = sortedPaths.filter((p) => p.endsWith('.java') || p.endsWith('.kt'));
+  const csFiles = sortedPaths.filter((p) => p.endsWith('.cs'));
+
+  const edges = [];
+  const seenEdge = new Set();
+  const addEdge = (from, to) => {
+    if (!from || !to || from === to) return false;
+    if (!repoFileSet.has(from) || !repoFileSet.has(to)) return false;
+    const key = `${from}->${to}`;
+    if (seenEdge.has(key)) return false;
+    seenEdge.add(key);
+    edges.push({ from, to, type: 'IMPORTS' });
+    return true;
+  };
+
+  // Pre-index JVM (.java, .kt) packages & declared class/object/interface names
+  const jvmMetaByFile = new Map();
+  const jvmFqcnToFiles = new Map();
+  const jvmPkgToMeta = new Map();
+
+  for (const entry of entries) {
+    const ext = path.extname(entry.filePath).toLowerCase();
+    if (ext !== '.java' && ext !== '.kt') continue;
+    const cleaned = stripCStyleComments(entry.content, false);
+    const pkgMatch = /^\s*package\s+([A-Za-z_][A-Za-z0-9_.]*)/m.exec(cleaned);
+    const pkg = pkgMatch ? pkgMatch[1] : '';
+    const classSet = new Set();
+    const stem = path.posix.basename(entry.filePath, ext);
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(stem)) {
+      classSet.add(stem);
+    }
+    for (const m of cleaned.matchAll(/\b(?:class|interface|enum|record|object)\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+      if (m[1]) classSet.add(m[1]);
+    }
+    const meta = {
+      filePath: entry.filePath,
+      ext,
+      cleaned,
+      pkg,
+      classNames: [...classSet]
+    };
+    jvmMetaByFile.set(entry.filePath, meta);
+    if (pkg) {
+      if (!jvmPkgToMeta.has(pkg)) jvmPkgToMeta.set(pkg, []);
+      jvmPkgToMeta.get(pkg).push(meta);
+      for (const cn of meta.classNames) {
+        const fqcn = `${pkg}.${cn}`;
+        if (!jvmFqcnToFiles.has(fqcn)) jvmFqcnToFiles.set(fqcn, []);
+        jvmFqcnToFiles.get(fqcn).push(entry.filePath);
+      }
+    }
+  }
+
+  // Pre-index C# (.cs) namespaces & declared type names
+  const csMetaByFile = new Map();
+  const csNamespaceToFiles = new Map();
+  const csNamespaceToMeta = new Map();
+
+  for (const entry of entries) {
+    if (!entry.filePath.toLowerCase().endsWith('.cs')) continue;
+    const cleaned = stripCStyleComments(entry.content, false);
+    const namespaces = [];
+    for (const m of cleaned.matchAll(/\bnamespace\s+([A-Za-z_][A-Za-z0-9_.]*)\s*[;{]/g)) {
+      if (m[1] && !namespaces.includes(m[1])) {
+        namespaces.push(m[1]);
+      }
+    }
+    const typeSet = new Set();
+    const stem = path.posix.basename(entry.filePath, path.extname(entry.filePath));
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(stem)) {
+      typeSet.add(stem);
+    }
+    for (const m of cleaned.matchAll(/\b(?:class|interface|struct|record|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+      if (m[1]) typeSet.add(m[1]);
+    }
+    const meta = {
+      filePath: entry.filePath,
+      cleaned,
+      namespaces,
+      typeNames: [...typeSet]
+    };
+    csMetaByFile.set(entry.filePath, meta);
+    for (const ns of namespaces) {
+      if (!csNamespaceToFiles.has(ns)) csNamespaceToFiles.set(ns, []);
+      csNamespaceToFiles.get(ns).push(entry.filePath);
+      if (!csNamespaceToMeta.has(ns)) csNamespaceToMeta.set(ns, []);
+      csNamespaceToMeta.get(ns).push(meta);
+    }
+  }
+  for (const fileList of csNamespaceToFiles.values()) {
+    fileList.sort(compareCodePathsAlpha);
+  }
+
+  for (const entry of entries) {
+    const from = entry.filePath;
+    const ext = path.extname(from).toLowerCase();
+
+    // 1. JS / TS relative + `@/` and `~/` path aliases
+    if (JS_TS_EXTENSIONS.has(ext)) {
+      const masked = maskCodePreservingNewlines(entry.content, { maskStrings: false });
+      const specs = new Set();
+      const jsPatterns = [
+        /\b(?:import|export)\s+(?:[^'";]*?\s+from\s+)?['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]/g,
+        /\b(?:import|require)\s*\(\s*['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]\s*\)/g
+      ];
+      for (const regex of jsPatterns) {
+        for (const m of masked.matchAll(regex)) {
+          if (m[1]) specs.add(m[1].trim());
+        }
+      }
+      for (const spec of specs) {
+        const resolved = resolveJsTsSpecifier(from, spec, repoFileSet);
+        if (resolved) addEdge(from, resolved);
+      }
+      continue;
+    }
+
+    // 2. Python (.py) absolute dotted & relative `.` / `..` imports
+    if (ext === '.py') {
+      const cleanedPy = stripHashComments(entry.content).replace(/\\\r?\n/g, ' ');
+      const fromDir = path.posix.dirname(from) === '.' ? '' : path.posix.dirname(from);
+      const ancestorRoots = ['', 'src/'];
+      let walkDir = fromDir;
+      while (walkDir && walkDir !== '.') {
+        const prefix = `${walkDir}/`;
+        if (!ancestorRoots.includes(prefix)) ancestorRoots.push(prefix);
+        const parent = path.posix.dirname(walkDir);
+        if (parent === walkDir) break;
+        walkDir = parent === '.' ? '' : parent;
+      }
+
+      const tryPyModuleCandidates = (relModulePath) => {
+        const cleanMod = normalizeRelPath(relModulePath);
+        if (!cleanMod || cleanMod.startsWith('..')) return false;
+        const pyFile = `${cleanMod}.py`;
+        const initFile = `${cleanMod}/__init__.py`;
+        let matched = false;
+        if (pyFile !== from && repoFileSet.has(pyFile)) {
+          addEdge(from, pyFile);
+          matched = true;
+        } else if (initFile !== from && repoFileSet.has(initFile)) {
+          addEdge(from, initFile);
+          matched = true;
+        }
+        return matched;
+      };
+
+      const handlePyFromImport = (rawModSpec, rawNames) => {
+        const specTrim = String(rawModSpec || '').trim();
+        if (!specTrim) return;
+        const dotMatch = /^(\.*)(.*)$/.exec(specTrim);
+        if (!dotMatch) return;
+        const dots = dotMatch[1] || '';
+        const modRest = (dotMatch[2] || '').trim();
+        const names = String(rawNames || '')
+          .split(',')
+          .map((n) => n.trim().split(/\s+as\s+/)[0].trim())
+          .filter((n) => n && n !== '*' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(n));
+
+        if (dots.length > 0) {
+          let baseDir = fromDir;
+          let validUp = true;
+          for (let up = 1; up < dots.length; up += 1) {
+            if (!baseDir) {
+              validUp = false;
+              break;
+            }
+            const nextParent = path.posix.dirname(baseDir);
+            baseDir = nextParent === '.' ? '' : nextParent;
+          }
+          if (!validUp) return;
+
+          const modRel = modRest ? modRest.replace(/\./g, '/') : '';
+          const baseRel = [baseDir, modRel].filter(Boolean).join('/');
+          let anyNameResolvedAsModule = false;
+          for (const name of names) {
+            const subCandidate = [baseRel, name].filter(Boolean).join('/');
+            if (tryPyModuleCandidates(subCandidate)) {
+              anyNameResolvedAsModule = true;
+            }
+          }
+          if (!anyNameResolvedAsModule && baseRel) {
+            tryPyModuleCandidates(baseRel);
+          }
+          return;
+        }
+
+        if (!modRest || !/^[A-Za-z_][A-Za-z0-9_.]*$/.test(modRest)) return;
+        const modPath = modRest.replace(/\./g, '/');
+        for (const rootPrefix of ancestorRoots) {
+          let matchedAtRoot = false;
+          for (const name of names) {
+            if (tryPyModuleCandidates(`${rootPrefix}${modPath}/${name}`)) {
+              matchedAtRoot = true;
+            }
+          }
+          if (tryPyModuleCandidates(`${rootPrefix}${modPath}`)) {
+            matchedAtRoot = true;
+          }
+          if (matchedAtRoot) break;
+        }
+      };
+
+      for (const m of cleanedPy.matchAll(/^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+\(([^)]*)\)/gm)) {
+        handlePyFromImport(m[1], m[2]);
+      }
+      for (const m of cleanedPy.matchAll(/^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+([^\n(]+)/gm)) {
+        handlePyFromImport(m[1], m[2]);
+      }
+      for (const m of cleanedPy.matchAll(/^[ \t]*import[ \t]+([^\n]+)/gm)) {
+        const items = String(m[1] || '').split(',');
+        for (const rawItem of items) {
+          const modName = rawItem.trim().split(/\s+as\s+/)[0].trim();
+          if (!modName || !/^[A-Za-z_][A-Za-z0-9_.]*$/.test(modName)) continue;
+          const modPath = modName.replace(/\./g, '/');
+          for (const rootPrefix of ancestorRoots) {
+            if (tryPyModuleCandidates(`${rootPrefix}${modPath}`)) {
+              break;
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    // 3. Go (.go) single and grouped `import ( ... )` blocks
+    if (ext === '.go') {
+      const cleanedGo = stripCStyleComments(entry.content, true);
+      const goImports = new Set();
+      for (const blockMatch of cleanedGo.matchAll(/\bimport\s*\(([\s\S]*?)\)/g)) {
+        const body = blockMatch[1] || '';
+        for (const lineMatch of body.matchAll(/(?:[A-Za-z0-9_.]+\s+)?["`]([^"`\s]+)["`]/g)) {
+          if (lineMatch[1]) goImports.add(lineMatch[1].trim());
+        }
+      }
+      for (const singleMatch of cleanedGo.matchAll(/\bimport\s+(?:[A-Za-z0-9_.]+\s+)?["`]([^"`\s]+)["`]/g)) {
+        if (singleMatch[1]) goImports.add(singleMatch[1].trim());
+      }
+
+      const fromIsTest = from.endsWith('_test.go');
+      for (const imp of goImports) {
+        if (GO_STDLIB_PACKAGES.has(imp)) continue;
+        const segs = imp.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+        if (segs.length === 0) continue;
+
+        const pkgName = segs[segs.length - 1];
+        const tailTwo = segs.length >= 2 ? `${segs[segs.length - 2]}/${pkgName}` : pkgName;
+        const afterRepo = segs.length > 3 ? segs.slice(3).join('/') : '';
+        const afterMod = segs.length > 1 ? segs.slice(1).join('/') : '';
+
+        const tierA = [];
+        const tierB = [];
+        const tierC = [];
+
+        for (const cand of goFiles) {
+          if (cand === from) continue;
+          if (!fromIsTest && cand.endsWith('_test.go')) continue;
+          const candDir = path.posix.dirname(cand) === '.' ? '' : path.posix.dirname(cand);
+          if (
+            (afterRepo && (candDir === afterRepo || candDir.endsWith(`/${afterRepo}`))) ||
+            (afterMod && candDir === afterMod)
+          ) {
+            tierA.push(cand);
+          } else if (candDir === tailTwo || candDir.endsWith(`/${tailTwo}`)) {
+            tierB.push(cand);
+          } else if (
+            candDir === pkgName ||
+            (segs.length === 1 && candDir.endsWith(`/${pkgName}`))
+          ) {
+            tierC.push(cand);
+          }
+        }
+
+        const chosen = tierA.length > 0 ? tierA : tierB.length > 0 ? tierB : tierC;
+        let emittedForImport = 0;
+        for (const target of chosen) {
+          if (emittedForImport >= 6) break;
+          addEdge(from, target);
+          emittedForImport += 1;
+        }
+      }
+      continue;
+    }
+
+    // 4. Rust (.rs) `mod foo;`, `use crate::...`, `use super::...`, `use self::...`
+    if (ext === '.rs') {
+      const cleanedRs = stripCStyleComments(entry.content, false);
+      const fromBase = path.posix.basename(from);
+      const fromDir = path.posix.dirname(from) === '.' ? '' : path.posix.dirname(from);
+      const srcMarkerIdx = from.indexOf('/src/');
+      const crateRoots =
+        srcMarkerIdx !== -1
+          ? [from.slice(0, srcMarkerIdx + 4)]
+          : from.startsWith('src/')
+            ? ['src']
+            : ['src', ''];
+
+      const isRootOrModFile =
+        fromBase === 'lib.rs' || fromBase === 'main.rs' || fromBase === 'mod.rs';
+      const selfModuleDir = isRootOrModFile
+        ? fromDir
+        : [fromDir, path.posix.basename(from, '.rs')].filter(Boolean).join('/');
+
+      const tryRustModPath = (modRelPath) => {
+        const cleanRel = normalizeRelPath(modRelPath);
+        if (!cleanRel || cleanRel.startsWith('..')) return false;
+        const directRs = `${cleanRel}.rs`;
+        const folderModRs = `${cleanRel}/mod.rs`;
+        if (directRs !== from && repoFileSet.has(directRs)) {
+          addEdge(from, directRs);
+          return true;
+        }
+        if (folderModRs !== from && repoFileSet.has(folderModRs)) {
+          addEdge(from, folderModRs);
+          return true;
+        }
+        return false;
+      };
+
+      const resolveRustPrefixSegments = (baseDir, segs) => {
+        const cleanSegs = segs.filter((s) => s && s !== '*' && s !== 'self');
+        for (let len = cleanSegs.length; len >= 1; len -= 1) {
+          const prefixRel = [baseDir, ...cleanSegs.slice(0, len)].filter(Boolean).join('/');
+          if (tryRustModPath(prefixRel)) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      for (const modMatch of cleanedRs.matchAll(/\b(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/g)) {
+        const modName = modMatch[1];
+        if (!modName) continue;
+        const modSearchDirs = isRootOrModFile ? [fromDir] : [selfModuleDir, fromDir];
+        for (const base of modSearchDirs) {
+          if (tryRustModPath([base, modName].filter(Boolean).join('/'))) {
+            break;
+          }
+        }
+      }
+
+      for (const useMatch of cleanedRs.matchAll(/\b(?:pub(?:\s*\([^)]*\))?\s+)?use\s+([^;]+);/g)) {
+        const expanded = expandRustUseTree(useMatch[1]);
+        for (const usePath of expanded) {
+          const rawSegs = usePath.split('::').map((s) => s.trim()).filter(Boolean);
+          if (rawSegs.length === 0) continue;
+
+          if (rawSegs[0] === 'crate') {
+            const rest = rawSegs.slice(1);
+            for (const cRoot of crateRoots) {
+              if (resolveRustPrefixSegments(cRoot, rest)) break;
+            }
+          } else if (rawSegs[0] === 'self') {
+            const rest = rawSegs.slice(1);
+            if (!resolveRustPrefixSegments(selfModuleDir, rest) && selfModuleDir !== fromDir) {
+              resolveRustPrefixSegments(fromDir, rest);
+            }
+          } else if (rawSegs[0] === 'super') {
+            let superCount = 0;
+            while (superCount < rawSegs.length && rawSegs[superCount] === 'super') {
+              superCount += 1;
+            }
+            const rest = rawSegs.slice(superCount);
+            let curModDir = fromBase === 'mod.rs' ? fromDir : selfModuleDir;
+            let validSuper = true;
+            for (let s = 0; s < superCount; s += 1) {
+              if (!curModDir) {
+                validSuper = false;
+                break;
+              }
+              const nextDir = path.posix.dirname(curModDir);
+              curModDir = nextDir === '.' ? '' : nextDir;
+            }
+            if (validSuper) {
+              const matchedChild = resolveRustPrefixSegments(curModDir, rest);
+              if (!matchedChild && curModDir) {
+                tryRustModPath(curModDir);
+              }
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    // 5. Java & Kotlin (.java, .kt) explicit imports + same-package class references
+    if (ext === '.java' || ext === '.kt') {
+      const meta = jvmMetaByFile.get(from);
+      if (!meta) continue;
+      const bodyWithoutHeaders = meta.cleaned
+        .replace(/^\s*package\s+[^\n]+/gm, ' ')
+        .replace(/^\s*import\s+[^\n]+/gm, ' ');
+      const bodyIdents = new Set(bodyWithoutHeaders.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || []);
+
+      const matchJvmFqcnOrSuffix = (fqcn) => {
+        const indexed = jvmFqcnToFiles.get(fqcn) || [];
+        let matched = false;
+        for (const target of indexed) {
+          if (target !== from) {
+            addEdge(from, target);
+            matched = true;
+          }
+        }
+        const slashPath = fqcn.replace(/\./g, '/');
+        const suffixes = [`${slashPath}.java`, `${slashPath}.kt`];
+        for (const cand of jvmFiles) {
+          if (cand === from) continue;
+          if (suffixes.some((suf) => cand === suf || cand.endsWith(`/${suf}`))) {
+            addEdge(from, cand);
+            matched = true;
+          }
+        }
+        return matched;
+      };
+
+      for (const impMatch of meta.cleaned.matchAll(/^\s*import\s+(?:static\s+)?([A-Za-z_][A-Za-z0-9_.*]*)(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?\s*;?/gm)) {
+        const rawImp = (impMatch[1] || '').trim();
+        if (!rawImp) continue;
+        if (rawImp.endsWith('.*')) {
+          const wildcardPkg = rawImp.slice(0, -2);
+          const peers = jvmPkgToMeta.get(wildcardPkg) || [];
+          let wildcardAdded = 0;
+          for (const peer of peers) {
+            if (wildcardAdded >= 6) break;
+            if (peer.filePath === from) continue;
+            if (peer.classNames.some((cn) => bodyIdents.has(cn))) {
+              addEdge(from, peer.filePath);
+              wildcardAdded += 1;
+            }
+          }
+          continue;
+        }
+
+        if (!matchJvmFqcnOrSuffix(rawImp)) {
+          const lastDot = rawImp.lastIndexOf('.');
+          if (lastDot > 0) {
+            matchJvmFqcnOrSuffix(rawImp.slice(0, lastDot));
+          }
+        }
+      }
+
+      if (meta.pkg) {
+        const samePkgPeers = jvmPkgToMeta.get(meta.pkg) || [];
+        for (const peer of samePkgPeers) {
+          if (peer.filePath === from) continue;
+          if (peer.classNames.some((cn) => bodyIdents.has(cn))) {
+            addEdge(from, peer.filePath);
+          }
+        }
+      }
+      continue;
+    }
+
+    // 6. C# (.cs) `using Foo.Bar;` + same-namespace peer type references
+    if (ext === '.cs') {
+      const meta = csMetaByFile.get(from);
+      if (!meta) continue;
+
+      for (const usingMatch of meta.cleaned.matchAll(/^\s*(?:global\s+)?using\s+(?:static\s+)?(?!var\b)(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?([A-Za-z_][A-Za-z0-9_.]*)\s*;/gm)) {
+        const ns = (usingMatch[1] || '').trim();
+        if (!ns) continue;
+
+        const matchedTargets = [];
+        const byNs = csNamespaceToFiles.get(ns) || [];
+        for (const target of byNs) {
+          if (target !== from && !matchedTargets.includes(target)) {
+            matchedTargets.push(target);
+          }
+        }
+
+        if (matchedTargets.length === 0) {
+          const lastDot = ns.lastIndexOf('.');
+          if (lastDot > 0) {
+            const parentNs = ns.slice(0, lastDot);
+            const typeName = ns.slice(lastDot + 1);
+            const parentPeers = csNamespaceToMeta.get(parentNs) || [];
+            for (const peer of parentPeers) {
+              if (
+                peer.filePath !== from &&
+                peer.typeNames.includes(typeName) &&
+                !matchedTargets.includes(peer.filePath)
+              ) {
+                matchedTargets.push(peer.filePath);
+              }
+            }
+          }
+        }
+
+        if (matchedTargets.length === 0) {
+          const nsSlashLower = ns.replace(/\./g, '/').toLowerCase();
+          for (const cand of csFiles) {
+            if (cand === from) continue;
+            const candDirLower = (
+              path.posix.dirname(cand) === '.' ? '' : path.posix.dirname(cand)
+            ).toLowerCase();
+            if (candDirLower === nsSlashLower || candDirLower.endsWith(`/${nsSlashLower}`)) {
+              matchedTargets.push(cand);
+            }
+          }
+        }
+
+        for (const target of matchedTargets.slice(0, 6)) {
+          addEdge(from, target);
+        }
+      }
+
+      if (meta.namespaces.length > 0) {
+        const bodyNoUsing = meta.cleaned.replace(/^\s*(?:global\s+)?using\s+[^\n]+/gm, ' ');
+        const bodyIdents = new Set(bodyNoUsing.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || []);
+        for (const ns of meta.namespaces) {
+          let sameNsAdded = 0;
+          for (const peer of csNamespaceToMeta.get(ns) || []) {
+            if (sameNsAdded >= 6) break;
+            if (peer.filePath === from) continue;
+            if (peer.typeNames.some((tn) => bodyIdents.has(tn))) {
+              addEdge(from, peer.filePath);
+              sameNsAdded += 1;
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    // 7. Ruby (.rb) `require_relative` and `require`
+    if (ext === '.rb') {
+      const cleanedRb = stripHashComments(entry.content);
+      const fromDir = path.posix.dirname(from) === '.' ? '' : path.posix.dirname(from);
+
+      for (const reqRelMatch of cleanedRb.matchAll(/\brequire_relative\s*(?:\(\s*)?['"]([^'"]+)['"]\s*\)?/g)) {
+        const rawSpec = (reqRelMatch[1] || '').trim();
+        if (!rawSpec) continue;
+        const joined = path.posix.normalize(path.posix.join(fromDir || '.', rawSpec));
+        if (joined.startsWith('..')) continue;
+        for (const cand of [joined, `${joined}.rb`]) {
+          if (cand !== from && repoFileSet.has(cand)) {
+            addEdge(from, cand);
+            break;
+          }
+        }
+      }
+
+      for (const reqMatch of cleanedRb.matchAll(/\brequire\s*(?:\(\s*)?['"]([^'"]+)['"]\s*\)?/g)) {
+        const rawSpec = (reqMatch[1] || '').trim();
+        if (!rawSpec) continue;
+
+        const candidates = [];
+        if (rawSpec.startsWith('./') || rawSpec.startsWith('../')) {
+          const relJoined = path.posix.normalize(path.posix.join(fromDir || '.', rawSpec));
+          if (!relJoined.startsWith('..')) {
+            candidates.push(relJoined, `${relJoined}.rb`);
+          }
+        }
+        const cleanSpec = rawSpec.replace(/^(?:\.\/)+/, '').replace(/^\/+/, '');
+        if (cleanSpec && !cleanSpec.startsWith('..')) {
+          const prefixes = ['lib/', 'app/', '', ...(fromDir ? [`${fromDir}/`] : [])];
+          for (const prefix of prefixes) {
+            candidates.push(`${prefix}${cleanSpec}`, `${prefix}${cleanSpec}.rb`);
+          }
+        }
+
+        for (const cand of candidates) {
+          if (cand !== from && repoFileSet.has(cand)) {
+            addEdge(from, cand);
+            break;
+          }
+        }
+      }
+      continue;
+    }
+
+    // 8. PHP (.php) `require` / `include` / route links
+    if (ext === '.php') {
+      for (const dep of extractPhpDependencies(entry.content)) {
+        const target = resolvePhpDependencyTarget(from, dep.specifier, repoFileSet);
+        if (target) {
+          addEdge(from, target);
+        }
+      }
+    }
+  }
+
+  return edges;
 }
 
 /**
@@ -1263,11 +2458,11 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       }
     };
 
-    // 1. Walk relative ESM/CJS imports and PHP `require`/`include` dependencies across repository files
+    // 1. Walk relative/polyglot imports and PHP `require`/`include` dependencies across repository files
     const phpSourceByFile = new Map();
+    const polyglotSourceEntries = [];
     for (const relFile of allFiles) {
       const ext = path.extname(relFile).toLowerCase();
-      if (ext === '.py') continue;
       const abs = path.join(resolvedRepoDir, relFile);
       let content = '';
       try {
@@ -1291,13 +2486,20 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         continue;
       }
 
-      const specifiers = extractRelativeSpecifiers(content);
-      for (const spec of specifiers) {
-        const resolvedTarget = resolveRelativeImportTarget(relFile, spec, repoFileSet);
-        if (resolvedTarget) {
-          recordDirectedDependency(relFile, resolvedTarget, 'imports');
+      polyglotSourceEntries.push({ filePath: relFile, content });
+      if (JS_TS_EXTENSIONS.has(ext)) {
+        const specifiers = extractRelativeSpecifiers(content);
+        for (const spec of specifiers) {
+          const resolvedTarget = resolveRelativeImportTarget(relFile, spec, repoFileSet);
+          if (resolvedTarget) {
+            recordDirectedDependency(relFile, resolvedTarget, 'imports');
+          }
         }
       }
+    }
+
+    for (const edge of extractPolyglotDependencyEdges(polyglotSourceEntries)) {
+      recordDirectedDependency(edge.from, edge.to, 'imports');
     }
 
     // 2. Walk AST symbols (`stack.git` one-shot map for JS/TS/PY + PHP symbol/call extractor for `.php`)
@@ -1833,8 +3035,9 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
    * @param {object} params
    * @param {string} params.repoUrlOrPath
    * @param {number} [params.maxFiles=60]
+   * @param {string} [params.hintedFile='']
    */
-  async function scanExternalRepository({ repoUrlOrPath, maxFiles = 60 } = {}) {
+  async function scanExternalRepository({ repoUrlOrPath, maxFiles = 60, hintedFile = '' } = {}) {
     const startNs = process.hrtime.bigint();
     const rawTarget = String(repoUrlOrPath || '').trim();
 
@@ -1849,6 +3052,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
     const safeMaxFiles = Math.max(1, Math.min(200, Math.trunc(Number(maxFiles) || 60)));
     const normalizedInput = normalizeGitHubRepoInput(rawTarget);
+    const effectiveHintedFile = normalizeRelPath(hintedFile || normalizedInput.hintedFile || '');
 
     let tempCloneDir = null;
     let scanRoot = '';
@@ -1967,22 +3171,36 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
       const scanStartNs = process.hrtime.bigint();
       const cloneElapsedMs = Number((Number(scanStartNs - startNs) / 1e6).toFixed(3));
-      const relFiles = collectRepoCodeFiles(scanRoot, safeMaxFiles);
+      const { files: relFiles, truncatedOrFiltered } = collectPrioritizedRepoFiles(
+        scanRoot,
+        safeMaxFiles,
+        {
+          hintedFile: effectiveHintedFile,
+          walkCap: MAX_REPO_WALK_CANDIDATES
+        }
+      );
       const repoFileSet = new Set(relFiles);
       const fileEntries = [];
       const dependencyPreview = [];
       const seenPreviewEdge = new Set();
+      const dependencyEdges = [];
+      const seenMergedEdge = new Set();
       const phpSymbolsByFile = new Map();
       const polyglotSymbolsByFile = new Map();
       const extraFindings = [];
       let phpSymbolTotal = 0;
 
-      const pushPreviewEdge = (from, to, relation) => {
-        if (!from || !to || from === to || dependencyPreview.length >= 40) return;
-        const edgeKey = `${from}->${to}:${relation}`;
-        if (!seenPreviewEdge.has(edgeKey)) {
-          seenPreviewEdge.add(edgeKey);
-          dependencyPreview.push({ from, to, relation });
+      const pushPreviewEdge = (from, to, relation = 'imports') => {
+        if (!from || !to || from === to) return;
+        const previewKey = `${from}->${to}:${relation}`;
+        if (!seenPreviewEdge.has(previewKey) && dependencyPreview.length < 60) {
+          seenPreviewEdge.add(previewKey);
+          dependencyPreview.push({ from, to, relation, type: 'IMPORTS' });
+        }
+        const mergedKey = `${from}->${to}`;
+        if (!seenMergedEdge.has(mergedKey)) {
+          seenMergedEdge.add(mergedKey);
+          dependencyEdges.push({ from, to, type: 'IMPORTS', relation });
         }
       };
 
@@ -1991,7 +3209,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         let content = '';
         try {
           const st = fs.lstatSync(abs);
-          if (st.isSymbolicLink() || !st.isFile() || st.size > 262_144) continue;
+          if (st.isSymbolicLink() || !st.isFile() || st.size > MAX_SCANNABLE_FILE_BYTES) continue;
           const buf = fs.readFileSync(abs);
           if (buf.subarray(0, 4096).includes(0)) continue;
           content = buf.toString('utf8');
@@ -2020,7 +3238,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           const polySyms = extractPolyglotFileSymbols(content, relFile, ext);
           polyglotSymbolsByFile.set(relFile, polySyms);
           extraFindings.push(...auditPolyglotMigrationFile(content, relFile));
-        } else if (ext !== '.py') {
+        } else if (JS_TS_EXTENSIONS.has(ext)) {
           for (const spec of extractRelativeSpecifiers(content)) {
             const target = resolveRelativeImportTarget(relFile, spec, repoFileSet);
             if (target) {
@@ -2030,9 +3248,20 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         }
       }
 
+      const scannedFileSet = new Set(fileEntries.map((e) => e.filePath));
+      for (const polyEdge of extractPolyglotDependencyEdges(fileEntries)) {
+        if (scannedFileSet.has(polyEdge.from) && scannedFileSet.has(polyEdge.to)) {
+          pushPreviewEdge(polyEdge.from, polyEdge.to, 'imports');
+        }
+      }
+
       let boundedIndexDir = null;
       let indexTargetRoot = scanRoot;
-      if (fileEntries.length >= safeMaxFiles || fileEntries.length < relFiles.length) {
+      if (
+        truncatedOrFiltered ||
+        fileEntries.length >= safeMaxFiles ||
+        fileEntries.length < relFiles.length
+      ) {
         boundedIndexDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-bounded-idx-'));
         for (const entry of fileEntries) {
           const destAbs = path.resolve(boundedIndexDir, entry.filePath);
@@ -2065,6 +3294,38 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
       const indexedSymbolsByFile = loadAllRepoSymbolsByFile(stack, scanRepoName);
 
+      // Supplement dependencyEdges with AST symbol call/import edges from stack.git
+      if (stack?.db?.prepare && indexedSymbolsByFile.size > 0) {
+        const symbolOwners = new Map();
+        for (const [ownerFile, syms] of indexedSymbolsByFile.entries()) {
+          if (!scannedFileSet.has(ownerFile)) continue;
+          for (const sym of syms) {
+            const name = sym?.symbol_name;
+            if (!name) continue;
+            if (!symbolOwners.has(name)) symbolOwners.set(name, new Set());
+            symbolOwners.get(name).add(ownerFile);
+          }
+        }
+        try {
+          const gitEdgeRows = stack.db
+            .prepare('SELECT from_file, to_symbol, edge_type FROM git_edges WHERE repo_name = ?')
+            .all(scanRepoName);
+          for (const row of gitEdgeRows) {
+            const fromFile = normalizeRelPath(row?.from_file);
+            if (!fromFile || !scannedFileSet.has(fromFile)) continue;
+            const owners = symbolOwners.get(row?.to_symbol);
+            if (!owners || owners.size === 0 || owners.size > 3) continue;
+            for (const targetOwner of owners) {
+              if (targetOwner !== fromFile && scannedFileSet.has(targetOwner)) {
+                pushPreviewEdge(fromFile, targetOwner, row?.edge_type || 'calls');
+              }
+            }
+          }
+        } catch {
+          // Ignore optional git_edges supplement failure
+        }
+      }
+
       let fallbackPolyglotSymbols = 0;
       for (const [relFile, polySyms] of polyglotSymbolsByFile.entries()) {
         const indexedSyms = indexedSymbolsByFile.get(normalizeRelPath(relFile)) || [];
@@ -2073,24 +3334,98 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         }
       }
 
+      // Compute inDegree, outDegree, and 2-hop blast-radius metadata from merged deduplicated dependencyEdges
+      const inboundByFile = new Map();
+      const outboundByFile = new Map();
+      for (const entry of fileEntries) {
+        inboundByFile.set(entry.filePath, new Set());
+        outboundByFile.set(entry.filePath, new Set());
+      }
+      for (const edge of dependencyEdges) {
+        if (!scannedFileSet.has(edge.from) || !scannedFileSet.has(edge.to) || edge.from === edge.to) {
+          continue;
+        }
+        outboundByFile.get(edge.from)?.add(edge.to);
+        inboundByFile.get(edge.to)?.add(edge.from);
+      }
+
+      const inDegreeByFile = {};
+      const outDegreeByFile = {};
+      const hop1ByFile = new Map();
+      const hop2ByFile = new Map();
+      let connectedFileCount = 0;
+
+      for (const entry of fileEntries) {
+        const fp = entry.filePath;
+        const hop1 = [...(inboundByFile.get(fp) || [])].sort(compareCodePathsAlpha);
+        const hop1Set = new Set(hop1);
+        const hop2Set = new Set();
+        for (const h1 of hop1) {
+          for (const h2 of inboundByFile.get(h1) || []) {
+            if (h2 !== fp && !hop1Set.has(h2)) {
+              hop2Set.add(h2);
+            }
+          }
+        }
+        const hop2 = [...hop2Set].sort(compareCodePathsAlpha);
+        const inDeg = hop1.length;
+        const outDeg = outboundByFile.get(fp)?.size || 0;
+        if (inDeg > 0 || outDeg > 0) connectedFileCount += 1;
+
+        inDegreeByFile[fp] = inDeg;
+        outDegreeByFile[fp] = outDeg;
+        hop1ByFile.set(fp, hop1);
+        hop2ByFile.set(fp, hop2);
+      }
+
       const topFiles = fileEntries.slice(0, 15).map((entry) => {
-        const ext = path.extname(entry.filePath).toLowerCase();
+        const fp = entry.filePath;
+        const ext = path.extname(fp).toLowerCase();
         const syms =
           ext === '.php'
-            ? phpSymbolsByFile.get(entry.filePath) || []
+            ? phpSymbolsByFile.get(fp) || []
             : (() => {
-                const indexed = indexedSymbolsByFile.get(normalizeRelPath(entry.filePath)) || [];
+                const indexed = indexedSymbolsByFile.get(normalizeRelPath(fp)) || [];
                 if (indexed.length > 0) return indexed;
-                return polyglotSymbolsByFile.get(entry.filePath) || [];
+                return polyglotSymbolsByFile.get(fp) || [];
               })();
+        const hop1Dependents = hop1ByFile.get(fp) || [];
+        const hop2Dependents = hop2ByFile.get(fp) || [];
 
         return {
-          filePath: entry.filePath,
+          filePath: fp,
           lineCount: entry.content.split(/\r?\n/).length,
           symbolCount: syms.length,
-          symbols: syms.slice(0, 8).map((s) => s.symbol_name)
+          symbols: syms.slice(0, 8).map((s) => s.symbol_name),
+          inDegree: inDegreeByFile[fp] || 0,
+          outDegree: outDegreeByFile[fp] || 0,
+          hop1Dependents,
+          hop2Dependents,
+          blastRadiusCount: hop1Dependents.length + hop2Dependents.length
         };
       });
+
+      const hubFiles = [...fileEntries]
+        .map((entry) => {
+          const fp = entry.filePath;
+          const hop1 = hop1ByFile.get(fp) || [];
+          const hop2 = hop2ByFile.get(fp) || [];
+          return {
+            filePath: fp,
+            inDegree: inDegreeByFile[fp] || 0,
+            outDegree: outDegreeByFile[fp] || 0,
+            blastRadiusCount: hop1.length + hop2.length
+          };
+        })
+        .filter((item) => item.inDegree > 0 || item.outDegree > 0)
+        .sort(
+          (a, b) =>
+            b.inDegree - a.inDegree ||
+            b.blastRadiusCount - a.blastRadiusCount ||
+            b.outDegree - a.outDegree ||
+            compareCodePathsAlpha(a.filePath, b.filePath)
+        )
+        .slice(0, 10);
 
       const jsPyEntries = fileEntries.filter((entry) => {
         const ext = path.extname(entry.filePath).toLowerCase();
@@ -2130,16 +3465,25 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         ? normalizedInput.displayTarget
         : localDisplayName;
 
-      const summary = `Scanned ${fileEntries.length} file(s) and ${symbolCount} AST symbol(s) in ${displayTarget} (${mergedSlopAudit.slopFindingCount} slop finding(s), ${elapsedMs}ms).`;
+      const summary = `Scanned ${fileEntries.length} file(s) and ${symbolCount} AST symbol(s) in ${displayTarget} (${mergedSlopAudit.slopFindingCount} slop finding(s), ${dependencyEdges.length} dependency edge(s), ${elapsedMs}ms).`;
 
       return okEnvelope('deadbolt.planner.repo_scan', summary, {
         target: displayTarget,
-        hintedFile: normalizedInput.hintedFile || '',
+        hintedFile: effectiveHintedFile,
         scannedFiles: fileEntries.length,
         scannedFilePaths: fileEntries.map((entry) => entry.filePath),
         symbolCount,
         topFiles,
+        dependencyEdges,
+        dependencyEdgeCount: dependencyEdges.length,
         dependencyPreview,
+        inDegreeByFile,
+        outDegreeByFile,
+        blastRadius: {
+          edgeCount: dependencyEdges.length,
+          connectedFiles: connectedFileCount,
+          hubFiles
+        },
         slopAudit: mergedSlopAudit,
         elapsedMs,
         cloneElapsedMs

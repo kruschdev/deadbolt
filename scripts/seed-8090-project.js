@@ -13,6 +13,11 @@
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { safeFetch } from '@krusch/toolkit/security';
 import { config } from '../src/config.js';
+import {
+    readJsonWithTimeout,
+    readTextWithTimeout,
+    scrubPrivateNetworkStrings
+} from '../src/connectors/hydradb-graph.js';
 
 const FEATURE_REQUIREMENTS_TITLE = 'Billing Settlement Governance & SOX-Style Reconciliation';
 const COMPONENT_BLUEPRINT_TITLE = 'DEADBOLT 4-Stage Factory Governance Engine';
@@ -225,7 +230,12 @@ Replace unsigned base64 offset pagination in \`src/invoice-list.js\` with clampe
     }
 ]);
 
-async function callSofaJson(baseUrl, apiHost, pathname, { method = 'GET', headers = {}, body = undefined } = {}) {
+async function callSofaJson(
+    baseUrl,
+    apiHost,
+    pathname,
+    { method = 'GET', headers = {}, body = undefined, allowStatuses = [] } = {}
+) {
     const reqHeaders = {
         Accept: 'application/json',
         ...headers,
@@ -249,16 +259,59 @@ async function callSofaJson(baseUrl, apiHost, pathname, { method = 'GET', header
         }
     );
     if (!res.ok) {
-        throw new Error(`${method} ${pathname} blocked: ${res.error?.message || res.error?.code}`);
+        throw new Error(
+            scrubPrivateNetworkStrings(
+                `${method} ${pathname} blocked: ${res.error?.message || res.error?.code}`
+            )
+        );
     }
-    const text = await res.data.response.text();
+
+    const httpRes = res.data.response;
+    const status = res.data.status;
+    const contentType = String(httpRes.headers?.get?.('content-type') || '').toLowerCase();
     let json = null;
-    try {
-        json = text ? JSON.parse(text) : null;
-    } catch {
-        json = { raw: text };
+    let rawText = '';
+
+    if (contentType.includes('application/json')) {
+        try {
+            json = await readJsonWithTimeout(httpRes, 5000);
+        } catch (err) {
+            if (err?.code === 'BODY_READ_TIMEOUT') {
+                throw new Error(
+                    scrubPrivateNetworkStrings(
+                        `${method} ${pathname} timed out reading JSON body.`
+                    )
+                );
+            }
+            json = null;
+        }
+    } else {
+        rawText = await readTextWithTimeout(httpRes, 5000);
+        try {
+            json = rawText ? JSON.parse(rawText) : null;
+        } catch {
+            json = rawText ? { raw: rawText } : null;
+        }
     }
-    return { status: res.data.status, json };
+
+    const httpOk = Boolean(httpRes.ok && status >= 200 && status < 300);
+    if (!httpOk && !allowStatuses.includes(status)) {
+        const errDetail =
+            typeof json?.detail === 'string'
+                ? json.detail
+                : typeof json?.error === 'string'
+                  ? json.error
+                  : json?.error?.message ||
+                    json?.message ||
+                    (rawText ? rawText.slice(0, 240) : `HTTP ${status}`);
+        throw new Error(
+            scrubPrivateNetworkStrings(
+                `${method} ${pathname} failed with HTTP ${status}: ${errDetail}`
+            )
+        );
+    }
+
+    return { status, json };
 }
 
 export async function seedLive8090Project({
@@ -548,10 +601,12 @@ export async function seedLive8090Project({
             {
                 method: 'POST',
                 headers: extHeaders,
-                body: { work_order_id: wo101Record.id }
+                body: { work_order_id: wo101Record.id },
+                allowStatuses: [409]
             }
         );
-        feedbackSignal.linkedToWo101 = linkFbRes.status >= 200 && linkFbRes.status < 300;
+        feedbackSignal.linkedToWo101 =
+            (linkFbRes.status >= 200 && linkFbRes.status < 300) || linkFbRes.status === 409;
         feedbackSignal.displayId = firstFb.display_id || 'FB-1';
     }
 
@@ -560,19 +615,26 @@ export async function seedLive8090Project({
     return okEnvelope(
         'deadbolt.scripts.seed_8090',
         `Seeded live 8090 Software Factory project (${publicWorkOrders.length} Work Orders, Requirement, Blueprint, Skill, and Validator Feedback).`,
-        {
+        scrubPrivateNetworkStrings({
             requirement: { title: FEATURE_REQUIREMENTS_TITLE, created: requirementCreated, present: Boolean(requirementId) },
             blueprint: { title: COMPONENT_BLUEPRINT_TITLE, created: blueprintCreated, present: Boolean(blueprintId) },
             skill: { title: PROJECT_SKILL_TITLE, identifier: skillIdentifier, created: skillCreated },
             batchCreateStatus,
             workOrders: publicWorkOrders,
             feedbackSignal
-        }
+        })
     );
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-    const result = await seedLive8090Project();
-    console.log(JSON.stringify(result, null, 2));
-    process.exit(result.ok ? 0 : 1);
+    try {
+        const result = await seedLive8090Project();
+        console.log(JSON.stringify(scrubPrivateNetworkStrings(result), null, 2));
+        if (!result.ok) {
+            process.exitCode = 1;
+        }
+    } catch (err) {
+        console.error(scrubPrivateNetworkStrings(err?.message || String(err)));
+        process.exitCode = 1;
+    }
 }

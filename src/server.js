@@ -16,6 +16,7 @@ import {
 } from '@krusch/toolkit/http';
 import { sseResponse } from '@krusch/toolkit/streaming';
 import { openSqliteDb } from '@krusch/toolkit/sqlite';
+import { createRateLimiter } from '@krusch/toolkit/security';
 import { setupLogging } from '@krusch/toolkit/log';
 import { config } from './config.js';
 import { createDeadboltOrchestrator } from './orchestrator.js';
@@ -99,8 +100,21 @@ function resolveErrorHttpStatus(envelope) {
     ) {
         return 403;
     }
+    if (code === 'WORK_ORDER_NOT_FOUND' || code === 'ASSET_NOT_FOUND') {
+        return 404;
+    }
     if (code === 'AUDIT_TAMPERED' || code === 'UNVERIFIED_STAGE_BLOCKED') {
         return 409;
+    }
+    if (code === 'RATE_LIMITED') {
+        return 429;
+    }
+    if (
+        code === 'AUDIT_VERIFY_FAILED' ||
+        code === 'VALIDATOR_MISSING_FEE_ENGINE' ||
+        code.endsWith('_INTERNAL_ERROR')
+    ) {
+        return 500;
     }
     if (code === 'GIT_CLONE_FAILED') {
         return 502;
@@ -163,9 +177,38 @@ export function buildServer({
         return orchestratorPromise;
     }
 
+    const mutationLimiter = createRateLimiter({
+        windowMs: 60_000,
+        max: 120,
+        tool: 'deadbolt.rate_limit'
+    });
+
+    function checkMutationLimit(ctx, cost = 1) {
+        const remoteIp = String(ctx.req?.socket?.remoteAddress || '127.0.0.1');
+        const check = mutationLimiter.consume(remoteIp, cost);
+        if (typeof ctx.res?.setHeader === 'function' && !ctx.res.headersSent) {
+            for (const [k, v] of Object.entries(check.headers || {})) {
+                ctx.res.setHeader(k, v);
+            }
+        }
+        if (!check.allowed) {
+            ctx.sendJson(429, check.envelope);
+            return false;
+        }
+        return true;
+    }
+
     const server = createApiServer({
         serviceName: config.serviceName,
         version: '0.1.0',
+        corsOrigins: [
+            'http://127.0.0.1:4090',
+            'http://localhost:4090',
+            'http://127.0.0.1:5173',
+            'http://localhost:5173',
+            'http://127.0.0.1:4099',
+            'http://localhost:4099'
+        ],
         logger: activeLogger,
         healthCheck: async () => {
             const orch = await getOrchestrator();
@@ -216,6 +259,14 @@ export function buildServer({
                     FALLBACK_FAVICON_SVG
                 );
             },
+            'GET /favicon.ico': (ctx) => {
+                serveDistFileOrFallback(
+                    ctx.res,
+                    'favicon.svg',
+                    'image/svg+xml; charset=utf-8',
+                    FALLBACK_FAVICON_SVG
+                );
+            },
 
             // Core DEADBOLT Governance APIs
             'GET /api/status': async () => {
@@ -224,6 +275,7 @@ export function buildServer({
             },
 
             'POST /api/run': async (ctx) => {
+                if (!checkMutationLimit(ctx, 2)) return;
                 const orch = await getOrchestrator();
                 const workOrderId = String(ctx.body?.workOrderId || 'WO-101').trim();
                 telemetryDb.run('INSERT INTO events (label) VALUES (?)', [
@@ -241,6 +293,7 @@ export function buildServer({
             },
 
             'POST /api/run/stream': async (ctx) => {
+                if (!checkMutationLimit(ctx, 2)) return;
                 const orch = await getOrchestrator();
                 const workOrderId = String(ctx.body?.workOrderId || 'WO-101').trim();
                 const beatDelayMs = Number.isFinite(Number(ctx.body?.beatDelayMs))
@@ -278,6 +331,7 @@ export function buildServer({
             },
 
             'POST /api/repo/scan': async (ctx) => {
+                if (!checkMutationLimit(ctx, 1)) return;
                 const orch = await getOrchestrator();
                 const repoUrlOrPath = String(
                     ctx.body?.repoUrlOrPath || ctx.body?.target || 'acme-legacy-billing'
@@ -294,6 +348,7 @@ export function buildServer({
             },
 
             'POST /api/repo/modernize': async (ctx) => {
+                if (!checkMutationLimit(ctx, 3)) return;
                 const orch = await getOrchestrator();
                 const repoUrlOrPath = String(
                     ctx.body?.repoUrlOrPath ||
@@ -320,6 +375,7 @@ export function buildServer({
             },
 
             'POST /api/drills/crash-recovery': async (ctx) => {
+                if (!checkMutationLimit(ctx, 1)) return;
                 const orch = await getOrchestrator();
                 telemetryDb.run('INSERT INTO events (label) VALUES (?)', ['drill:crash-recovery']);
                 const result = await orch.runCrashDrill();
@@ -331,6 +387,7 @@ export function buildServer({
             },
 
             'POST /api/drills/confused-deputy': async (ctx) => {
+                if (!checkMutationLimit(ctx, 1)) return;
                 const orch = await getOrchestrator();
                 telemetryDb.run('INSERT INTO events (label) VALUES (?)', ['drill:confused-deputy']);
                 const result = await orch.runDeputyDrill();
@@ -342,6 +399,7 @@ export function buildServer({
             },
 
             'POST /api/foreman/speak': async (ctx) => {
+                if (!checkMutationLimit(ctx, 2)) return;
                 const orch = await getOrchestrator();
                 const result = await orch.speakForeman(ctx.body || {});
                 if (!result.ok) {
@@ -377,6 +435,7 @@ export function buildServer({
             },
 
             'POST /api/sofa/sync-receipt': async (ctx) => {
+                if (!checkMutationLimit(ctx, 2)) return;
                 const orch = await getOrchestrator();
                 const workOrderId = String(ctx.body?.workOrderId || 'WO-101').trim();
                 telemetryDb.run('INSERT INTO events (label) VALUES (?)', [
@@ -400,6 +459,7 @@ export function buildServer({
             },
 
             'POST /api/stream': (ctx) => {
+                if (!checkMutationLimit(ctx, 1)) return;
                 const prompt = String(ctx.body?.prompt || 'ping').trim().slice(0, 256);
                 telemetryDb.run('INSERT INTO events (label) VALUES (?)', [prompt]);
                 const sse = sseResponse(ctx.res, ctx.req, { tool: 'stream.complete' });

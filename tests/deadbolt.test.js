@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scoreLegoBrickCoverage } from '@krusch/toolkit/catalog';
@@ -11,7 +12,15 @@ import {
     scrubPrivateNetworkStrings
 } from '../src/connectors/hydradb-graph.js';
 import { createSponsorHub } from '../src/connectors/sponsors.js';
-import { parseReviewerVerdictPayload } from '../src/engines/validator-gate.js';
+import {
+    parseReviewerVerdictPayload,
+    stripJsCommentsPreservingStrings
+} from '../src/engines/validator-gate.js';
+import {
+    normalizeGitHubRepoInput,
+    extractPolyglotDependencyEdges
+} from '../src/engines/planner-graph.js';
+import { isStructurallyCompleteGoldenBrickModule } from '../src/engines/modernizer-benchmark.js';
 import { createDeadboltOrchestrator } from '../src/orchestrator.js';
 import {
     DEADBOLT_MCP_TOOLS,
@@ -1444,14 +1453,17 @@ test('PE+CSO audit remediation regressions: private-IP scrubbing, fail-closed re
             enableLiveReviewers: true,
             openRouterApiKey: 'sk-or-mock-disagree-test'
         },
-        chatImpl: async (_sys, _usr, cfg) => {
-            if (cfg?.model === 'deepseek/deepseek-v4.1-flash') {
+        chatImpl: async (sysPrompt, _usr, cfg) => {
+            const isReviewer = String(sysPrompt || '').includes(
+                'independent Software Factory validator'
+            );
+            if (isReviewer && String(cfg?.model || '').startsWith('deepseek/')) {
                 return {
                     text: '{"verdict":"REJECT","rationale":"Detected rounding drift risk in fee path."}',
                     usage: { inputTokens: 120, outputTokens: 28 }
                 };
             }
-            if (cfg?.model === 'google/gemini-3.5-flash-lite') {
+            if (isReviewer && String(cfg?.model || '').startsWith('google/')) {
                 return {
                     text: '{"verdict":"APPROVE","rationale":"Sealed envelope looks structurally valid."}',
                     usage: { inputTokens: 120, outputTokens: 24 }
@@ -1669,14 +1681,38 @@ test('8090 Software Factory Tri-API governance snapshot, PII redaction, idempote
     assert.equal(snap1.data.inventory.blueprintCount, 2);
     assert.equal(snap1.data.inventory.skillCount, 48);
     assert.equal(snap1.data.automations[0].permissionOverrides.length, 2);
+    assert.equal(snap1.data.workOrders[0].hasVerifiedReceipt, false);
+    assert.equal(
+        snap1.data.workOrders[1].hasVerifiedReceipt,
+        false,
+        'Non-Stage-4 comments must not be mislabeled as verified receipts'
+    );
     assert.equal(
         JSON.stringify(snap1).includes('secret-owner@example.com'),
         false,
         'Owner/author email PII must never leak into governance snapshot'
     );
 
-    // First sync posts receipt comment; second sync idempotently verifies existing comment without duplicating
-    const sync1 = await liveHub.syncGovernanceReceiptTo8090({ workOrderId: 'WO-101' });
+    // INV-DB-09: Unverified sync without a real SHA-256 hash or unknown Work Order must fail closed
+    const unverifiedSync = await liveHub.syncGovernanceReceiptTo8090({ workOrderId: 'WO-101' });
+    assert.equal(unverifiedSync.ok, false);
+    assert.equal(unverifiedSync.error.code, 'UNVERIFIED_STAGE_BLOCKED');
+
+    const missingWoSync = await liveHub.syncGovernanceReceiptTo8090({
+        workOrderId: 'WO-999',
+        auditTailHash: 'a'.repeat(64),
+        verifiedCostUsd: 0.00043
+    });
+    assert.equal(missingWoSync.ok, false);
+    assert.equal(missingWoSync.error.code, 'WORK_ORDER_NOT_FOUND');
+
+    // First verified sync posts receipt comment; second sync idempotently verifies existing comment without duplicating
+    const validAuditHash = 'b'.repeat(64);
+    const sync1 = await liveHub.syncGovernanceReceiptTo8090({
+        workOrderId: 'WO-101',
+        auditTailHash: validAuditHash,
+        verifiedCostUsd: 0.00043
+    });
     assert.equal(sync1.ok, true);
     assert.equal(sync1.data.commentAction, 'posted_live_comment');
     assert.equal(postedBodies.length, 1);
@@ -1684,13 +1720,24 @@ test('8090 Software Factory Tri-API governance snapshot, PII redaction, idempote
         sync1.data.snapshot.workOrders[0].latestGovernanceHeading,
         'DEADBOLT Stage 4 Governance Receipt'
     );
+    assert.equal(sync1.data.snapshot.workOrders[0].hasVerifiedReceipt, true);
+    assert.equal(
+        sync1.data.snapshot.automations[0].permissionOverrides.length,
+        2,
+        'Nested permissionOverrides must never be wiped to {} during scrubbing'
+    );
+    assert.equal(sync1.data.snapshot.automations[0].permissionOverrides[0].domain, 'tests');
 
-    const sync2 = await liveHub.syncGovernanceReceiptTo8090({ workOrderId: 'WO-101' });
+    const sync2 = await liveHub.syncGovernanceReceiptTo8090({
+        workOrderId: 'WO-101',
+        auditTailHash: validAuditHash,
+        verifiedCostUsd: 0.00043
+    });
     assert.equal(sync2.ok, true);
     assert.equal(sync2.data.commentAction, 'verified_existing_live_comment');
     assert.equal(postedBodies.length, 1, 'Second sync must not post duplicate comment');
 
-    // Ephemeral HTTP server routes check
+    // Ephemeral HTTP server routes check (INV-DB-09: 409 before Stage 4, 404 on unknown WO, 200 after Stage 4)
     const { server, close } = buildServer({ dbPath: ':memory:' });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     t.after(async () => {
@@ -1704,6 +1751,32 @@ test('8090 Software Factory Tri-API governance snapshot, PII redaction, idempote
     assert.equal(govHttpJson.ok, true);
     assert.equal(govHttpJson.data.inventory.workOrderCount, 4);
 
+    const preStageSyncRes = await fetch(`http://127.0.0.1:${port}/api/sofa/sync-receipt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workOrderId: 'WO-101' })
+    });
+    assert.equal(preStageSyncRes.status, 409);
+    const preStageSyncJson = await preStageSyncRes.json();
+    assert.equal(preStageSyncJson.ok, false);
+    assert.equal(preStageSyncJson.error.code, 'UNVERIFIED_STAGE_BLOCKED');
+
+    const unknownWoHttpRes = await fetch(`http://127.0.0.1:${port}/api/sofa/sync-receipt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workOrderId: 'WO-999' })
+    });
+    assert.equal(unknownWoHttpRes.status, 404);
+    const unknownWoHttpJson = await unknownWoHttpRes.json();
+    assert.equal(unknownWoHttpJson.error.code, 'WORK_ORDER_NOT_FOUND');
+
+    const runHttpRes = await fetch(`http://127.0.0.1:${port}/api/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workOrderId: 'WO-101' })
+    });
+    assert.equal(runHttpRes.status, 200);
+
     const syncHttpRes = await fetch(`http://127.0.0.1:${port}/api/sofa/sync-receipt`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1713,4 +1786,170 @@ test('8090 Software Factory Tri-API governance snapshot, PII redaction, idempote
     const syncHttpJson = await syncHttpRes.json();
     assert.equal(syncHttpJson.ok, true);
     assert.equal(syncHttpJson.data.workOrderId, 'WO-101');
+    assert.equal(syncHttpJson.data.snapshot.automations[0].permissionOverrides[0].domain, 'tests');
+});
+
+test('Evaluation readiness hardening: <think>/multi-JSON verdict parser, polyglot import graph, 1-file micro-repo modernization, depth-20 scrubber, ElevenLabs language_code + timeout fallback, INV-DB-HYDRA-ISOLATION-01 env guard, and concurrent runHeadToHead', async (t) => {
+    // 1. Verdict parser: <think> blocks, leading non-verdict JSON objects, and contrastive final verdicts
+    const thinkJson = parseReviewerVerdictPayload(
+        '<think>If raw SQL existed I would REJECT, checking {"step":1} first...</think>\n{"meta":{"checked":3}}\n{"invariantChecks":{"usesGoldenBricks":true},"verdict":"APPROVE","rationale":"Parameterized Golden Bricks verified."}'
+    );
+    assert.equal(thinkJson.verdict, 'APPROVE');
+    assert.equal(thinkJson.ambiguous, false);
+
+    const contrastiveProse = parseReviewerVerdictPayload(
+        'Analysis: we would REJECT naive per-line rounding, so integer carry is required. FINAL VERDICT: APPROVE'
+    );
+    assert.equal(contrastiveProse.verdict, 'APPROVE');
+    assert.equal(contrastiveProse.ambiguous, false);
+
+    const ambiguousQuestion = parseReviewerVerdictPayload('Should I APPROVE or REJECT this patch?');
+    assert.equal(ambiguousQuestion.verdict, 'REJECT');
+    assert.equal(ambiguousQuestion.ambiguous, true);
+
+    // 2. String-preserving comment stripper & structural ESM Golden Brick check
+    const stripped = stripJsCommentsPreservingStrings(
+        'const url = "https://api.hydradb.com/v2 // keep"; // strip comment\nconst tol = 0; /* block */'
+    );
+    assert.equal(stripped.includes('https://api.hydradb.com/v2 // keep'), true);
+    assert.equal(stripped.includes('strip comment'), false);
+    assert.equal(stripped.includes('block'), false);
+
+    assert.equal(
+        isStructurallyCompleteGoldenBrickModule(
+            "import { okEnvelope } from '@krusch/toolkit/http';\nexport function run() { return okEnvelope('x', 'ok', {}); }\n"
+        ),
+        true
+    );
+    assert.equal(
+        isStructurallyCompleteGoldenBrickModule(
+            "import { safeFetch } from '@krusch/toolkit/security';\nexport function broken() { return { ok: true "
+        ),
+        false,
+        'Truncated or okEnvelope-missing module must fail structural completeness check'
+    );
+
+    // 3. GitHub input normalization (http://github.com upgrade + trailing slash stripping) & polyglot edges
+    const httpGitNorm = normalizeGitHubRepoInput('http://github.com/taniarascia/pdo/');
+    assert.equal(httpGitNorm.cleanHttpsUrl, 'https://github.com/taniarascia/pdo.git');
+    assert.equal(httpGitNorm.repoSlug, 'taniarascia/pdo');
+
+    const shorthandSlash = normalizeGitHubRepoInput('expressjs/cors/');
+    assert.equal(shorthandSlash.cleanHttpsUrl, 'https://github.com/expressjs/cors.git');
+
+    const polyglotEdges = extractPolyglotDependencyEdges([
+        { filePath: 'app/main.py', content: 'from app.services import billing\nimport app.db\n' },
+        { filePath: 'app/services/billing.py', content: 'from .. import db\n' },
+        { filePath: 'app/db.py', content: 'CONN = True\n' },
+        { filePath: 'cmd/server/main.go', content: 'package main\nimport "acme/internal/ledger"\n' },
+        { filePath: 'internal/ledger/calc.go', content: 'package ledger\n' },
+        { filePath: 'src/App.tsx', content: "import { api } from '@/lib/api';\n" },
+        { filePath: 'src/lib/api.ts', content: 'export const api = {};\n' },
+        {
+            filePath: 'src/com/acme/OrderService.java',
+            content: 'package com.acme;\nimport com.acme.repo.OrderRepo;\npublic class OrderService {}'
+        },
+        {
+            filePath: 'src/com/acme/repo/OrderRepo.java',
+            content: 'package com.acme.repo;\npublic class OrderRepo {}'
+        }
+    ]);
+    const edgeKeys = new Set(polyglotEdges.map((e) => `${e.from}->${e.to}`));
+    assert.equal(edgeKeys.has('app/main.py->app/services/billing.py'), true);
+    assert.equal(edgeKeys.has('app/main.py->app/db.py'), true);
+    assert.equal(edgeKeys.has('cmd/server/main.go->internal/ledger/calc.go'), true);
+    assert.equal(edgeKeys.has('src/App.tsx->src/lib/api.ts'), true);
+    assert.equal(
+        edgeKeys.has('src/com/acme/OrderService.java->src/com/acme/repo/OrderRepo.java'),
+        true
+    );
+
+    // 4. Depth-20 scrubPrivateNetworkStrings leaf preservation + path/secret/email redaction
+    let deepObj = { leafOverride: { domain: 'tests', restriction: 'cannot_edit_or_create' } };
+    for (let i = 0; i < 14; i += 1) {
+        deepObj = { nested: deepObj };
+    }
+    const scrubbedDeep = scrubPrivateNetworkStrings({
+        deepObj,
+        leakText:
+            'Failed at /home/alice/secret/app.js with sofa-admin-liveSecret123, ck_liveSecretKey999, owner@corp.io, and http://100.65.159.15:11434 vs https://github.com/taniarascia/pdo for WO-101'
+    });
+    let cursor = scrubbedDeep.deepObj;
+    for (let i = 0; i < 14; i += 1) {
+        cursor = cursor.nested;
+    }
+    assert.equal(cursor.leafOverride.domain, 'tests');
+    assert.equal(scrubbedDeep.leakText.includes('/home/alice'), false);
+    assert.equal(scrubbedDeep.leakText.includes('sofa-admin-liveSecret123'), false);
+    assert.equal(scrubbedDeep.leakText.includes('ck_liveSecretKey999'), false);
+    assert.equal(scrubbedDeep.leakText.includes('owner@corp.io'), false);
+    assert.equal(scrubbedDeep.leakText.includes('100.65.159.15'), false);
+    assert.equal(scrubbedDeep.leakText.includes('https://github.com/taniarascia/pdo'), true);
+    assert.equal(scrubbedDeep.leakText.includes('WO-101'), true);
+
+    // 5. ElevenLabs language_code: 'en' payload + timeout fallback to deterministic PCM16 WAV
+    let capturedTtsBody = null;
+    const ttsHub = createSponsorHub({
+        config: {
+            elevenlabsApiKey: 'xi-unit-test-key-1234567890'
+        },
+        lookupFn: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetchImpl: async (_url, init) => {
+            capturedTtsBody = JSON.parse(String(init?.body || '{}'));
+            return new Response('upstream rate limit', { status: 429 });
+        }
+    });
+    const ttsFallbackRes = await ttsHub.synthesizeForemanAlert({
+        eventType: 'WORKAROUND_REJECTED'
+    });
+    assert.equal(ttsFallbackRes.ok, true);
+    assert.equal(capturedTtsBody?.language_code, 'en');
+    assert.equal(ttsFallbackRes.data.mimeType, 'audio/wav');
+
+    // 6. INV-DB-HYDRA-ISOLATION-01: process.env.HYDRADB_API_KEY must never leak into ephemeral orchestrator even when options.config is provided
+    const prevHydraKey = process.env.HYDRADB_API_KEY;
+    process.env.HYDRADB_API_KEY = 'hydra-env-should-not-leak-in-ephemeral-test';
+    let isoOrch = null;
+    try {
+        isoOrch = await createDeadboltOrchestrator({
+            ephemeral: true,
+            config: { serviceName: 'deadbolt-isolated-test' }
+        });
+        assert.equal(isoOrch.hydraClient.isConfigured(), false);
+
+        // 7. 1-file micro-repo modernization stays on L1_FAST with honest non-negative summary prose, plus concurrent runHeadToHead safety
+        const microDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-micro-repo-'));
+        t.after(() => fs.rmSync(microDir, { recursive: true, force: true }));
+        fs.writeFileSync(
+            path.join(microDir, 'query.py'),
+            'import sqlite3\ndef get_user(uid):\n    conn = sqlite3.connect("app.db")\n    return conn.execute(f"SELECT * FROM users WHERE id = {uid}").fetchall()\n',
+            'utf8'
+        );
+        const microMod = await isoOrch.modernizeRepository({ repoUrlOrPath: microDir });
+        assert.equal(microMod.ok, true);
+        assert.equal(microMod.data.deadboltCascade.verdict, 'VERIFIED');
+        assert.equal(microMod.data.deadboltCascade.fileReceipts[0]?.tier, 'L1_FAST');
+        assert.equal(typeof microMod.summary, 'string');
+        assert.equal(
+            microMod.summary.includes('-%') || /-\d+(?:\.\d+)?%\s+(?:fewer|lower)/i.test(microMod.summary),
+            false,
+            `Summary prose must never contain negative savings grammar: ${microMod.summary}`
+        );
+
+        const [runA, runB] = await Promise.all([
+            isoOrch.runHeadToHead({ workOrderId: 'WO-101', beatDelayMs: 0 }),
+            isoOrch.runHeadToHead({ workOrderId: 'WO-102', beatDelayMs: 0 })
+        ]);
+        assert.equal(runA.ok, true);
+        assert.equal(runB.ok, true);
+        assert.equal(runA.data.telemetry.verified, true);
+        assert.equal(runB.data.telemetry.verified, true);
+    } finally {
+        isoOrch?.close();
+        if (prevHydraKey === undefined) {
+            delete process.env.HYDRADB_API_KEY;
+        } else {
+            process.env.HYDRADB_API_KEY = prevHydraKey;
+        }
+    }
 });

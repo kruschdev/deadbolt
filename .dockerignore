@@ -9,6 +9,9 @@ logs
 *.log
 .git
 .agent
+.antigravity
+.cursor
+.windsurf
 .krusch-stack
 .sw-factory
 .mcp.json

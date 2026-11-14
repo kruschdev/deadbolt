@@ -11,10 +11,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import vm from 'node:vm';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
-import { selectCascadeTier, DEFAULT_FLEET_CASCADE_TIERS } from '@krusch/toolkit/cascade';
+import {
+    selectCascadeTier,
+    DEFAULT_FLEET_CASCADE_TIERS,
+    probeBurstEndpoint
+} from '@krusch/toolkit/cascade';
 import { scoreLegoBrickCoverage } from '@krusch/toolkit/catalog';
-import { validateOutboundUrl } from '@krusch/toolkit/security';
+import { safeFetch, validateOutboundUrl } from '@krusch/toolkit/security';
 import { chat } from '@krusch/toolkit/llm';
 import { normalizeGitHubRepoInput } from './planner-graph.js';
 import { parseReviewerVerdictPayload } from './validator-gate.js';
@@ -51,6 +56,14 @@ function isSensitiveLocalPath(absPath) {
 
 const SCHEMA_OR_CONFIG_HINT_RE = /(?:schema|init|migrat|config|common|db|database|env|types|constants)\.(?:sql|php|js|mjs|ts)$/i;
 const DOMAIN_CRITICAL_HINT_RE = /(?:fee|settle|sox|reconcil|transact|order|payment|invoice|ledger|allocat|auth|session|update-single|checkout|tax|vat)/i;
+const FINANCIAL_ROUNDING_RULE_RE =
+    /(?:php-float-currency-math|float-currency|float.*currency|currency.*rounding|sox.*reconcil)/i;
+
+const DEFAULT_REVIEWER_MODEL_A = 'deepseek/deepseek-chat-v3-0324';
+const DEFAULT_REVIEWER_FALLBACK_MODEL_A = 'deepseek/deepseek-v3.2';
+const DEFAULT_REVIEWER_MODEL_B = 'google/gemini-2.5-flash-lite';
+const DEFAULT_REVIEWER_FALLBACK_MODEL_B = 'google/gemini-2.5-flash';
+const OLLAMA_PROBE_TTL_MS = 30_000;
 
 /**
  * Exact published API token rates (USD per 1,000,000 tokens) from live OpenRouter catalog (2026-11-14).
@@ -62,8 +75,14 @@ const MODEL_RATES_PER_1M = Object.freeze({
     'google/gemini-4-argon': { in: 2.00, out: 10.00 },
     'gemini-4-argon': { in: 2.00, out: 10.00 },
     'openai/gpt-5.6-terra': { in: 2.00, out: 12.00 },
+    'deepseek/deepseek-chat-v3-0324': { in: 0.27, out: 1.10 },
+    'deepseek/deepseek-v3.2': { in: 0.27, out: 1.10 },
     'deepseek/deepseek-v4.1-flash': { in: 0.0507, out: 0.2028 },
     'deepseek/deepseek-v4-pro': { in: 0.90, out: 1.50 },
+    'google/gemini-2.5-flash-lite': { in: 0.10, out: 0.40 },
+    'gemini-2.5-flash-lite': { in: 0.10, out: 0.40 },
+    'google/gemini-2.5-flash': { in: 0.30, out: 2.50 },
+    'gemini-2.5-flash': { in: 0.30, out: 2.50 },
     'google/gemini-3.5-flash-lite': { in: 0.30, out: 2.50 },
     'google/gemini-3.8-flash': { in: 0.825, out: 4.125 },
     'gemini-3.8-flash': { in: 0.825, out: 4.125 }
@@ -91,6 +110,16 @@ function estimateTokenCount(text = '') {
     return len === 0 ? 0 : Math.max(1, Math.ceil(len / 3.8));
 }
 
+function hasMeasuredTokenUsage(usage) {
+    return (
+        Boolean(usage) &&
+        Number.isFinite(Number(usage.inputTokens)) &&
+        Number(usage.inputTokens) > 0 &&
+        Number.isFinite(Number(usage.outputTokens)) &&
+        Number(usage.outputTokens) > 0
+    );
+}
+
 function deriveRepoVertexId(repoSlug, relPath) {
     const seed = `${repoSlug}::${relPath}`;
     let hash = 2166136261;
@@ -102,7 +131,9 @@ function deriveRepoVertexId(repoSlug, relPath) {
 }
 
 function extractCleanCodeBlock(rawText = '') {
-    const trimmed = String(rawText || '').trim();
+    const trimmed = String(rawText || '')
+        .replace(/<think\b[^>]*>[\s\S]*?(?:<\/think>|$)/gi, ' ')
+        .trim();
     const fenceMatch = /```(?:[A-Za-z0-9_+-]+)?\s*\n([\s\S]*?)```/.exec(trimmed);
     if (fenceMatch && fenceMatch[1].trim().length > 0) {
         return `${fenceMatch[1].trim()}\n`;
@@ -112,6 +143,399 @@ function extractCleanCodeBlock(rawText = '') {
         .replace(/\s*```$/i, '')
         .trim();
     return stripped ? `${stripped}\n` : '';
+}
+
+function canPrecedeRegexLiteral(prevToken = '') {
+    return (
+        !prevToken ||
+        prevToken === '(' ||
+        prevToken === '[' ||
+        prevToken === '{' ||
+        prevToken === '}' ||
+        prevToken === ',' ||
+        prevToken === ';' ||
+        prevToken === ':' ||
+        prevToken === '=' ||
+        prevToken === '!' ||
+        prevToken === '&' ||
+        prevToken === '|' ||
+        prevToken === '?' ||
+        prevToken === '+' ||
+        prevToken === '-' ||
+        prevToken === '*' ||
+        prevToken === '%' ||
+        prevToken === '^' ||
+        prevToken === '~' ||
+        prevToken === '<' ||
+        prevToken === '>' ||
+        prevToken === 'return' ||
+        prevToken === 'case' ||
+        prevToken === 'throw' ||
+        prevToken === 'typeof' ||
+        prevToken === 'void' ||
+        prevToken === 'delete' ||
+        prevToken === 'in' ||
+        prevToken === 'of' ||
+        prevToken === 'instanceof' ||
+        prevToken === 'new' ||
+        prevToken === 'await' ||
+        prevToken === 'yield'
+    );
+}
+
+/**
+ * Verify in <0.5ms that a candidate ESM module:
+ * 1. Imports/references `@krusch/toolkit/` and `okEnvelope`,
+ * 2. Declares at least one top-level `export `,
+ * 3. Contains no unterminated string/template/comment/regex literals and has balanced `{}` / `()` / `[]`,
+ * 4. Compiles cleanly as JavaScript syntax via `new vm.Script(...)` after top-level ESM keyword normalization.
+ */
+export function isStructurallyCompleteGoldenBrickModule(rawCode = '') {
+    const code = String(rawCode || '');
+    if (!code.trim()) {
+        return false;
+    }
+    if (!code.includes('@krusch/toolkit/') || !/\bokEnvelope\b/.test(code)) {
+        return false;
+    }
+
+    const len = code.length;
+    let i = 0;
+    /** @type {'NORMAL' | 'SINGLE' | 'DOUBLE' | 'TEMPLATE' | 'BLOCK_COMMENT' | 'REGEX'} */
+    let mode = 'NORMAL';
+    let inRegexCharClass = false;
+    /** @type {Array<'{' | '(' | '[' | '${'>} */
+    const bracketStack = [];
+    /** @type {Array<{ kind: 'import' | 'export', outIdx: number }>} */
+    const topLevelKeywords = [];
+    let lastSignificantToken = '';
+    let hasTopLevelExport = false;
+    let hasOkEnvelopeOutsideComments = false;
+    let commentFree = '';
+
+    while (i < len) {
+        const ch = code[i];
+        const next = i + 1 < len ? code[i + 1] : '';
+
+        if (mode === 'SINGLE') {
+            if (ch === '\\') {
+                if (i + 1 >= len) return false;
+                commentFree += ch + next;
+                i += 2;
+                continue;
+            }
+            if (ch === '\n' || ch === '\r') {
+                return false;
+            }
+            commentFree += ch;
+            if (ch === "'") {
+                mode = 'NORMAL';
+                lastSignificantToken = "'";
+            }
+            i += 1;
+            continue;
+        }
+
+        if (mode === 'DOUBLE') {
+            if (ch === '\\') {
+                if (i + 1 >= len) return false;
+                commentFree += ch + next;
+                i += 2;
+                continue;
+            }
+            if (ch === '\n' || ch === '\r') {
+                return false;
+            }
+            commentFree += ch;
+            if (ch === '"') {
+                mode = 'NORMAL';
+                lastSignificantToken = '"';
+            }
+            i += 1;
+            continue;
+        }
+
+        if (mode === 'TEMPLATE') {
+            if (ch === '\\') {
+                if (i + 1 >= len) return false;
+                commentFree += ch + next;
+                i += 2;
+                continue;
+            }
+            if (ch === '$' && next === '{') {
+                commentFree += '${';
+                bracketStack.push('${');
+                mode = 'NORMAL';
+                lastSignificantToken = '{';
+                i += 2;
+                continue;
+            }
+            commentFree += ch;
+            if (ch === '`') {
+                mode = 'NORMAL';
+                lastSignificantToken = '`';
+            }
+            i += 1;
+            continue;
+        }
+
+        if (mode === 'BLOCK_COMMENT') {
+            if (ch === '*' && next === '/') {
+                commentFree += ' ';
+                mode = 'NORMAL';
+                i += 2;
+                continue;
+            }
+            if (ch === '\n' || ch === '\r') {
+                commentFree += ch;
+            }
+            i += 1;
+            continue;
+        }
+
+        if (mode === 'REGEX') {
+            if (ch === '\\') {
+                if (i + 1 >= len || next === '\n' || next === '\r') return false;
+                commentFree += ch + next;
+                i += 2;
+                continue;
+            }
+            if (ch === '\n' || ch === '\r') {
+                return false;
+            }
+            if (ch === '[') {
+                inRegexCharClass = true;
+            } else if (ch === ']') {
+                inRegexCharClass = false;
+            } else if (ch === '/' && !inRegexCharClass) {
+                mode = 'NORMAL';
+                lastSignificantToken = '/';
+            }
+            commentFree += ch;
+            i += 1;
+            continue;
+        }
+
+        // mode === 'NORMAL'
+        if (ch === '/' && next === '/') {
+            i += 2;
+            while (i < len && code[i] !== '\n' && code[i] !== '\r') {
+                i += 1;
+            }
+            commentFree += ' ';
+            continue;
+        }
+
+        if (ch === '/' && next === '*') {
+            mode = 'BLOCK_COMMENT';
+            i += 2;
+            continue;
+        }
+
+        if (ch === "'") {
+            mode = 'SINGLE';
+            commentFree += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '"') {
+            mode = 'DOUBLE';
+            commentFree += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '`') {
+            mode = 'TEMPLATE';
+            commentFree += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '/' && canPrecedeRegexLiteral(lastSignificantToken)) {
+            mode = 'REGEX';
+            inRegexCharClass = false;
+            commentFree += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '{' || ch === '(' || ch === '[') {
+            bracketStack.push(ch);
+            lastSignificantToken = ch;
+            commentFree += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '}') {
+            if (bracketStack.length === 0) return false;
+            const top = bracketStack.pop();
+            if (top === '${') {
+                mode = 'TEMPLATE';
+                commentFree += ch;
+                i += 1;
+                continue;
+            }
+            if (top !== '{') return false;
+            lastSignificantToken = ch;
+            commentFree += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === ')') {
+            if (bracketStack.length === 0 || bracketStack.pop() !== '(') return false;
+            lastSignificantToken = ch;
+            commentFree += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === ']') {
+            if (bracketStack.length === 0 || bracketStack.pop() !== '[') return false;
+            lastSignificantToken = ch;
+            commentFree += ch;
+            i += 1;
+            continue;
+        }
+
+        if (/[A-Za-z_$]/.test(ch)) {
+            let end = i + 1;
+            while (end < len && /[A-Za-z0-9_$]/.test(code[end])) {
+                end += 1;
+            }
+            const word = code.slice(i, end);
+            if (word === 'okEnvelope' && lastSignificantToken !== '.') {
+                hasOkEnvelopeOutsideComments = true;
+            }
+
+            if (word === 'import' && lastSignificantToken !== '.') {
+                let look = end;
+                while (look < len && /\s/.test(code[look])) {
+                    look += 1;
+                }
+                if (code[look] === '.' && code.slice(look + 1, look + 5) === 'meta') {
+                    let afterMeta = look + 5;
+                    if (afterMeta >= len || !/[A-Za-z0-9_$]/.test(code[afterMeta])) {
+                        commentFree += '({})';
+                        lastSignificantToken = ')';
+                        i = afterMeta;
+                        continue;
+                    }
+                }
+                if (bracketStack.length === 0 && code[look] !== '(' && code[look] !== '.') {
+                    topLevelKeywords.push({ kind: 'import', outIdx: commentFree.length });
+                }
+            } else if (word === 'export' && lastSignificantToken !== '.' && bracketStack.length === 0) {
+                let look = end;
+                while (look < len && /[ \t]/.test(code[look])) {
+                    look += 1;
+                }
+                if (look > end || code[look] === '{' || code[look] === '*') {
+                    hasTopLevelExport = true;
+                }
+                topLevelKeywords.push({ kind: 'export', outIdx: commentFree.length });
+            }
+
+            commentFree += word;
+            lastSignificantToken = word;
+            i = end;
+            continue;
+        }
+
+        if (!/\s/.test(ch)) {
+            lastSignificantToken = ch;
+        }
+        commentFree += ch;
+        i += 1;
+    }
+
+    if (mode !== 'NORMAL' || bracketStack.length !== 0) {
+        return false;
+    }
+    if (!hasTopLevelExport || !hasOkEnvelopeOutsideComments) {
+        return false;
+    }
+
+    // Transform recorded top-level ESM import/export statements in reverse offset order for vm.Script compilation
+    let normalizedScript = commentFree;
+    for (let k = topLevelKeywords.length - 1; k >= 0; k -= 1) {
+        const { kind, outIdx } = topLevelKeywords[k];
+        const tail = normalizedScript.slice(outIdx);
+
+        if (kind === 'import') {
+            const importMatch =
+                /^import\s+(?:['"][^'"\r\n]+['"]|[\s\S]*?\bfrom\s*['"][^'"\r\n]+['"])(?:\s+(?:with|assert)\s*\{[^}]*\})?\s*;?/.exec(
+                    tail
+                );
+            if (!importMatch) {
+                return false;
+            }
+            normalizedScript = `${normalizedScript.slice(0, outIdx)};${tail.slice(importMatch[0].length)}`;
+            continue;
+        }
+
+        // kind === 'export'
+        const namedDeclMatch =
+            /^export\s+(?=(?:async\s+function|function|class|const|let|var)\b)/.exec(tail);
+        if (namedDeclMatch) {
+            normalizedScript = `${normalizedScript.slice(0, outIdx)}${tail.slice(namedDeclMatch[0].length)}`;
+            continue;
+        }
+
+        const defaultNamedDeclMatch =
+            /^export\s+default\s+(?=(?:async\s+)?function\s+[A-Za-z_$]|class\s+[A-Za-z_$])/.exec(tail);
+        if (defaultNamedDeclMatch) {
+            normalizedScript = `${normalizedScript.slice(0, outIdx)}${tail.slice(defaultNamedDeclMatch[0].length)}`;
+            continue;
+        }
+
+        const defaultExprMatch = /^export\s+default\b/.exec(tail);
+        if (defaultExprMatch) {
+            normalizedScript = `${normalizedScript.slice(0, outIdx)}var __deadbolt_default__ = ${tail.slice(defaultExprMatch[0].length)}`;
+            continue;
+        }
+
+        const reExportAllMatch =
+            /^export\s*\*(?:\s+as\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s+from\s*['"][^'"\r\n]+['"]\s*;?/.exec(
+                tail
+            );
+        if (reExportAllMatch) {
+            normalizedScript = `${normalizedScript.slice(0, outIdx)};${tail.slice(reExportAllMatch[0].length)}`;
+            continue;
+        }
+
+        const reExportNamedMatch = /^export\s*\{([^}]*)\}\s*from\s*['"][^'"\r\n]+['"]\s*;?/.exec(
+            tail
+        );
+        if (reExportNamedMatch) {
+            normalizedScript = `${normalizedScript.slice(0, outIdx)};${tail.slice(reExportNamedMatch[0].length)}`;
+            continue;
+        }
+
+        const localExportListMatch = /^export\s*\{([^}]*)\}\s*;?/.exec(tail);
+        if (localExportListMatch) {
+            const locals = localExportListMatch[1]
+                .split(',')
+                .map((part) => part.trim().split(/\s+as\s+/)[0].trim())
+                .filter(Boolean);
+            const replacement = locals.length > 0 ? `void [${locals.join(', ')}];` : ';';
+            normalizedScript = `${normalizedScript.slice(0, outIdx)}${replacement}${tail.slice(localExportListMatch[0].length)}`;
+            continue;
+        }
+
+        return false;
+    }
+
+    try {
+        // Compile-only syntax check (never executed)
+        new vm.Script(`(async function __deadboltModuleSyntaxCheck__() {\n${normalizedScript}\n});`);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 const DIRECT_ESM_TARGET_EXT_RE = /\.(?:js|mjs|ts)$/i;
@@ -156,12 +580,83 @@ export function toTargetModernizedPath(relPath = '') {
     return `src/modernized/${stem}.route.js`;
 }
 
+function buildDisambiguatedModernizedPath(relPath = '', seenPaths = new Set(), forceDisambiguate = false) {
+    const primary = toTargetModernizedPath(relPath);
+    if (!forceDisambiguate && !seenPaths.has(primary)) {
+        seenPaths.add(primary);
+        return primary;
+    }
+
+    const normalized = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    const extMatch = /\.([A-Za-z0-9]+)$/.exec(normalized);
+    const extSlug = extMatch ? extMatch[1].toLowerCase() : '';
+    const withoutExt = normalized.replace(/\.[A-Za-z0-9]+$/, '');
+    const fullSegments = withoutExt
+        .split('/')
+        .filter(Boolean)
+        .map((seg) => {
+            const safe = seg.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'mod';
+            if (EXEMPT_OR_TEST_SEGMENT_RE.test(safe)) return 'module';
+            if (/^test[_-]/i.test(safe)) return safe.replace(/^test[_-]/i, 'check-');
+            return safe;
+        });
+
+    const flatStem = fullSegments.join('-') || 'legacy-route';
+    const candidateList = [
+        `src/modernized/${flatStem}.route.js`,
+        ...(extSlug ? [`src/modernized/${flatStem}-${extSlug}.route.js`] : [])
+    ];
+
+    for (const cand of candidateList) {
+        if (!seenPaths.has(cand)) {
+            seenPaths.add(cand);
+            return cand;
+        }
+    }
+
+    let suffix = 2;
+    while (seenPaths.has(`src/modernized/${flatStem}-${suffix}.route.js`)) {
+        suffix += 1;
+    }
+    const uniqueFallback = `src/modernized/${flatStem}-${suffix}.route.js`;
+    seenPaths.add(uniqueFallback);
+    return uniqueFallback;
+}
+
+function assignUniqueWaveModernizedPaths(items = []) {
+    const primaryCounts = new Map();
+    for (const item of items) {
+        const p = toTargetModernizedPath(item.filePath);
+        primaryCounts.set(p, (primaryCounts.get(p) || 0) + 1);
+    }
+
+    const seenPaths = new Set();
+    return items.map((item) => {
+        const primary = toTargetModernizedPath(item.filePath);
+        const normalized = String(item.filePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+        const segCount = normalized.split('/').filter(Boolean).length;
+        // When multiple wave files map to the same primary target (e.g. `user.py` and `src/user.py`),
+        // let root-level single-segment files claim `primary` and disambiguate nested directory paths first.
+        const forceDisambiguate = (primaryCounts.get(primary) || 0) > 1 && segCount > 1;
+        const resolved = buildDisambiguatedModernizedPath(item.filePath, seenPaths, forceDisambiguate);
+        return {
+            ...item,
+            modernizedPath: resolved,
+            targetPath: resolved
+        };
+    });
+}
+
 /**
  * Deterministic Golden Brick synthesizer used for offline/ephemeral unit tests or if network drops,
- * and as a guaranteed zero-slop reference repair if a fast tier leaves an anti-pattern.
+ * and as an enforced zero-slop reference repair if a fast tier leaves an anti-pattern.
  */
 function buildDeterministicGoldenBrickModule({ relPath, targetPath, findings = [], neighborPaths = [] }) {
     const safeSource = String(relPath || 'legacy-module').replace(/[^A-Za-z0-9._/-]/g, '');
+    const safeTarget = String(targetPath || 'src/modernized/module.route.js').replace(
+        /[^A-Za-z0-9._/-]/g,
+        ''
+    );
     const ruleSummary = findings.map((f) => f.ruleId || 'legacy-hazard').slice(0, 3).join(', ') || 'legacy-plumbing';
     const hopSummary = neighborPaths.slice(0, 3).join(', ') || 'leaf-module';
 
@@ -198,7 +693,7 @@ function buildDeterministicGoldenBrickModule({ relPath, targetPath, findings = [
             `  floors.sort((a, b) => a.index - b.index);`,
             `  return okEnvelope('modernized.domain.allocate', 'Verified integer cent allocation', {`,
             `    sourceFile: '${safeSource}',`,
-            `    targetPath: '${targetPath}',`,
+            `    targetPath: '${safeTarget}',`,
             `    totalGrossCents,`,
             `    targetFeeCents,`,
             `    lineFeesCents: floors.map((f) => f.base)`,
@@ -234,7 +729,7 @@ function buildDeterministicGoldenBrickModule({ relPath, targetPath, findings = [
         `  const nextToken = page.hasMore ? encodeCursor({ offset: clampedLimit }) : null;`,
         `  return okEnvelope('modernized.leaf.route', 'Served via sealed Golden Bricks', {`,
         `    sourceFile: '${safeSource}',`,
-        `    targetPath: '${targetPath}',`,
+        `    targetPath: '${safeTarget}',`,
         `    items: page.items ?? items.slice(0, clampedLimit),`,
         `    nextCursor: nextToken`,
         `  });`,
@@ -277,7 +772,7 @@ function buildOfflineUngovernedBaselineSnippet({ relPath }) {
 /**
  * Select up to 3 representative modernization targets from scanned files:
  * - Up to 2 bounded leaf/plumbing modules (routed to L1_FAST)
- * - Up to 1 multi-hop or domain-critical seam module (routed to L3_FRONTIER_ARGON)
+ * - Up to 1 multi-hop (`inDegree >= 2`) or financial/currency rounding seam module (routed to L3_FRONTIER_ARGON only when `wave.length >= 2`)
  */
 export function selectModernizationWave({ fileEntries = [], findings = [], edges = [], requestedFile = '' }) {
     const findingsByFile = new Map();
@@ -303,13 +798,18 @@ export function selectModernizationWave({ fileEntries = [], findings = [], edges
         const inbound = [...(inboundMap.get(entry.filePath) || [])];
         const outbound = [...(outboundMap.get(entry.filePath) || [])];
         const isNoiseFile = TEST_OR_CONFIG_NOISE_RE.test(entry.filePath);
-        const isDomainSeam =
-            !isNoiseFile &&
-            (DOMAIN_CRITICAL_HINT_RE.test(entry.filePath) ||
-                inbound.length >= 2 ||
-                fileFindings.some((f) =>
-                    /(?:float|currency|ssrf|rbac|auth|sql|hmac|reconcil)/i.test(String(f.ruleId || ''))
-                ));
+        const hasFinancialRoundingHazard = fileFindings.some((f) =>
+            FINANCIAL_ROUNDING_RULE_RE.test(String(f.ruleId || ''))
+        );
+        const qualifiesForFrontierSeam =
+            !isNoiseFile && (inbound.length >= 2 || hasFinancialRoundingHazard);
+        const isDomainCandidate =
+            qualifiesForFrontierSeam ||
+            (!isNoiseFile &&
+                (DOMAIN_CRITICAL_HINT_RE.test(entry.filePath) ||
+                    fileFindings.some((f) =>
+                        /(?:ssrf|rbac|auth|sql|hmac)/i.test(String(f.ruleId || ''))
+                    )));
         return {
             filePath: entry.filePath,
             content: entry.content,
@@ -319,7 +819,10 @@ export function selectModernizationWave({ fileEntries = [], findings = [], edges
             inboundCallers: inbound,
             outboundDeps: outbound,
             isNoiseFile,
-            isDomainSeam
+            hasFinancialRoundingHazard,
+            qualifiesForFrontierSeam,
+            isDomainSeam: qualifiesForFrontierSeam,
+            isDomainCandidate
         };
     });
 
@@ -331,7 +834,7 @@ export function selectModernizationWave({ fileEntries = [], findings = [], edges
         ? nonNoiseCandidates.filter((c) => c.findingCount > 0)
         : nonNoiseCandidates;
 
-    const picked = [];
+    const rawPicked = [];
     const used = new Set();
 
     const cleanRequested = String(requestedFile || '')
@@ -343,39 +846,38 @@ export function selectModernizationWave({ fileEntries = [], findings = [], edges
             candidates.find((c) => c.filePath === cleanRequested) ||
             candidates.find((c) => cleanRequested.endsWith(`/${c.filePath}`));
         if (matched) {
-            picked.push({ ...matched, role: matched.isDomainSeam ? 'domain_seam' : 'leaf_plumbing' });
+            rawPicked.push(matched);
             used.add(matched.filePath);
         }
     }
 
-    // Pick 1 domain/multi-hop seam (reserved for genuine domain seams or >=3-file Strangler-Fig waves)
-    const domainSorted = [...flaggedOrAll]
-        .filter((c) => !used.has(c.filePath))
+    // Prefer genuine multi-hop (`inDegree >= 2`) or financial rounding seam when building a multi-file wave
+    const seamSorted = [...flaggedOrAll]
+        .filter((c) => !used.has(c.filePath) && c.qualifiesForFrontierSeam)
         .sort((a, b) => {
             const scoreA =
-                (a.isDomainSeam ? 10 : 0) +
-                a.inboundCallers.length * 3 +
+                (a.hasFinancialRoundingHazard ? 12 : 0) +
+                a.inboundCallers.length * 4 +
                 a.findingCount -
                 (a.isNoiseFile ? 8 : 0);
             const scoreB =
-                (b.isDomainSeam ? 10 : 0) +
-                b.inboundCallers.length * 3 +
+                (b.hasFinancialRoundingHazard ? 12 : 0) +
+                b.inboundCallers.length * 4 +
                 b.findingCount -
                 (b.isNoiseFile ? 8 : 0);
             return scoreB - scoreA;
         });
 
     if (
-        domainSorted.length > 0 &&
-        !picked.some((p) => p.role === 'domain_seam') &&
-        (domainSorted[0].isDomainSeam || candidates.length >= 3)
+        seamSorted.length > 0 &&
+        candidates.length >= 2 &&
+        !rawPicked.some((p) => p.qualifiesForFrontierSeam)
     ) {
-        const seam = domainSorted[0];
-        picked.push({ ...seam, role: 'domain_seam' });
-        used.add(seam.filePath);
+        rawPicked.push(seamSorted[0]);
+        used.add(seamSorted[0].filePath);
     }
 
-    // Pick bounded leaf/plumbing modules (80% cascade fast-tier work)
+    // Fill remaining wave slots (up to 3 total) with bounded leaf/plumbing modules
     const leafSorted = [...flaggedOrAll, ...nonNoiseCandidates, ...candidates]
         .filter((c) => !used.has(c.filePath))
         .sort((a, b) => {
@@ -393,15 +895,45 @@ export function selectModernizationWave({ fileEntries = [], findings = [], edges
         });
 
     for (const cand of leafSorted) {
-        if (picked.length >= 3) break;
+        if (rawPicked.length >= 3) break;
         if (used.has(cand.filePath)) continue;
-        picked.push({ ...cand, role: 'leaf_plumbing' });
+        rawPicked.push(cand);
         used.add(cand.filePath);
     }
 
-    // Order leaves first, domain seam last (Strangler-Fig leaf -> seam order)
-    picked.sort((a, b) => (a.role === 'leaf_plumbing' ? -1 : 1) - (b.role === 'leaf_plumbing' ? -1 : 1));
-    return { wave: picked, inboundMap, outboundMap };
+    // Only promote at most 1 file to `domain_seam` (L3_FRONTIER) when wave.length >= 2 AND
+    // (inDegree >= 2 or financial/currency rounding hazard). 1-file micro-repos stay on L1_FAST.
+    let promotedFilePath = null;
+    if (rawPicked.length >= 2) {
+        const eligibleSeams = rawPicked
+            .filter((item) => item.qualifiesForFrontierSeam)
+            .sort((a, b) => {
+                const scoreA =
+                    (a.hasFinancialRoundingHazard ? 12 : 0) +
+                    a.inboundCallers.length * 4 +
+                    a.findingCount;
+                const scoreB =
+                    (b.hasFinancialRoundingHazard ? 12 : 0) +
+                    b.inboundCallers.length * 4 +
+                    b.findingCount;
+                return scoreB - scoreA;
+            });
+        if (eligibleSeams.length > 0) {
+            promotedFilePath = eligibleSeams[0].filePath;
+        }
+    }
+
+    const pickedWithRoles = rawPicked.map((item) => ({
+        ...item,
+        role: item.filePath === promotedFilePath ? 'domain_seam' : 'leaf_plumbing'
+    }));
+
+    // Order leaves first, domain seam last (Strangler-Fig leaf -> seam order), then deduplicate target paths
+    pickedWithRoles.sort(
+        (a, b) => (a.role === 'leaf_plumbing' ? -1 : 1) - (b.role === 'leaf_plumbing' ? -1 : 1)
+    );
+    const deduplicatedWave = assignUniqueWaveModernizedPaths(pickedWithRoles);
+    return { wave: deduplicatedWave, inboundMap, outboundMap };
 }
 
 /**
@@ -416,6 +948,83 @@ export function createModernizerBenchmarkEngine({
     sponsors = null,
     llmConfig = {}
 } = {}) {
+    /** @type {Map<string, { reachable: boolean, expiresAt: number }>} */
+    const ollamaReachabilityCache = new Map();
+
+    async function probeOllamaTagsReachable(rawOllamaUrl = '') {
+        const cleanBase = String(rawOllamaUrl || '').trim().replace(/\/+$/, '');
+        if (!cleanBase) {
+            return false;
+        }
+        if (
+            typeof llmConfig.chatImpl === 'function' &&
+            typeof llmConfig.ollamaProbeFetchImpl !== 'function' &&
+            typeof llmConfig.fetchImpl !== 'function' &&
+            llmConfig.forceOllamaProbe !== true
+        ) {
+            return true;
+        }
+
+        const now = Date.now();
+        const cached = ollamaReachabilityCache.get(cleanBase);
+        if (cached && cached.expiresAt > now) {
+            return cached.reachable;
+        }
+
+        const tagsUrl = `${cleanBase}/api/tags`;
+        const probeFetchImpl =
+            typeof llmConfig.ollamaProbeFetchImpl === 'function'
+                ? llmConfig.ollamaProbeFetchImpl
+                : typeof llmConfig.fetchImpl === 'function'
+                  ? llmConfig.fetchImpl
+                  : undefined;
+
+        let reachable = false;
+        const probeEnv = await safeFetch(
+            tagsUrl,
+            { method: 'GET', headers: { Accept: 'application/json' } },
+            {
+                timeoutMs: 1500,
+                allowPrivateLan: true,
+                allowTailscale: true,
+                ...(probeFetchImpl ? { fetchImpl: probeFetchImpl } : {}),
+                tool: 'deadbolt.modernizer.ollama_probe'
+            }
+        );
+
+        if (probeEnv.ok) {
+            const status = Number(probeEnv.data?.status || 0);
+            reachable = status >= 200 && status < 300;
+            probeEnv.data?.response?.body?.cancel?.().catch(() => {});
+        } else if (probeEnv.error?.code === 'SSRF_PRIVATE_IP') {
+            try {
+                const parsed = new URL(cleanBase);
+                const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+                if (host === '127.0.0.1' || host === 'localhost' || host === '::1') {
+                    const burstEnv = await probeBurstEndpoint(cleanBase, {
+                        timeoutMs: 1500,
+                        ...(probeFetchImpl ? { fetchImpl: probeFetchImpl } : {}),
+                        tool: 'deadbolt.modernizer.ollama_probe'
+                    });
+                    reachable = Boolean(burstEnv.ok || burstEnv.data?.reachable === true);
+                }
+            } catch {
+                reachable = false;
+            }
+        }
+
+        while (ollamaReachabilityCache.size >= 16) {
+            const oldestKey = ollamaReachabilityCache.keys().next().value;
+            if (!oldestKey) break;
+            ollamaReachabilityCache.delete(oldestKey);
+        }
+        ollamaReachabilityCache.set(cleanBase, {
+            reachable,
+            expiresAt: Date.now() + OLLAMA_PROBE_TTL_MS
+        });
+        return reachable;
+    }
+
     /**
      * Clone or copy target repository into an ephemeral working directory so we can both scan AND stage verified diffs.
      */
@@ -911,7 +1520,10 @@ export function createModernizerBenchmarkEngine({
                     ? {
                           provider: 'openrouter',
                           apiKey: llmConfig.openRouterApiKey || '',
-                          model: 'google/gemini-4-argon'
+                          model:
+                              llmConfig.frontierBackupModel ||
+                              process.env.DEADBOLT_FRONTIER_BACKUP_MODEL ||
+                              DEFAULT_REVIEWER_MODEL_A
                       }
                     : {
                           provider: 'gemini',
@@ -951,7 +1563,7 @@ export function createModernizerBenchmarkEngine({
                 }
             }
 
-            // Resolve Cascade L1_FAST config (local Ollama GPU at $0.00 if configured, with fast cloud fallback)
+            // Resolve Cascade L1_FAST config (local Ollama GPU at $0.00 if reachable, with live fast cloud fallback)
             const hasLocalGpu = Boolean(llmConfig.ollamaUrl) && !llmConfig.preferCloudFastTier;
             const localFastConfig = hasLocalGpu
                 ? {
@@ -967,7 +1579,10 @@ export function createModernizerBenchmarkEngine({
                     ? {
                           provider: 'openrouter',
                           apiKey: llmConfig.openRouterApiKey || '',
-                          model: 'deepseek/deepseek-v4.1-flash'
+                          model:
+                              llmConfig.cloudFastModel ||
+                              process.env.DEADBOLT_CLOUD_FAST_MODEL ||
+                              DEFAULT_REVIEWER_MODEL_B
                       }
                     : {
                           provider: 'gemini',
@@ -975,30 +1590,75 @@ export function createModernizerBenchmarkEngine({
                           model: 'gemini-3.8-flash'
                       };
 
-            // Run <25us Cascade Router per file in the wave
+            const cloudFastBackupConfig =
+                llmConfig.openRouterApiKey || !llmConfig.geminiApiKey
+                    ? {
+                          provider: 'openrouter',
+                          apiKey: llmConfig.openRouterApiKey || '',
+                          model:
+                              llmConfig.cloudFastBackupModel ||
+                              process.env.DEADBOLT_CLOUD_FAST_BACKUP_MODEL ||
+                              DEFAULT_REVIEWER_MODEL_A
+                      }
+                    : {
+                          provider: 'gemini',
+                          apiKey: llmConfig.geminiApiKey || '',
+                          model: 'gemini-3.8-flash'
+                      };
+
+            const reviewerPrimaryModelA =
+                llmConfig.openRouterModel ||
+                llmConfig.reviewerModelA ||
+                process.env.DEADBOLT_REVIEWER_MODEL_A ||
+                DEFAULT_REVIEWER_MODEL_A;
+            const reviewerFallbackModelA =
+                llmConfig.reviewerFallbackModelA ||
+                process.env.DEADBOLT_REVIEWER_FALLBACK_MODEL_A ||
+                DEFAULT_REVIEWER_FALLBACK_MODEL_A;
+            const reviewerPrimaryModelB =
+                llmConfig.openRouterSecondaryModel ||
+                llmConfig.reviewerModelB ||
+                process.env.DEADBOLT_REVIEWER_MODEL_B ||
+                DEFAULT_REVIEWER_MODEL_B;
+            const reviewerFallbackModelB =
+                llmConfig.reviewerFallbackModelB ||
+                process.env.DEADBOLT_REVIEWER_FALLBACK_MODEL_B ||
+                DEFAULT_REVIEWER_FALLBACK_MODEL_B;
+
+            // Run <25us Cascade Router per file in the collision-safe wave
             const customTiers = DEFAULT_FLEET_CASCADE_TIERS;
+            const collisionSafeWave = assignUniqueWaveModernizedPaths(wave);
             let totalRouteNs = 0n;
-            const routedWave = wave.map((item) => {
-                const complexityScore = item.role === 'domain_seam' ? 0.88 : 0.22;
-                const t0 = process.hrtime.bigint();
-                const routeEnv = selectCascadeTier(
-                    {
-                        complexityScore,
-                        taskClass: item.role === 'domain_seam' ? 'domain_reconciliation' : 'bounded_plumbing',
-                        estimatedTokens: 1800
-                    },
-                    { tiers: customTiers }
+            const routedWave = collisionSafeWave.map((item) => {
+                const hasFinancialRoundingHazard = (item.findings || []).some((f) =>
+                    FINANCIAL_ROUNDING_RULE_RE.test(String(f.ruleId || ''))
                 );
+                const isPromotedDomainSeam =
+                    collisionSafeWave.length >= 2 &&
+                    item.role === 'domain_seam' &&
+                    ((item.inboundCallers?.length ?? 0) >= 2 || hasFinancialRoundingHazard);
+                const effectiveRole = isPromotedDomainSeam ? 'domain_seam' : 'leaf_plumbing';
+                const complexityScore = isPromotedDomainSeam ? 0.88 : 0.22;
+                const t0 = process.hrtime.bigint();
+                const routeEnv = selectCascadeTier({
+                    complexityScore,
+                    taskClass: isPromotedDomainSeam ? 'domain_reconciliation' : 'bounded_plumbing',
+                    estimatedTokens: 1800,
+                    tiers: customTiers
+                });
                 const dtNs = process.hrtime.bigint() - t0;
                 totalRouteNs += dtNs;
+                const resolvedTargetPath =
+                    item.modernizedPath || item.targetPath || toTargetModernizedPath(item.filePath);
                 return {
                     ...item,
-                    targetPath: toTargetModernizedPath(item.filePath),
+                    role: effectiveRole,
+                    modernizedPath: resolvedTargetPath,
+                    targetPath: resolvedTargetPath,
                     complexityScore,
-                    selectedTier:
-                        item.role === 'domain_seam'
-                            ? 'L3_FRONTIER_ARGON'
-                            : routeEnv.data?.selectedTier?.id || 'L1_FAST',
+                    selectedTier: isPromotedDomainSeam
+                        ? 'L3_FRONTIER_ARGON'
+                        : routeEnv.data?.selectedTier?.id || 'L1_FAST',
                     routingLatencyUs: Number((Number(dtNs) / 1000).toFixed(2))
                 };
             });
@@ -1027,6 +1687,7 @@ export function createModernizerBenchmarkEngine({
                                 provider: frontierConfig.provider,
                                 inputTokens: inTok,
                                 outputTokens: outTok,
+                                usageEstimated: true,
                                 costUsd: computeExactCallCostUsd(frontierConfig.model, frontierConfig.provider, {
                                     inputTokens: inTok,
                                     outputTokens: outTok
@@ -1045,6 +1706,7 @@ export function createModernizerBenchmarkEngine({
                         const code =
                             extractCleanCodeBlock(res?.text) ||
                             buildOfflineUngovernedBaselineSnippet({ relPath: item.filePath });
+                        const measuredGenUsage = hasMeasuredTokenUsage(res?.usage);
                         const inTok = Number(res?.usage?.inputTokens || estimateTokenCount(sysPrompt + usrPrompt));
                         const outTok = Number(res?.usage?.outputTokens || estimateTokenCount(code));
                         return {
@@ -1055,10 +1717,17 @@ export function createModernizerBenchmarkEngine({
                             provider: usedCfg.provider,
                             inputTokens: inTok,
                             outputTokens: outTok,
-                            costUsd: computeExactCallCostUsd(usedCfg.model, usedCfg.provider, res?.usage || {
-                                inputTokens: inTok,
-                                outputTokens: outTok
-                            }),
+                            usageEstimated: !measuredGenUsage,
+                            costUsd: computeExactCallCostUsd(
+                                usedCfg.model,
+                                usedCfg.provider,
+                                measuredGenUsage
+                                    ? res.usage
+                                    : {
+                                          inputTokens: inTok,
+                                          outputTokens: outTok
+                                      }
+                            ),
                             code
                         };
                     })
@@ -1068,6 +1737,7 @@ export function createModernizerBenchmarkEngine({
                 let reviewInTok = 0;
                 let reviewOutTok = 0;
                 let reviewCostUsd = 0;
+                let reviewUsageEstimated = !hasLiveApi;
                 const combinedDigest = fileReceipts
                     .map((r) => `// ${r.targetPath}\n${r.code}`)
                     .join('\n')
@@ -1084,12 +1754,20 @@ export function createModernizerBenchmarkEngine({
                         temperature: 0.0,
                         timeoutMs: 12_000
                     });
+                    const measuredRev = hasMeasuredTokenUsage(revRes?.usage);
+                    reviewUsageEstimated = !measuredRev;
                     reviewInTok = Number(revRes?.usage?.inputTokens || estimateTokenCount(revSys + revUsr));
                     reviewOutTok = Number(revRes?.usage?.outputTokens || 45);
-                    reviewCostUsd = computeExactCallCostUsd(revCfg.model, revCfg.provider, {
-                        inputTokens: reviewInTok,
-                        outputTokens: reviewOutTok
-                    });
+                    reviewCostUsd = computeExactCallCostUsd(
+                        revCfg.model,
+                        revCfg.provider,
+                        measuredRev
+                            ? revRes.usage
+                            : {
+                                  inputTokens: reviewInTok,
+                                  outputTokens: reviewOutTok
+                              }
+                    );
                 } else {
                     reviewInTok = estimateTokenCount(revSys + revUsr);
                     reviewOutTok = 42;
@@ -1110,6 +1788,10 @@ export function createModernizerBenchmarkEngine({
                 const totalCostUsd = Number(
                     (fileReceipts.reduce((acc, r) => acc + r.costUsd, 0) + reviewCostUsd).toFixed(6)
                 );
+                const armAUsageEstimated =
+                    !hasLiveApi ||
+                    reviewUsageEstimated ||
+                    fileReceipts.some((r) => r.usageEstimated === true);
 
                 const hasSealedBricks = (slopCheck.data.sealedTouchpoints ?? 0) > 0;
                 const effectiveSealedPct = hasSealedBricks
@@ -1121,6 +1803,7 @@ export function createModernizerBenchmarkEngine({
                     modelSummary: `100% ${frontierConfig.model} (${fileReceipts.length} gen + 1 self-review)`,
                     contextMode: 'full_repo_stuffed',
                     executionMode: hasLiveApi ? 'live_api' : 'offline_deterministic',
+                    usageEstimated: armAUsageEstimated,
                     filesProcessed: fileReceipts.length,
                     inputTokens: totalInputTokens,
                     outputTokens: totalOutputTokens,
@@ -1142,6 +1825,7 @@ export function createModernizerBenchmarkEngine({
                         model: r.model,
                         inputTokens: r.inputTokens,
                         outputTokens: r.outputTokens,
+                        usageEstimated: Boolean(r.usageEstimated),
                         costUsd: Number(r.costUsd.toFixed(6))
                     }))
                 };
@@ -1150,6 +1834,16 @@ export function createModernizerBenchmarkEngine({
             const runArmB = async () => {
                 const armStartNs = process.hrtime.bigint();
                 let circuitBreakerEscalations = 0;
+
+                let ollamaProbeReachable = Boolean(localFastConfig);
+                if (
+                    hasLiveApi &&
+                    localFastConfig &&
+                    routedWave.some((w) => w.role !== 'domain_seam')
+                ) {
+                    ollamaProbeReachable = await probeOllamaTagsReachable(llmConfig.ollamaUrl);
+                }
+                const activeLocalFastConfig = ollamaProbeReachable ? localFastConfig : null;
 
                 const fileReceipts = await Promise.all(
                     routedWave.map(async (item) => {
@@ -1166,10 +1860,11 @@ export function createModernizerBenchmarkEngine({
 
                         const sysPrompt = [
                             'You are a DEADBOLT Golden Brick Modernizer.',
-                            'Output ONLY valid Node.js ESM code (under 50 lines) with zero markdown commentary.',
+                            'Output ONLY a complete, syntactically valid Node.js ESM module (under 55 lines) with zero markdown commentary and at least one exported function.',
                             'MANDATORY GOLDEN BRICK INVARIANTS (0 Slop-Breaker findings):',
                             "- Import and call `okEnvelope` / `errorEnvelope` from '@krusch/toolkit/http'.",
-                            "- Never call raw `express()`, `http.createServer`, raw `pg.Pool`, or raw `fetch()` without `@krusch/toolkit/security` `safeFetch`.",
+                            "- Use '@krusch/toolkit/sqlite' (`openSqliteDb` with `?` parameterized SQL), '@krusch/toolkit/security' (`safeFetch`, `validateOutboundUrl`), and '@krusch/toolkit/pagination' (`encodeCursor`, `paginateItems`) as needed.",
+                            "- Never call raw `express()`, `http.createServer`, raw `pg.Pool`, raw `DatabaseSync`, or raw `fetch()`.",
                             "- For monetary math, use integer basis points (`Math.floor` + largest-remainder cent carry), never float rounding."
                         ].join('\n');
 
@@ -1186,7 +1881,7 @@ export function createModernizerBenchmarkEngine({
                         const isDomain = item.role === 'domain_seam';
                         const primaryCfg = isDomain
                             ? frontierConfig
-                            : localFastConfig || cloudFastConfig;
+                            : activeLocalFastConfig || cloudFastConfig;
 
                         if (!hasLiveApi) {
                             const code = buildDeterministicGoldenBrickModule({
@@ -1209,6 +1904,8 @@ export function createModernizerBenchmarkEngine({
                                 provider: activeCfg.provider,
                                 inputTokens: inTok,
                                 outputTokens: outTok,
+                                usageEstimated: true,
+                                repairedBySlopBreaker: false,
                                 costUsd: computeExactCallCostUsd(activeCfg.model, activeCfg.provider, {
                                     inputTokens: inTok,
                                     outputTokens: outTok
@@ -1223,18 +1920,22 @@ export function createModernizerBenchmarkEngine({
                             res = await callImpl(sysPrompt, usrPrompt, primaryCfg, {
                                 returnFullResponse: true,
                                 bypassCascade: true,
-                                maxTokens: 850,
+                                maxTokens: 1200,
                                 temperature: 0.0,
                                 signal: AbortSignal.timeout(isDomain ? 14_000 : 7_500)
                             });
                         } catch {
-                            // Automatic Cascade Circuit-Breaker failover (local GPU -> fast cloud, or primary frontier -> backup frontier)
-                            usedCfg = isDomain ? frontierBackupConfig : cloudFastConfig;
+                            // Automatic Cascade Circuit-Breaker failover (local GPU -> fast cloud -> backup cloud, or primary frontier -> backup frontier)
+                            usedCfg = isDomain
+                                ? frontierBackupConfig
+                                : primaryCfg === cloudFastConfig
+                                  ? cloudFastBackupConfig
+                                  : cloudFastConfig;
                             try {
                                 res = await callImpl(sysPrompt, usrPrompt, usedCfg, {
                                     returnFullResponse: true,
                                     bypassCascade: true,
-                                    maxTokens: 850,
+                                    maxTokens: 1200,
                                     temperature: 0.0,
                                     signal: AbortSignal.timeout(12_000)
                                 });
@@ -1244,12 +1945,22 @@ export function createModernizerBenchmarkEngine({
                         }
 
                         let code = extractCleanCodeBlock(res?.text);
+                        const measuredGenUsage = hasMeasuredTokenUsage(res?.usage);
                         const inTok = Number(res?.usage?.inputTokens || estimateTokenCount(sysPrompt + usrPrompt));
 
-                        // <1ms Deterministic Slop-Breaker Gate on generated module
+                        // <1ms Deterministic Slop-Breaker + Structural ESM Completeness Gate BEFORE Stage 4 review
                         const fileSlop = scoreLegoBrickCoverage([{ filePath: item.targetPath, content: code }]);
-                        if (!code || fileSlop.data.slopFindingCount > 0 || fileSlop.data.sealedTouchpoints === 0) {
+                        const slopBreakerClean =
+                            Boolean(code) &&
+                            fileSlop.data.slopFindingCount === 0 &&
+                            (fileSlop.data.sealedTouchpoints ?? 0) > 0;
+                        const structurallyComplete =
+                            slopBreakerClean && isStructurallyCompleteGoldenBrickModule(code);
+
+                        let repairedBySlopBreaker = false;
+                        if (!slopBreakerClean || !structurallyComplete) {
                             circuitBreakerEscalations += 1;
+                            repairedBySlopBreaker = true;
                             code = buildDeterministicGoldenBrickModule({
                                 relPath: item.filePath,
                                 targetPath: item.targetPath,
@@ -1259,10 +1970,16 @@ export function createModernizerBenchmarkEngine({
                         }
 
                         const outTok = Number(res?.usage?.outputTokens || estimateTokenCount(code));
-                        const callCost = computeExactCallCostUsd(usedCfg.model, usedCfg.provider, {
-                            inputTokens: inTok,
-                            outputTokens: outTok
-                        });
+                        const callCost = computeExactCallCostUsd(
+                            usedCfg.model,
+                            usedCfg.provider,
+                            measuredGenUsage
+                                ? res.usage
+                                : {
+                                      inputTokens: inTok,
+                                      outputTokens: outTok
+                                  }
+                        );
 
                         return {
                             sourceFile: item.filePath,
@@ -1275,6 +1992,8 @@ export function createModernizerBenchmarkEngine({
                             provider: usedCfg.provider,
                             inputTokens: inTok,
                             outputTokens: outTok,
+                            usageEstimated: !measuredGenUsage,
+                            repairedBySlopBreaker,
                             costUsd: callCost,
                             code
                         };
@@ -1316,10 +2035,11 @@ export function createModernizerBenchmarkEngine({
 
                 let reviewData = {
                     mode: 'offline_deterministic',
+                    usageEstimated: true,
                     reviewers: [
                         {
                             family: 'deepseek',
-                            model: 'deepseek/deepseek-v4.1-flash',
+                            model: reviewerPrimaryModelA,
                             mode: 'offline_deterministic',
                             verdict: deterministicVerdict,
                             rationale: deterministicRationale,
@@ -1327,7 +2047,7 @@ export function createModernizerBenchmarkEngine({
                         },
                         {
                             family: 'google-gemini',
-                            model: 'google/gemini-3.5-flash-lite',
+                            model: reviewerPrimaryModelB,
                             mode: 'offline_deterministic',
                             verdict: deterministicVerdict,
                             rationale: deterministicRationale,
@@ -1340,52 +2060,88 @@ export function createModernizerBenchmarkEngine({
                 };
 
                 if (hasLiveApi && llmConfig.openRouterApiKey) {
-                    const revSys =
-                        'You are an independent Software Factory validator. Confirm the modernized Golden Brick modules use @krusch/toolkit envelopes and contain zero raw SQL/SSRF boilerplate. Reply strict JSON: {"verdict":"APPROVE"|"REJECT","rationale":"concise reason"}.';
+                    const revSys = [
+                        'You are an independent Software Factory validator in DEADBOLT Stage 4.',
+                        'Evaluate ONLY objective Golden Brick compliance on the complete generated Node.js ESM modules below:',
+                        '1. Sealed Golden Bricks from `@krusch/toolkit/http` (`okEnvelope`, `errorEnvelope`), `@krusch/toolkit/sqlite` (`openSqliteDb` with `?` parameterized SQL), `@krusch/toolkit/security` (`safeFetch`, `validateOutboundUrl`), `@krusch/toolkit/pagination`, or `@krusch/toolkit/schema` are valid and sealed by contract.',
+                        '2. Reject ONLY if a module is syntactically truncated/incomplete, omits `@krusch/toolkit/` envelopes, interpolates raw SQL strings without `?` parameters, calls unguarded `fetch()`, or uses floating-point currency rounding.',
+                        '3. Do NOT reject for concise helper implementations when Golden Brick imports, parameterized queries, and complete ESM exports are present.',
+                        'Reply with compact strict JSON only (no markdown fences): {"invariantChecks":{"usesGoldenBricks":true,"parameterizedSql":true,"syntaxComplete":true},"verdict":"APPROVE"|"REJECT","rationale":"concise 1-sentence reason"}.'
+                    ].join('\n');
+
                     const revUsr = edits
-                        .map((e) => `FILE ${e.file_path}:\n${e.content.slice(0, 1800)}`)
+                        .map((e) => `FILE ${e.file_path}:\n${String(e.content || '').slice(0, 8000)}`)
                         .join('\n---\n');
-                    const cfgA = {
-                        provider: 'openrouter',
-                        apiKey: llmConfig.openRouterApiKey,
-                        model: 'deepseek/deepseek-v4.1-flash'
+
+                    const callReviewerWithModelFallback = async (primaryModel, fallbackModel, familyLabel) => {
+                        const primaryReviewerCfg = {
+                            provider: 'openrouter',
+                            familyLabel,
+                            apiKey: llmConfig.openRouterApiKey,
+                            model: primaryModel
+                        };
+                        try {
+                            const res = await callImpl(revSys, revUsr, primaryReviewerCfg, {
+                                returnFullResponse: true,
+                                bypassCascade: true,
+                                maxTokens: 1024,
+                                temperature: 0.0,
+                                signal: AbortSignal.timeout(10_000)
+                            });
+                            return { res, model: primaryReviewerCfg.model };
+                        } catch (primaryErr) {
+                            if (!fallbackModel || fallbackModel === primaryModel) {
+                                throw primaryErr;
+                            }
+                            const fallbackReviewerCfg = {
+                                provider: 'openrouter',
+                                familyLabel,
+                                apiKey: llmConfig.openRouterApiKey,
+                                model: fallbackModel
+                            };
+                            const res = await callImpl(revSys, revUsr, fallbackReviewerCfg, {
+                                returnFullResponse: true,
+                                bypassCascade: true,
+                                maxTokens: 1024,
+                                temperature: 0.0,
+                                signal: AbortSignal.timeout(10_000)
+                            });
+                            return { res, model: fallbackReviewerCfg.model };
+                        }
                     };
-                    const cfgB = {
-                        provider: 'openrouter',
-                        apiKey: llmConfig.openRouterApiKey,
-                        model: 'google/gemini-3.5-flash-lite'
-                    };
+
                     try {
-                        const [rA, rB] = await Promise.all([
-                            callImpl(revSys, revUsr, cfgA, {
-                                returnFullResponse: true,
-                                bypassCascade: true,
-                                maxTokens: 220,
-                                temperature: 0.0,
-                                signal: AbortSignal.timeout(6_000)
-                            }),
-                            callImpl(revSys, revUsr, cfgB, {
-                                returnFullResponse: true,
-                                bypassCascade: true,
-                                maxTokens: 220,
-                                temperature: 0.0,
-                                signal: AbortSignal.timeout(6_000)
-                            })
+                        const [outRevA, outRevB] = await Promise.all([
+                            callReviewerWithModelFallback(
+                                reviewerPrimaryModelA,
+                                reviewerFallbackModelA,
+                                'deepseek'
+                            ),
+                            callReviewerWithModelFallback(
+                                reviewerPrimaryModelB,
+                                reviewerFallbackModelB,
+                                'google-gemini'
+                            )
                         ]);
+                        const rA = outRevA.res;
+                        const rB = outRevB.res;
                         const parsedA = parseReviewerVerdictPayload(rA?.text);
                         const parsedB = parseReviewerVerdictPayload(rB?.text);
+                        const measuredRevA = hasMeasuredTokenUsage(rA?.usage);
+                        const measuredRevB = hasMeasuredTokenUsage(rB?.usage);
                         const inA = Number(rA?.usage?.inputTokens || 0);
                         const outA = Number(rA?.usage?.outputTokens || 0);
                         const inB = Number(rB?.usage?.inputTokens || 0);
                         const outB = Number(rB?.usage?.outputTokens || 0);
-                        const cA = computeExactCallCostUsd(cfgA.model, 'openrouter', rA?.usage);
-                        const cB = computeExactCallCostUsd(cfgB.model, 'openrouter', rB?.usage);
+                        const cA = computeExactCallCostUsd(outRevA.model, 'openrouter', rA?.usage);
+                        const cB = computeExactCallCostUsd(outRevB.model, 'openrouter', rB?.usage);
                         reviewData = {
                             mode: 'live_api',
+                            usageEstimated: !measuredRevA || !measuredRevB,
                             reviewers: [
                                 {
                                     family: 'deepseek',
-                                    model: cfgA.model,
+                                    model: outRevA.model,
                                     mode: 'live_api',
                                     verdict: parsedA.verdict,
                                     rationale: parsedA.rationale,
@@ -1393,7 +2149,7 @@ export function createModernizerBenchmarkEngine({
                                 },
                                 {
                                     family: 'google-gemini',
-                                    model: cfgB.model,
+                                    model: outRevB.model,
                                     mode: 'live_api',
                                     verdict: parsedB.verdict,
                                     rationale: parsedB.rationale,
@@ -1407,6 +2163,7 @@ export function createModernizerBenchmarkEngine({
                     } catch {
                         reviewData = {
                             mode: 'deterministic_fallback_after_timeout',
+                            usageEstimated: true,
                             reviewers: reviewData.reviewers.map((r) => ({
                                 ...r,
                                 mode: 'deterministic_fallback_after_timeout'
@@ -1448,9 +2205,17 @@ export function createModernizerBenchmarkEngine({
                 const totalCostUsd = Number(
                     (fileReceipts.reduce((acc, r) => acc + r.costUsd, 0) + reviewData.costUsd).toFixed(6)
                 );
-                const costMeasurementMode = hasLiveApi
-                    ? 'live_measured'
-                    : 'offline_rate_sheet_estimate';
+                const armBUsageEstimated =
+                    !hasLiveApi ||
+                    Boolean(reviewData.usageEstimated) ||
+                    fileReceipts.some((r) => r.usageEstimated === true);
+                const repairedFileCount = fileReceipts.filter((r) => r.repairedBySlopBreaker).length;
+                const costMeasurementMode =
+                    hasLiveApi && !armBUsageEstimated
+                        ? 'live_measured'
+                        : hasLiveApi
+                          ? 'live_partial_estimated'
+                          : 'offline_rate_sheet_estimate';
                 const costPerVerifiedTaskUsd =
                     hasLiveApi && armBVerdict === 'VERIFIED' ? totalCostUsd : null;
 
@@ -1460,6 +2225,10 @@ export function createModernizerBenchmarkEngine({
                     contextMode: 'hydradb_2hop_sliced',
                     executionMode: hasLiveApi ? 'live_api' : 'offline_deterministic',
                     reviewMode: reviewData.mode,
+                    ollamaReachable: ollamaProbeReachable,
+                    usageEstimated: armBUsageEstimated,
+                    repairedBySlopBreaker: repairedFileCount > 0,
+                    repairedFileCount,
                     avgRoutingLatencyUs,
                     circuitBreakerEscalations,
                     filesProcessed: fileReceipts.length,
@@ -1488,6 +2257,8 @@ export function createModernizerBenchmarkEngine({
                         model: r.model,
                         inputTokens: r.inputTokens,
                         outputTokens: r.outputTokens,
+                        usageEstimated: Boolean(r.usageEstimated),
+                        repairedBySlopBreaker: Boolean(r.repairedBySlopBreaker),
                         costUsd: Number(r.costUsd.toFixed(6)),
                         code: r.code
                     }))
@@ -1525,9 +2296,15 @@ export function createModernizerBenchmarkEngine({
                       ? 99.9
                       : 1.0;
 
-            const costMeasurementMode = hasLiveApi
-                ? 'live_measured'
-                : 'offline_rate_sheet_estimate';
+            const usageEstimated = Boolean(
+                singleFrontier.usageEstimated || deadboltCascade.usageEstimated
+            );
+            const costMeasurementMode =
+                hasLiveApi && !usageEstimated
+                    ? 'live_measured'
+                    : hasLiveApi
+                      ? 'live_partial_estimated'
+                      : 'offline_rate_sheet_estimate';
             const costPerVerifiedTaskUsd =
                 hasLiveApi && deadboltCascade.verdict === 'VERIFIED'
                     ? deadboltCascade.totalCostUsd
@@ -1550,6 +2327,7 @@ export function createModernizerBenchmarkEngine({
                         hydraMode: hydraSlice.mode,
                         supersedesEdgesWritten: deadboltCascade.hydraSupersedesWritten,
                         inputTokenReductionPct: tokenSavingsPct,
+                        promptTokenReductionPct: tokenSavingsPct,
                         costReductionPct: costSavingsPct,
                         costSavingsPct,
                         costMultiplier,
@@ -1557,6 +2335,7 @@ export function createModernizerBenchmarkEngine({
                         deadboltCascadeCostUsd: deadboltCascade.totalCostUsd,
                         costPerVerifiedTaskUsd,
                         costMeasurementMode,
+                        usageEstimated,
                         executionMode: deadboltCascade.executionMode
                     }
                 });
@@ -1567,10 +2346,17 @@ export function createModernizerBenchmarkEngine({
             const totalElapsedMs = Number(
                 (Number(process.hrtime.bigint() - totalStartNs) / 1e6).toFixed(2)
             );
+            const verifiedFileCount = deadboltCascade.fileReceipts.length;
+            const extraVerificationTokens = Math.max(
+                0,
+                deadboltCascade.inputTokens - singleFrontier.inputTokens
+            );
             const summaryText =
-                deadboltCascade.verdict === 'VERIFIED'
-                    ? `Modernized ${routedWave.length} file(s) from ${displayTarget}: DEADBOLT Cascade + HydraDB used ${tokenSavingsPct}% fewer prompt tokens and ${costSavingsPct}% lower cost (${costMultiplier}x cheaper) at 100% Golden Brick coverage.`
-                    : `Evaluated ${routedWave.length} file(s) from ${displayTarget}: Stage 4 Validator halted promotion with verdict ${deadboltCascade.verdict} (0 :SUPERSEDES lineage edges written).`;
+                deadboltCascade.verdict !== 'VERIFIED'
+                    ? `Evaluated ${routedWave.length} file(s) from ${displayTarget}: Stage 4 Validator halted promotion with verdict ${deadboltCascade.verdict} (0 :SUPERSEDES lineage edges written).`
+                    : tokenSavingsPct >= 0 && costSavingsPct >= 0
+                      ? `Modernized ${routedWave.length} file(s) from ${displayTarget}: DEADBOLT Cascade + HydraDB used ${tokenSavingsPct}% fewer prompt tokens and ${costSavingsPct}% lower cost (${costMultiplier}x cheaper) at 100% Golden Brick coverage.`
+                      : `Modernized ${routedWave.length} file(s) from ${displayTarget}: Arm B verified ${verifiedFileCount}/${routedWave.length} file(s) with 2-family consensus ($${deadboltCascade.totalCostUsd.toFixed(5)} total${extraVerificationTokens > 0 ? `, +${extraVerificationTokens} bounded verification tokens` : ''}) vs Arm A unverified single-model output ($${singleFrontier.totalCostUsd.toFixed(5)}) at 100% Golden Brick coverage.`;
 
             return okEnvelope(
                 'deadbolt.modernizer.compare',
@@ -1590,6 +2376,7 @@ export function createModernizerBenchmarkEngine({
                     comparison: {
                         filesModernized: routedWave.length,
                         inputTokenReductionPct: tokenSavingsPct,
+                        promptTokenReductionPct: tokenSavingsPct,
                         costReductionPct: costSavingsPct,
                         costSavingsPct,
                         costMultiplier,
@@ -1597,6 +2384,7 @@ export function createModernizerBenchmarkEngine({
                         deadboltCascadeCostUsd: deadboltCascade.totalCostUsd,
                         costPerVerifiedTaskUsd,
                         costMeasurementMode,
+                        usageEstimated,
                         auditEntryHash,
                         auditChainValid: auditTrail?.ok ? Boolean(auditTrail.data?.valid) : true
                     },

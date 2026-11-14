@@ -58,11 +58,248 @@ const FIXED_REVIEW_ORDER = Object.freeze([
     '4_disagreement_escalation_gate'
 ]);
 
+export function stripJsCommentsPreservingStrings(sourceText = '') {
+    const src = String(sourceText || '');
+    if (!src) {
+        return '';
+    }
+
+    let out = '';
+    let i = 0;
+    const len = src.length;
+    /** @type {'NORMAL' | 'SINGLE' | 'DOUBLE' | 'TEMPLATE' | 'REGEX'} */
+    let mode = 'NORMAL';
+    let inRegexCharClass = false;
+    /** @type {number[]} */
+    const templateBraceStack = [];
+    let lastSignificantToken = '';
+
+    const canStartRegex = (prevTok) =>
+        !prevTok ||
+        prevTok === '(' ||
+        prevTok === '[' ||
+        prevTok === '{' ||
+        prevTok === '}' ||
+        prevTok === ',' ||
+        prevTok === ';' ||
+        prevTok === ':' ||
+        prevTok === '=' ||
+        prevTok === '!' ||
+        prevTok === '&' ||
+        prevTok === '|' ||
+        prevTok === '?' ||
+        prevTok === '+' ||
+        prevTok === '-' ||
+        prevTok === '*' ||
+        prevTok === '%' ||
+        prevTok === '^' ||
+        prevTok === '~' ||
+        prevTok === '<' ||
+        prevTok === '>' ||
+        prevTok === 'return' ||
+        prevTok === 'case' ||
+        prevTok === 'throw' ||
+        prevTok === 'typeof' ||
+        prevTok === 'void' ||
+        prevTok === 'delete' ||
+        prevTok === 'in' ||
+        prevTok === 'of' ||
+        prevTok === 'instanceof' ||
+        prevTok === 'new' ||
+        prevTok === 'await' ||
+        prevTok === 'yield';
+
+    while (i < len) {
+        const ch = src[i];
+        const next = i + 1 < len ? src[i + 1] : '';
+
+        if (mode === 'SINGLE') {
+            if (ch === '\\' && i + 1 < len) {
+                out += ch + next;
+                i += 2;
+                continue;
+            }
+            out += ch;
+            if (ch === "'" || ch === '\n' || ch === '\r') {
+                mode = 'NORMAL';
+                if (ch === "'") {
+                    lastSignificantToken = "'";
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if (mode === 'DOUBLE') {
+            if (ch === '\\' && i + 1 < len) {
+                out += ch + next;
+                i += 2;
+                continue;
+            }
+            out += ch;
+            if (ch === '"' || ch === '\n' || ch === '\r') {
+                mode = 'NORMAL';
+                if (ch === '"') {
+                    lastSignificantToken = '"';
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if (mode === 'TEMPLATE') {
+            if (ch === '\\' && i + 1 < len) {
+                out += ch + next;
+                i += 2;
+                continue;
+            }
+            if (ch === '$' && next === '{') {
+                out += '${';
+                templateBraceStack.push(0);
+                mode = 'NORMAL';
+                lastSignificantToken = '{';
+                i += 2;
+                continue;
+            }
+            out += ch;
+            if (ch === '`') {
+                mode = 'NORMAL';
+                lastSignificantToken = '`';
+            }
+            i += 1;
+            continue;
+        }
+
+        if (mode === 'REGEX') {
+            if (ch === '\\' && i + 1 < len && next !== '\n' && next !== '\r') {
+                out += ch + next;
+                i += 2;
+                continue;
+            }
+            if (ch === '[') {
+                inRegexCharClass = true;
+            } else if (ch === ']') {
+                inRegexCharClass = false;
+            } else if (ch === '/' && !inRegexCharClass) {
+                mode = 'NORMAL';
+                lastSignificantToken = '/';
+            } else if (ch === '\n' || ch === '\r') {
+                mode = 'NORMAL';
+            }
+            out += ch;
+            i += 1;
+            continue;
+        }
+
+        // mode === 'NORMAL'
+        if (ch === '/' && next === '/') {
+            i += 2;
+            while (i < len && src[i] !== '\n' && src[i] !== '\r') {
+                i += 1;
+            }
+            out += ' ';
+            continue;
+        }
+
+        if (ch === '/' && next === '*') {
+            i += 2;
+            let emittedNewline = false;
+            while (i < len && !(src[i] === '*' && src[i + 1] === '/')) {
+                if (src[i] === '\n' || src[i] === '\r') {
+                    out += src[i];
+                    emittedNewline = true;
+                }
+                i += 1;
+            }
+            if (i < len) {
+                i += 2;
+            }
+            if (!emittedNewline) {
+                out += ' ';
+            }
+            continue;
+        }
+
+        if (ch === "'") {
+            mode = 'SINGLE';
+            out += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '"') {
+            mode = 'DOUBLE';
+            out += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '`') {
+            mode = 'TEMPLATE';
+            out += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '/' && canStartRegex(lastSignificantToken)) {
+            mode = 'REGEX';
+            inRegexCharClass = false;
+            out += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '{') {
+            if (templateBraceStack.length > 0) {
+                templateBraceStack[templateBraceStack.length - 1] += 1;
+            }
+            lastSignificantToken = '{';
+            out += ch;
+            i += 1;
+            continue;
+        }
+
+        if (ch === '}') {
+            if (templateBraceStack.length > 0) {
+                if (templateBraceStack[templateBraceStack.length - 1] === 0) {
+                    templateBraceStack.pop();
+                    mode = 'TEMPLATE';
+                    out += ch;
+                    i += 1;
+                    continue;
+                }
+                templateBraceStack[templateBraceStack.length - 1] -= 1;
+            }
+            lastSignificantToken = '}';
+            out += ch;
+            i += 1;
+            continue;
+        }
+
+        if (/[A-Za-z0-9_$]/.test(ch)) {
+            let end = i + 1;
+            while (end < len && /[A-Za-z0-9_$]/.test(src[end])) {
+                end += 1;
+            }
+            const word = src.slice(i, end);
+            out += word;
+            lastSignificantToken = word;
+            i = end;
+            continue;
+        }
+
+        if (!/\s/.test(ch)) {
+            lastSignificantToken = ch;
+        }
+        out += ch;
+        i += 1;
+    }
+
+    return out;
+}
+
 function stripJsComments(sourceText = '') {
-    const raw = String(sourceText || '');
-    return raw
-        .replace(/\/\*[\s\S]*?\*\//g, ' ')
-        .replace(/(^|[^:\\])\/\/[^\r\n]*/g, '$1 ');
+    return stripJsCommentsPreservingStrings(sourceText);
 }
 
 function normalizeRelativeRepoPath(rawPath = '') {
@@ -759,8 +996,10 @@ function extractBalancedJsonObjects(text = '') {
 }
 
 export function parseReviewerVerdictPayload(rawText = '') {
-    const raw = String(rawText ?? '').trim();
-    if (!raw) {
+    const withoutThink = String(rawText ?? '')
+        .replace(/<think\b[^>]*>[\s\S]*?(?:<\/think>|$)/gi, ' ')
+        .trim();
+    if (!withoutThink) {
         return {
             verdict: 'REJECT',
             rationale: 'Empty or missing reviewer verdict; failing closed.',
@@ -768,7 +1007,7 @@ export function parseReviewerVerdictPayload(rawText = '') {
         };
     }
 
-    const cleaned = raw
+    const cleaned = withoutThink
         .replace(/^```(?:json)?\s*/i, '')
         .replace(/\s*```$/i, '')
         .trim();
@@ -776,13 +1015,13 @@ export function parseReviewerVerdictPayload(rawText = '') {
     const jsonCandidates = [];
     const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
     const fencedBlocks = [];
-    let fenceMatch = fenceRe.exec(raw);
+    let fenceMatch = fenceRe.exec(withoutThink);
     while (fenceMatch !== null) {
         const block = fenceMatch[1].trim();
         if (block) {
             fencedBlocks.push(block);
         }
-        fenceMatch = fenceRe.exec(raw);
+        fenceMatch = fenceRe.exec(withoutThink);
     }
 
     const fencedWithVerdict = fencedBlocks.filter((b) => /["']?verdict["']?\s*:/i.test(b)).reverse();
@@ -790,28 +1029,44 @@ export function parseReviewerVerdictPayload(rawText = '') {
     for (const block of [...fencedWithVerdict, ...fencedOther]) {
         const innerObjects = extractBalancedJsonObjects(block);
         const innerVerdict = innerObjects.filter((b) => /["']?verdict["']?\s*:/i.test(b)).reverse();
-        jsonCandidates.push(...innerVerdict, block);
+        const innerOther = innerObjects.filter((b) => !/["']?verdict["']?\s*:/i.test(b)).reverse();
+        jsonCandidates.push(...innerVerdict, block, ...innerOther);
     }
 
     const balancedBlocks = extractBalancedJsonObjects(cleaned);
     const balancedWithVerdict = balancedBlocks
         .filter((b) => /["']?verdict["']?\s*:/i.test(b))
         .reverse();
-    jsonCandidates.push(...balancedWithVerdict);
+    const balancedWithoutVerdict = balancedBlocks
+        .filter((b) => !/["']?verdict["']?\s*:/i.test(b))
+        .reverse();
+    jsonCandidates.push(...balancedWithVerdict, ...balancedWithoutVerdict);
 
     if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
         jsonCandidates.push(cleaned);
     }
 
+    const seenCandidates = new Set();
     for (const candidate of jsonCandidates) {
+        if (!candidate || seenCandidates.has(candidate)) {
+            continue;
+        }
+        seenCandidates.add(candidate);
         try {
             const parsed = JSON.parse(candidate);
             if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
                 continue;
             }
-            const rawUpper = String(parsed.verdict || '').trim().toUpperCase();
-            const verdict = rawUpper === 'APPROVE' ? 'APPROVE' : 'REJECT';
-            const ambiguous = verdict === 'APPROVE' ? false : rawUpper !== 'REJECT';
+            if (typeof parsed?.verdict !== 'string') {
+                continue;
+            }
+            const rawUpper = parsed.verdict.trim().toUpperCase();
+            const verdict =
+                rawUpper === 'APPROVE' || rawUpper === 'APPROVED' ? 'APPROVE' : 'REJECT';
+            const ambiguous =
+                verdict === 'APPROVE'
+                    ? false
+                    : rawUpper !== 'REJECT' && rawUpper !== 'REJECTED';
             const rationale =
                 String(
                     parsed.rationale ??
@@ -826,8 +1081,30 @@ export function parseReviewerVerdictPayload(rawText = '') {
         }
     }
 
-    const hasApproveToken = /\bAPPROVE\b/i.test(cleaned);
-    const hasNegativeToken = /\b(?:REJECT|FAIL|UNSAFE|ESCALATE)\b/i.test(cleaned);
+    const explicitVerdictRe =
+        /(?:FINAL\s+)?VERDICT\s*[:=-]\s*[*`"']*(APPROVE|APPROVED|REJECT|REJECTED)[*`"']*/gi;
+    let lastExplicitVerdict = null;
+    let explicitMatch = explicitVerdictRe.exec(cleaned);
+    while (explicitMatch !== null) {
+        lastExplicitVerdict = explicitMatch[1].toUpperCase();
+        explicitMatch = explicitVerdictRe.exec(cleaned);
+    }
+    if (lastExplicitVerdict !== null) {
+        const verdict =
+            lastExplicitVerdict === 'APPROVE' || lastExplicitVerdict === 'APPROVED'
+                ? 'APPROVE'
+                : 'REJECT';
+        return {
+            verdict,
+            rationale: cleaned.slice(0, 280),
+            ambiguous: false
+        };
+    }
+
+    const hasApproveToken = /\bAPPROVE(?:D)?\b/i.test(cleaned);
+    const hasNegativeToken = /\b(?:REJECT\w*|UNSAFE\w*|FAIL\w*|VIOLAT\w*|ESCALAT\w*)\b/i.test(
+        cleaned
+    );
 
     if (hasApproveToken && !hasNegativeToken) {
         return {
@@ -837,7 +1114,7 @@ export function parseReviewerVerdictPayload(rawText = '') {
         };
     }
 
-    const explicitRejectOnly = /\bREJECT\b/i.test(cleaned) && !hasApproveToken;
+    const explicitRejectOnly = /\bREJECT(?:ED)?\b/i.test(cleaned) && !hasApproveToken;
     return {
         verdict: 'REJECT',
         rationale: cleaned.slice(0, 280) || 'Unrecognized reviewer output; failing closed.',

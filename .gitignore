@@ -12,7 +12,7 @@ logs/
 .cursor/
 .windsurf/
 .antigravity/
-.sw-factory/staging/
+.sw-factory/
 GEMINI_INFLIGHT.md
 JEAN_SESSION_REVIEW.md
 *.log

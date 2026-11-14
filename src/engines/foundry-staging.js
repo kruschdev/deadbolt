@@ -20,7 +20,7 @@ import {
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { scoreLegoBrickCoverage, auditBoilerplateText } from '@krusch/toolkit/catalog';
 
-const MAX_STAGED_TASKS = 32;
+const MAX_STAGED_TASKS = 64;
 
 const IGNORED_STAGE_DIRS = new Set([
   '.git',

@@ -31,7 +31,7 @@ services:
       CLOUD_PROVIDER: local
       LOCAL_PATH: /data/store
       GRAPH_NAMESPACE: default
-      GRAPH_ID: default
+      GRAPH_ID: deadbolt-factory
       GRAPH_CELL_ID: cell-0
       GRAPH_CELLS: cell-0
       GRAPH_DATA_PATH: data

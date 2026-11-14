@@ -14,6 +14,10 @@ import {
   okMcpResult,
   errorMcpResult
 } from '@krusch/toolkit/mcp';
+import { scrubPrivateNetworkStrings } from '../connectors/hydradb-graph.js';
+
+const MAX_MCP_EDITS_COUNT = 24;
+const MAX_MCP_EDIT_CONTENT_CHARS = 262_144;
 
 export const DEADBOLT_MCP_TOOLS = Object.freeze([
   defineMcpTool({
@@ -211,8 +215,10 @@ function wrapOrchestratorOutcome(toolName, outcome, fallbackSummary) {
     return errorMcpResult(
       toolName,
       errInfo.code || 'DEADBOLT_GATE_ERROR',
-      errInfo.message || outcome.summary || 'DEADBOLT governance gate rejected request.',
-      errInfo.details ?? outcome.data ?? null
+      scrubPrivateNetworkStrings(
+        errInfo.message || outcome.summary || 'DEADBOLT governance gate rejected request.'
+      ),
+      scrubPrivateNetworkStrings(errInfo.details ?? outcome.data ?? null)
     );
   }
 
@@ -290,7 +296,32 @@ export async function createDeadboltMcp({ orchestrator, connect = false } = {}) 
           const mode = typeof args.mode === 'string' && args.mode.trim()
             ? args.mode.trim().toLowerCase()
             : 'remediated';
-          if (!Array.isArray(args.edits) && !['naive', 'workaround', 'remediated'].includes(mode)) {
+          if (Array.isArray(args.edits)) {
+            if (args.edits.length === 0 || args.edits.length > MAX_MCP_EDITS_COUNT) {
+              return errorMcpResult(
+                name,
+                'INVALID_ARGUMENTS',
+                `Custom edits array must contain between 1 and ${MAX_MCP_EDITS_COUNT} file patches.`
+              );
+            }
+            for (const edit of args.edits) {
+              if (
+                !edit ||
+                typeof edit !== 'object' ||
+                typeof edit.file_path !== 'string' ||
+                !edit.file_path.trim() ||
+                edit.file_path.length > 256 ||
+                typeof edit.content !== 'string' ||
+                edit.content.length > MAX_MCP_EDIT_CONTENT_CHARS
+              ) {
+                return errorMcpResult(
+                  name,
+                  'INVALID_ARGUMENTS',
+                  `Each edit must have a non-empty file_path (<=256 chars) and string content (<=${MAX_MCP_EDIT_CONTENT_CHARS} chars).`
+                );
+              }
+            }
+          } else if (!['naive', 'workaround', 'remediated'].includes(mode)) {
             return errorMcpResult(
               name,
               'INVALID_ARGUMENTS',
@@ -337,7 +368,7 @@ export async function createDeadboltMcp({ orchestrator, connect = false } = {}) 
       }
     } catch (err) {
       const code = err?.code ? String(err.code) : 'DEADBOLT_MCP_ERROR';
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = scrubPrivateNetworkStrings(err instanceof Error ? err.message : String(err));
       return errorMcpResult(name, code, msg);
     }
   };

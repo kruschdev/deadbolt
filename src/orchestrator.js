@@ -107,7 +107,7 @@ function waitAbortable(delayMs, signal = null) {
  */
 export async function createDeadboltOrchestrator(options = {}) {
     const ephemeralOfflineDefaults =
-        options.ephemeral === true && !options.config
+        options.ephemeral === true
             ? {
                   sofaApiKey: '',
                   sofaAdminApiKey: '',
@@ -158,9 +158,9 @@ export async function createDeadboltOrchestrator(options = {}) {
         autoEmbed: false
     });
 
-    const hydraClient =
-        options.hydraClient ||
-        createHydraDbClient({
+    const hydraClient = (() => {
+        if (options.hydraClient) return options.hydraClient;
+        const created = createHydraDbClient({
             apiKey: activeConfig.hydradbApiKey || '',
             baseUrl: activeConfig.hydradbBaseUrl || 'https://api.hydradb.com',
             database: activeConfig.hydradbDatabase || 'default-tenant',
@@ -168,6 +168,11 @@ export async function createDeadboltOrchestrator(options = {}) {
             timeoutMs: 2500,
             maxRetries: 0
         });
+        if (!activeConfig.hydradbApiKey) {
+            created.apiKey = '';
+        }
+        return created;
+    })();
 
     const hydraGraphClient =
         options.hydraGraphClient ||
@@ -315,17 +320,22 @@ export async function createDeadboltOrchestrator(options = {}) {
     async function mapBlastRadius({
         workOrderId = 'WO-101',
         entryFile = undefined,
-        repoDir = undefined
+        repoDir = undefined,
+        repoName = 'acme-legacy-billing'
     } = {}) {
         const targetWo =
             BILLING_WORK_ORDERS.find((wo) => wo.id === workOrderId) || BILLING_WORK_ORDERS[0];
         const resolvedEntry =
             entryFile || targetWo.targetFiles?.[0] || 'src/fee-engine.js';
         const resolvedRepoDir = repoDir ? path.resolve(repoDir) : billingRepoDir;
+        const resolvedRepoName =
+            typeof repoName === 'string' && repoName.trim()
+                ? repoName.trim()
+                : 'acme-legacy-billing';
 
         const plannerEnv = await planner.analyzeBlastRadius({
             repoDir: resolvedRepoDir,
-            repoName: 'acme-legacy-billing',
+            repoName: resolvedRepoName,
             entryFile: resolvedEntry,
             workOrders: BILLING_WORK_ORDERS
         });
@@ -561,6 +571,7 @@ export async function createDeadboltOrchestrator(options = {}) {
 
         // Isolated clean target copy per head-to-head run so concurrent or repeated stage runs stay idempotent
         const runScratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-run-'));
+        const runRepoName = `acme-legacy-billing-${path.basename(runScratchDir)}`;
         let stagedHeadToHeadTaskId = null;
         const makeAbortResult = () =>
             errorEnvelope(
@@ -612,7 +623,8 @@ export async function createDeadboltOrchestrator(options = {}) {
             const plannerEnv = await mapBlastRadius({
                 workOrderId: targetWo.id,
                 entryFile: targetWo.targetFiles?.[0] || 'src/fee-engine.js',
-                repoDir: runScratchDir
+                repoDir: runScratchDir,
+                repoName: runRepoName
             });
             if (signal?.aborted) return makeAbortResult();
             const hydraSyncEnv = await sponsors.syncHydraLineage({
@@ -844,6 +856,15 @@ export async function createDeadboltOrchestrator(options = {}) {
                 receiptData
             );
         } finally {
+            if (stack?.db?.prepare) {
+                try {
+                    stack.db.prepare('DELETE FROM git_symbols WHERE repo_name = ?').run(runRepoName);
+                    stack.db.prepare('DELETE FROM git_edges WHERE repo_name = ?').run(runRepoName);
+                    stack.db.prepare('DELETE FROM git_repositories WHERE name = ?').run(runRepoName);
+                } catch {
+                    /* best-effort ephemeral git index cleanup */
+                }
+            }
             if (stagedHeadToHeadTaskId) {
                 verifiedTasks.delete(stagedHeadToHeadTaskId);
                 try {
@@ -1103,17 +1124,101 @@ export async function createDeadboltOrchestrator(options = {}) {
     }
 
     /**
-     * Verify or post a Stage 4 Governance Receipt onto the live 8090 Work Order + Feedback Inbox.
+     * Verify or post a Stage 4 Governance Receipt onto the live 8090 Work Order + Feedback Inbox (`INV-DB-09`).
      */
     async function syncSofaGovernanceReceipt({ workOrderId = 'WO-101' } = {}) {
-        const auditEnv = validator.getAuditTrail({ limit: 5 });
-        const tailHash =
-            auditEnv.ok && auditEnv.data?.tailHash ? auditEnv.data.tailHash : 'sha256:verified';
+        const safeWoId = String(workOrderId || 'WO-101').trim() || 'WO-101';
+        const upperWo = safeWoId.toUpperCase();
+        const aliasMap = {
+            'WO-101': ['WO-101', 'WO-1'],
+            'WO-1': ['WO-101', 'WO-1'],
+            'WO-102': ['WO-102', 'WO-2'],
+            'WO-2': ['WO-102', 'WO-2'],
+            'WO-103': ['WO-103', 'WO-3'],
+            'WO-3': ['WO-103', 'WO-3'],
+            'WO-104': ['WO-104', 'WO-4'],
+            'WO-4': ['WO-104', 'WO-4']
+        };
+        const candidateWoCodes = new Set(aliasMap[upperWo] || [upperWo]);
+
+        const auditEnv = validator.getAuditTrail({ limit: 50 });
+        if (!auditEnv.ok || !auditEnv.data?.valid) {
+            return errorEnvelope(
+                'AUDIT_TAMPERED',
+                'Cannot sync governance receipt: SHA-256 audit chain verification failed.',
+                { workOrderId: safeWoId },
+                'deadbolt.orchestrator.sofa_sync'
+            );
+        }
+
+        const entries = Array.isArray(auditEnv.data?.entries) ? auditEnv.data.entries : [];
+        const matchedEntry = entries.find((entry) => {
+            const isVerifiedEntry =
+                entry?.action === 'validator.verified' ||
+                entry?.metadata?.verdict === 'VERIFIED';
+            if (!isVerifiedEntry) return false;
+            const resourceCode = String(entry?.resource || '').trim().toUpperCase();
+            return candidateWoCodes.has(resourceCode);
+        });
+
+        if (!matchedEntry) {
+            const knownLocal = BILLING_WORK_ORDERS.some((wo) =>
+                candidateWoCodes.has(String(wo.id || '').trim().toUpperCase())
+            );
+            let knownInFactory = knownLocal;
+            if (!knownInFactory) {
+                const snapEnv = await sponsors.getSoftwareFactoryGovernanceSnapshot({
+                    forceRefresh: false
+                });
+                const factoryWos = Array.isArray(snapEnv?.data?.workOrders)
+                    ? snapEnv.data.workOrders
+                    : [];
+                knownInFactory = factoryWos.some((item) => {
+                    const code = String(item?.code || '').trim().toUpperCase();
+                    const id = String(item?.id || '').trim().toUpperCase();
+                    return candidateWoCodes.has(code) || candidateWoCodes.has(id);
+                });
+            }
+            if (!knownInFactory) {
+                return errorEnvelope(
+                    'WORK_ORDER_NOT_FOUND',
+                    `Work Order "${safeWoId}" was not found in the 8090 project.`,
+                    { workOrderId: safeWoId },
+                    'deadbolt.orchestrator.sofa_sync'
+                );
+            }
+            return errorEnvelope(
+                'UNVERIFIED_STAGE_BLOCKED',
+                `Run Stage 4 Validator on ${safeWoId} first to mint a signed VERIFIED SHA-256 receipt before syncing to 8090.`,
+                { workOrderId: safeWoId },
+                'deadbolt.orchestrator.sofa_sync'
+            );
+        }
+
+        const entryHash = String(
+            matchedEntry.entryHash || matchedEntry.hash || auditEnv.data?.tailHash || ''
+        ).trim();
+        if (!entryHash) {
+            return errorEnvelope(
+                'UNVERIFIED_STAGE_BLOCKED',
+                `Missing cryptographic SHA-256 entry hash for ${safeWoId}.`,
+                { workOrderId: safeWoId },
+                'deadbolt.orchestrator.sofa_sync'
+            );
+        }
+
+        const entryCost = matchedEntry.metadata?.costPerVerifiedTaskUsd;
         const verifiedCostUsd =
-            lastRunReceipt?.telemetry?.costPerVerifiedTaskUsd ?? 0.00043;
+            typeof entryCost === 'number' && Number.isFinite(entryCost)
+                ? entryCost
+                : candidateWoCodes.has(String(lastRunReceipt?.workOrderId || '').toUpperCase()) &&
+                    typeof lastRunReceipt?.telemetry?.costPerVerifiedTaskUsd === 'number'
+                  ? lastRunReceipt.telemetry.costPerVerifiedTaskUsd
+                  : 0;
+
         return sponsors.syncGovernanceReceiptTo8090({
-            workOrderId,
-            auditTailHash: tailHash,
+            workOrderId: safeWoId,
+            auditTailHash: entryHash,
             verifiedCostUsd
         });
     }

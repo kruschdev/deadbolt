@@ -11,6 +11,7 @@ import {
 import { delimitUntrustedContent } from '@krusch/toolkit/harness-engineering';
 import { sanitizeAgentMessage } from '@krusch/toolkit/trajectory-guard';
 import { buildHydraContextString } from '@krusch/toolkit/hydradb';
+import { scrubPrivateNetworkStrings } from '../connectors/hydradb-graph.js';
 import {
   BILLING_WORK_ORDERS,
   ORG_CONTEXT_MODALITIES,
@@ -163,6 +164,16 @@ function formatHydraV2Snippet(queryResult) {
   return promptFallback ? promptFallback.slice(0, 900) : '';
 }
 
+function scrubExternalErrorMessage(err) {
+  const raw = err instanceof Error ? err.message : String(err ?? 'External connector error');
+  const scrubbed = String(scrubPrivateNetworkStrings(raw));
+  return scrubbed
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [redacted]')
+    .replace(/([?&](?:api[_-]?key|token|access_token|secret)=)[^&\s]+/gi, '$1[redacted]')
+    .replace(/(https?:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1[redacted]@')
+    .replace(/\/(?:home|Users|root|tmp|private\/tmp|var\/folders)\/[^\s'")\]]+/g, '[redacted-path]');
+}
+
 export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot } = {}) {
   const stackRoot = path.resolve(stack?.workspaceRoot || workspaceRoot || process.cwd());
   const mirrorSlot = crypto
@@ -177,6 +188,7 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
   let rawRag = null;
   let rawRagWindowCount = 0;
   let lastSeedMeta = null;
+  let seedMutex = Promise.resolve();
 
   function syncAnchorFiles(sourceRepoDir = null) {
     if (sourceRepoDir) {
@@ -292,7 +304,7 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
     };
   }
 
-  async function seedOrganizationalContext({ repoDir, forceReseed = false } = {}) {
+  async function runSeedOrganizationalContext({ repoDir, forceReseed = false } = {}) {
     if (!stack || !stack.context) {
       return errorEnvelope(
         'REFINERY_STACK_MISSING',
@@ -473,21 +485,21 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
           }
         ];
         const ingestRes = await hydraClient.ingestMemories(hydraMemories, { upsert: true });
-        hydraSync = {
+        hydraSync = scrubPrivateNetworkStrings({
           configured: true,
           synced: true,
           mode: 'hydradb_v2_live',
           apiVersion: ingestRes?._meta?.api_version || '2',
           requestId: ingestRes?._meta?.request_id || null,
           ingestedCount: hydraMemories.length
-        };
+        });
       } catch (err) {
         hydraSync = {
           configured: true,
           synced: false,
           mode: 'hydradb_error_fallback',
           ingestedCount: 0,
-          error: err instanceof Error ? err.message : String(err)
+          error: scrubExternalErrorMessage(err)
         };
       }
     }
@@ -535,6 +547,16 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
       `Seeded Deadbolt organizational context across 6 modalities (${rawRagWindowCount} Raw-RAG window(s), INV-FIN-02 -> INV-FIN-03 lineage active).`,
       lastSeedMeta
     );
+  }
+
+  function seedOrganizationalContext(options = {}) {
+    const runNext = () => runSeedOrganizationalContext(options);
+    const scheduled = seedMutex.then(runNext, runNext);
+    seedMutex = scheduled.then(
+      () => undefined,
+      () => undefined
+    );
+    return scheduled;
   }
 
   async function hydrateWorkOrderContext({
@@ -692,8 +714,10 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
           maxResults: 4,
           graphContext: true
         });
-        const formattedHydra = formatHydraV2Snippet(hydraQueryRes);
-        hydraSync = {
+        const formattedHydra = String(
+          scrubPrivateNetworkStrings(formatHydraV2Snippet(hydraQueryRes))
+        );
+        hydraSync = scrubPrivateNetworkStrings({
           configured: true,
           queried: true,
           mode: 'hydradb_v2_live',
@@ -701,7 +725,7 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
           requestId: hydraQueryRes?._meta?.request_id || null,
           chunkCount: Array.isArray(hydraQueryRes?.chunks) ? hydraQueryRes.chunks.length : 0,
           contextSnippet: formattedHydra
-        };
+        });
       } catch (err) {
         hydraSync = {
           configured: true,
@@ -709,7 +733,7 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
           mode: 'hydradb_error_fallback',
           requestId: null,
           contextSnippet: '',
-          error: err instanceof Error ? err.message : String(err)
+          error: scrubExternalErrorMessage(err)
         };
       }
     }

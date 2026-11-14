@@ -24,11 +24,11 @@
     "prebuild": "node --input-type=module -e \"import fs from 'node:fs'; import { execSync } from 'node:child_process'; if (!fs.existsSync('client/node_modules')) execSync('npm --prefix client ci', { stdio: 'inherit' });\"",
     "build": "npm --prefix client run build",
     "seed:8090": "node scripts/seed-8090-project.js",
-    "pretest": "node --input-type=module -e \"import fs from 'node:fs'; import { execSync } from 'node:child_process'; if (!fs.existsSync('client/dist/index.html')) execSync('npm run build', { stdio: 'inherit' });\"",
-    "test": "node --test tests/*.test.js"
+    "pretest": "node --input-type=module -e \"import fs from 'node:fs'; import { execSync } from 'node:child_process'; const dist = 'client/dist/index.html'; const src = 'client/src/components/BreakerCockpit.jsx'; const stale = !fs.existsSync(dist) || (fs.existsSync(src) && fs.statSync(src).mtimeMs > fs.statSync(dist).mtimeMs); if (stale) execSync('npm run build', { stdio: 'inherit' });\"",
+    "test": "NODE_ENV=test node --test tests/*.test.js"
   },
   "dependencies": {
-    "@krusch/toolkit": "github:kruschdev/toolkit#b8bc750",
-    "krusch-stack": "github:kruschdev/krusch-stack#9b8c4a2"
+    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/b8bc7506bc4cf5c9ccb2a7ae76ae171e98ce99ad.tar.gz",
+    "krusch-stack": "https://github.com/kruschdev/krusch-stack/archive/9b8c4a2e7d08e88db5195aa701c287f7f076bc6d.tar.gz"
   }
 }

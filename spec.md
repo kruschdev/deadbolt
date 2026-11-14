@@ -29,7 +29,9 @@ DEADBOLT is the deterministic governance control plane, 2-hop blast-radius plann
 - **`INV-DB-06` (Isolated Staging & Crash-Recoverable Apply Journal)**: Proposed edits are staged in an isolated workspace via `krusch-stack` `harness` (`harness_tasks` + `harness_apply_journal`) before touching target files, with deterministic crash simulation and recovery (`recoverInFlight`).
 - **`INV-DB-07` (Confused-Deputy & Outbound Action Gate)**: External ticket/chat/PR text is wrapped with `delimitUntrustedContent` (`@krusch/toolkit/harness-engineering`) and scanned with `sanitizeAgentMessage` (`@krusch/toolkit/trajectory-guard`). Composio outbound PR actions are blocked until Stage 4 (`Validator`) returns `VERIFIED` and all outbound URLs pass `safeFetch` / `validateOutboundUrl` (`@krusch/toolkit/security`).
 - **`INV-DB-08` (Measured Cost-Per-Verified-Task & Zero Leaks)**: Only live measured token counts, latency, retries, and USD cost are reported (`costPerVerifiedTaskUsd` is `null` for unverified/failed runs). Zero API keys, private IPs, or local workstation paths may appear in tracked files.
-- **`INV-SOLO-VOICE-01` (First-Person Voice & No Em Dashes)**: All user-facing copy, README prose, and UI labels use clear technical prose without em dashes (`U+2014`).
+- **`INV-DB-09` (8090 Governance Receipt Stage-4 Gate)**: `POST /api/sofa/sync-receipt` (`syncSofaGovernanceReceipt`) is strictly gated on a real Stage 4 `VERIFIED` audit entry matching `workOrderId` with a 64-hex `entryHash` (`409 UNVERIFIED_STAGE_BLOCKED` before Stage 4 runs, `404 WORK_ORDER_NOT_FOUND` when `workOrderId` does not match any live 8090 Work Order; never fabricates `'sha256:verified'` or synthetic USD costs).
+- **`INV-DB-HYDRA-ISOLATION-01` (Ephemeral Sponsor Isolation)**: Keep `HYDRADB_API_KEY` (Cloud `v2`) strictly isolated from `HYDRADB_GRAPH_TOKEN` (self-hosted `v0.4.0` OpenCypher), and enforce offline sponsor defaults whenever `ephemeral === true` unless explicit keys are passed in `options.config`, including an offline-short-circuit `hydraClient` when `hydradbApiKey === ''` so `npm test` never leaks to or mutates live sponsor APIs.
+- **`INV-SOLO-VOICE-01` (First-Person Voice & No Em Dashes)**: All user-facing copy, README prose, and UI labels use singular first-person technical prose without em dashes (`U+2014`) or unhedged `"guarantees"` claims.
 
 ## 3. Disjoint Module Ownership & Frozen Export Contracts
 
@@ -78,12 +80,12 @@ Exports of `src/engines/planner-graph.js`:
     4. Computes **Parallel Work Order Disjoint AST Leases** across `workOrders` (`WO-101`, `WO-102`, `WO-103`).
     Returns `okEnvelope('deadbolt.planner.blast_radius', summary, { entryFile, hop1Files, hop2Files, hopPath, symbolGraph, cascadeRoutes, routingLatencyUs, parallelLeases, remoteKruschGit })`.
   - `scanExternalRepository({ repoUrlOrPath, maxFiles = 60 })`:
-    Validates GitHub URLs via `validateOutboundUrl` (`allowedHosts: ['github.com', 'www.github.com']`) before non-blocking shallow `git clone --depth 1 --single-branch --filter=blob:limit=256k` (`execFile` timeout `12000ms`), or safely walks local non-sensitive directories (`<= 256 KB` non-binary files) across 14 enterprise extensions (`.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.tsx`, `.py`, `.php`, `.java`, `.cs`, `.go`, `.rb`, `.rs`, `.kt`) and 28 deterministic Golden Brick + PHP + Polyglot hazard rules. Cleans up temp directories and ephemeral SQLite scan rows in `finally`.
+    Validates GitHub URLs via `validateOutboundUrl` (`allowedHosts: ['github.com', 'www.github.com']`, upgrading `http://github.com/...` to `https://` and stripping trailing slashes) before non-blocking shallow `git clone --depth 1 --single-branch --filter=blob:limit=256k` (`execFile` timeout `12000ms`), or safely walks local non-sensitive directories (`<= 256 KB` non-binary files, prioritizing `src/`, `app/`, `lib/`, `pkg/`, `cmd/`, `internal/`, `public/`, and `hintedFile` ahead of `tests/`/`examples/`/`benchmarks/`) across 10 languages and 14 enterprise source extensions (`.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.tsx`, `.py`, `.php`, `.java`, `.cs`, `.go`, `.rb`, `.rs`, `.kt`), extracting polyglot dependency edges (`.py`, `.go`, `.rs`, `.java`, `.kt`, `.cs`, `.rb`, `@/`/`~/` TS aliases, and `.php`) and evaluating 28 deterministic Golden Brick + PHP + Polyglot hazard rules. Cleans up temp directories and ephemeral SQLite scan rows in `finally`.
 
 Exports of `src/engines/foundry-staging.js`:
 - `createFoundryEngine({ stack })`:
   - `auditWithSlopBreaker({ files, label = 'candidate' })`: Runs `<1ms` `scoreLegoBrickCoverage` and `auditBoilerplateText` (`@krusch/toolkit/catalog`).
-  - `stageWorkOrderEdits({ workOrderId, goal, repoDir, edits })`: Stages `edits` in an isolated staging workspace copy with an isolated per-stage journal (`stage.db`) and bounded `MAX_STAGED_TASKS = 32` LRU eviction.
+  - `stageWorkOrderEdits({ workOrderId, goal, repoDir, edits })`: Stages `edits` in an isolated staging workspace copy with an isolated per-stage journal (`stage.db`) and bounded `MAX_STAGED_TASKS = 64` LRU eviction aligned with `MAX_VERIFIED_TASKS = 64`.
   - `applyVerifiedStage({ taskId, applyToRepoDir = false })`: Applies verified staged diffs only after Validator approval.
   - `releaseStage(taskId)`: Deterministically removes staged scratch directories from `os.tmpdir()` and evicts `stagedTasks` state.
   - `runCrashRecoveryDrill({ repoDir })`: Simulates a mid-apply crash (`RECOVERY_PENDING`) on an isolated `drill-stack.db` and verifies `recoverInFlight()` convergence (`halfWrittenFiles === 0`).
@@ -96,17 +98,17 @@ Files owned by Agent 3 / Modernizer & Connector layer:
 - `src/connectors/sponsors.js`
 
 Exports of `src/engines/validator-gate.js`:
-- `parseReviewerVerdictPayload(rawText)`: Fail-closed JSON/structured verdict parser returning `APPROVE` strictly when parsed `verdict === 'APPROVE'` (or unambiguous `APPROVE` text with zero `REJECT`/`FAIL`/`UNSAFE`/`ESCALATE` tokens), otherwise returning `REJECT`.
+- `parseReviewerVerdictPayload(rawText)`: Fail-closed JSON/structured verdict parser that strips `<think>...</think>` blocks, iterates across embedded JSON objects until a `.verdict` field is found, and returns `APPROVE` strictly when parsed `verdict === 'APPROVE'` (or unambiguous final `VERDICT: APPROVE` / `APPROVE` text without active rejection verdicts), otherwise returning `REJECT`.
 - `estimateReviewerUsageCostUsd(modelId, usage)`: Exact per-1M token cost calculator.
-- `createValidatorEngine({ auditDbPath, hmacSecret, llmConfig = {} })`: Enforces fixed review order (`1A Policy Floor -> 1B Slop + INV-FIN-03 SOX Reconciliation -> 2 Cross-Family Review within 4500ms -> 3 Disagreement Escalation`) and tamper-evident SHA-256 `auditLog`.
+- `createValidatorEngine({ auditDbPath, hmacSecret, llmConfig = {} })`: Enforces fixed review order (`1A Policy Floor with string-aware masking -> 1B Slop + INV-FIN-03 SOX Reconciliation -> 2 Cross-Family Review within 4500ms -> 3 Disagreement Escalation`) and tamper-evident SHA-256 `auditLog`.
 
 Exports of `src/engines/modernizer-benchmark.js`:
 - `toTargetModernizedPath(relPath)` & `selectModernizationWave({ fileEntries, findings, edges, requestedFile })`.
-- `createModernizerBenchmarkEngine(...)`: Runs Head-to-Head Legacy Modernization (`POST /api/repo/modernize`) comparing Arm A (1 Single Frontier Model with full-repo stuffing) vs. Arm B (HydraDB Dual-Live `v2` + `v0.4.0` OpenCypher 2-hop graph slice + `<25µs` Cascade Router + `<1ms` Golden Brick Slop Breaker + real 2-family `parseReviewerVerdictPayload` consensus + `:SUPERSEDES` writeback gated on `VERIFIED`). Mints fresh per-attempt `AbortSignal.timeout` instances and guards backup failovers so transient LLM errors never throw unhandled `500`s.
+- `createModernizerBenchmarkEngine(...)`: Runs Head-to-Head Legacy Modernization (`POST /api/repo/modernize`) comparing Arm A (1 Single Frontier Model with full-repo stuffing) vs. Arm B (HydraDB Dual-Live `v2` + `v0.4.0` OpenCypher 2-hop graph slice + `<25µs` Cascade Router + `<1ms` Golden Brick + `vm.Script` + `okEnvelope` Slop/Syntax Breaker + real 2-family `parseReviewerVerdictPayload` consensus with `invariantChecks` pre-deliberation + `:SUPERSEDES` writeback gated on `VERIFIED`). Fast-probes `ollamaUrl` (`1500ms`) before `runArmB` to avoid venue Tailscale stalls, keeps 1-file leaf micro-repos on `L1_FAST` unless multi-hop financial math applies, deduplicates target output paths, and labels token/cost telemetry honestly (`INV-DB-08`).
 
 Exports of `src/connectors/hydradb-graph.js` & `src/connectors/sponsors.js`:
-- `createHydraGraphClient(...)`: Native HydraDB `v0.4.0` OpenCypher HTTP client over `safeFetch` (`2000ms` timeout, fast-break on unreachable host, and private/Tailscale IP scrubbing on all error envelopes).
-- `createSponsorHub({ config, hydraClient, hydraGraphClient })`: Manages 8090 Software Factory Tri-API (`sofa-admin-*`, `sofa-ext-*`, `sf-rpt-*`), HydraDB Dual-Live (`v2.0.1` + `v0.4.0` OpenCypher with `INV-DB-HYDRA-ISOLATION-01` token separation), Composio Connect MCP (`ck_*`) + v3 Confused-Deputy 3-layer gate (`INV-DB-07` pinned hosts + delimited `diffSummary`), and ElevenLabs TTS (`3500ms` bounded header + body timeout with offline PCM16 WAV fallback).
+- `scrubPrivateNetworkStrings(value)` & `createHydraGraphClient(...)`: Depth-12 leaf-preserving network/path/secret/email scrubber (never wiping deep nested objects to `{}`) + native HydraDB `v0.4.0` OpenCypher HTTP client over `safeFetch` (`2000ms` header + body timeout and fast-break on unreachable host).
+- `createSponsorHub({ config, hydraClient, hydraGraphClient })`: Manages 8090 Software Factory Tri-API (`sofa-admin-*`, `sofa-ext-*`, `sf-rpt-*`, live `getSoftwareFactoryGovernanceSnapshot` and Stage-4-gated `syncGovernanceReceiptTo8090`), HydraDB Dual-Live (`v2.0.1` + `v0.4.0` OpenCypher with `INV-DB-HYDRA-ISOLATION-01` token separation), Composio Connect MCP (`ck_*`) + v3 Confused-Deputy 3-layer gate (`INV-DB-07` pinned hosts + delimited `diffSummary`), and ElevenLabs TTS (`language_code: 'en'`, `3500ms` bounded header + body timeout with offline PCM16 WAV fallback).
 
 ### Module D (Agent 4): Deadbolt MCP Server & Live Breaker Panel UI
 Files owned exclusively by Agent 4:
@@ -141,8 +143,8 @@ Exports of `client/src/components/BreakerCockpit.jsx`:
          - Attempt 1 (Naive rounding): Gate trips on `+1¢` delta (`expected: 9750¢`, `actual: 9751¢`, `delta: +1¢`).
          - Attempt 2 (Agent tries sneaky workaround editing `sox-reconciler.js` tolerance): **BREAKER TRIPPED (`WORKAROUND_REJECTED`: policy floor cannot be overridden by supervised AI)** + plays ElevenLabs Foreman alert!
          - Attempt 3 (Legitimate integer largest-remainder fix in `fee-engine.js`): `delta: 0¢` + separate-family review passes -> `VERIFIED` PR (`[WO-101]`) + verified SHA-256 audit receipt + **Measured Cost-Per-Verified-Task** ledger.
-  3. **Tab 2: Head-to-Head GitHub Modernizer & Polyglot Hazard Scanner**: Pre-filled quick-select pills (`https://github.com/taniarascia/pdo`, `acme-legacy-billing`, `pdo-nextjs-governed`) + custom GitHub URL / local directory input calling `POST /api/repo/modernize` (Arm A 1-Frontier vs. Arm B HydraDB Dual-Live + `<25µs` Cascade + Golden Bricks) and `POST /api/repo/scan` (`<1ms` 28-rule scanner across 14 extensions).
-  4. **Tab 3: Safety Drills & 8090 MCP Matrix**: One-click **"Run Crash-Recovery Drill (`INV-DB-06`)"** (`POST /api/drills/crash-recovery`), **"Run Confused-Deputy Prompt-Injection Drill (`INV-DB-07`)"** (`POST /api/drills/confused-deputy`), and **8090 MCP Tools Matrix** (`Allow` vs `Confirm`).
+  3. **Tab 2: Head-to-Head GitHub Modernizer & Polyglot Hazard Scanner**: Pre-filled quick-select pills (`https://github.com/taniarascia/pdo`, `acme-legacy-billing`, `pdo-nextjs-governed`) + custom GitHub URL / local directory input calling `POST /api/repo/modernize` (Arm A 1-Frontier vs. Arm B HydraDB Dual-Live + `<25µs` Cascade + Golden Bricks) and `POST /api/repo/scan` (`<1ms` 28-rule scanner across 10 languages and 14 extensions).
+  4. **Tab 3 (`3. 8090 Factory & Safety`)**: Live **8090 Software Factory Tri-API Governance Control Plane** (`GET /api/sofa/governance` + Stage-4-gated `POST /api/sofa/sync-receipt` showing Work Orders, Blueprints, Requirements, Skills, locked `tests`/`blueprints` `AgentPermissionOverride` automations, org token spend, and Stage 4 receipt sync), one-click **"Run Crash-Recovery Drill (`INV-DB-06`)"** (`POST /api/drills/crash-recovery`), **"Run Confused-Deputy Prompt-Injection Drill (`INV-DB-07`)"** (`POST /api/drills/confused-deputy`), and **8090 MCP Tools Matrix** (`4 Allow` vs `1 Confirm`).
 
 ### Choke-Point Orchestrator (Wired Only by Main Orchestrator)
 Files wired exclusively by the orchestrator after subagents finish:
@@ -151,10 +153,10 @@ Files wired exclusively by the orchestrator after subagents finish:
 - `src/server.js`
 - `src/mcp/deadbolt-mcp.js`
 - `client/src/App.jsx`
-- `package.json`, `.env.example`, `config.json`, `Dockerfile`, `.dockerignore`, `.github/workflows/ci.yml`, `README.md`, `AGENTS.md`
+- `package.json`, `client/package.json`, `package-lock.json`, `client/package-lock.json`, `.env.example`, `config.json`, `Dockerfile`, `.dockerignore`, `.gitignore`, `docker-compose.yml`, `.github/workflows/ci.yml`, `README.md`, `AGENTS.md`
 - `tests/deadbolt.test.js`, `tests/smoke.test.js`, `scripts/seed-8090-project.js`
 
-HTTP API Routes exposed by `src/server.js` (`createApiServer` on `127.0.0.1:4090` by default, `HOST=0.0.0.0` in Docker):
+HTTP API Routes exposed by `src/server.js` (`createApiServer` on `127.0.0.1:4090` by default, `HOST=0.0.0.0` in Docker, localhost-scoped CORS):
 - `GET /health` & `GET /doctor` (automatic via `@krusch/toolkit/http`)
 - `GET /api/status`: Full dashboard state, connector statuses, work orders, audit trail head/tail hash, and MCP tool permission table.
 - `POST /api/run`: Synchronous full head-to-head execution (`Standard Agent` vs `DEADBOLT` 3-attempt self-rejection & remediation loop) returning complete JSON receipt.
@@ -164,6 +166,8 @@ HTTP API Routes exposed by `src/server.js` (`createApiServer` on `127.0.0.1:4090
 - `POST /api/drills/crash-recovery`: Runs `runCrashRecoveryDrill`.
 - `POST /api/drills/confused-deputy`: Runs `runConfusedDeputyDrill`.
 - `POST /api/foreman/speak`: Synthesizes Foreman audio alert (`synthesizeForemanAlert`).
+- `GET /api/sofa/governance`: Returns live or deterministic 8090 Software Factory Tri-API governance snapshot (`getSofaGovernance`).
+- `POST /api/sofa/sync-receipt`: Stage-4-gated governance receipt sync to 8090 Work Order + Feedback Inbox (`syncSofaGovernanceReceipt`, `409 UNVERIFIED_STAGE_BLOCKED` before Stage 4 `VERIFIED`, `404 WORK_ORDER_NOT_FOUND` on unknown Work Order).
 - `GET /api/audit`: Returns cryptographically verified SHA-256 audit chain (`getAuditTrail`).
 - `GET /api/metrics` & `POST /api/stream`: Telemetry event counter & baseline SSE stream.
 - Static UI routes (`GET /`, `GET /index.html`, `GET /assets/app.js`, `GET /assets/app.css`, `GET /favicon.svg`).
