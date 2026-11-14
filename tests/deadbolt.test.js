@@ -531,3 +531,89 @@ test('8090 Software Factory v2 Organization Admin (sofa-admin-*) and External AP
     assert.ok(extReq);
     assert.equal(extReq.headers.Authorization, 'Bearer sofa-ext-unit-fixture');
 });
+
+test('Composio Connect MCP (ck_* x-consumer-api-key) connector and INV-DB-07 pre-network gate', async () => {
+    const capturedMcp = [];
+    const sseFrame = [
+        ': connected',
+        '',
+        'event: message',
+        `data: ${JSON.stringify({
+            jsonrpc: '2.0',
+            id: 'deadbolt-pr-WO-101',
+            result: {
+                tools: [
+                    { name: 'COMPOSIO_SEARCH_TOOLS' },
+                    { name: 'COMPOSIO_MULTI_EXECUTE_TOOL' }
+                ]
+            }
+        })}`,
+        ''
+    ].join('\n');
+
+    const mockComposioFetch = async (url, init = {}) => {
+        const parsed = new URL(url);
+        capturedMcp.push({
+            hostname: parsed.hostname,
+            pathname: parsed.pathname,
+            headers: init.headers || {},
+            body: init.body ? JSON.parse(String(init.body)) : null
+        });
+        return new Response(sseFrame, {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    };
+
+    const sponsorHub = createSponsorHub({
+        config: {
+            composioApiKey: 'ck_unit_fixture_consumer_key',
+            composioMcpUrl: 'https://connect.composio.dev/mcp',
+            auditHmacSecret: 'unit-test-hmac-secret'
+        },
+        lookupFn: async () => [{ address: '104.18.32.47', family: 4 }],
+        fetchImpl: mockComposioFetch
+    });
+
+    const statusEnv = sponsorHub.getConnectorStatuses();
+    assert.equal(statusEnv.ok, true);
+    assert.equal(statusEnv.data.connectors.composio.liveConfigured, true);
+    assert.equal(statusEnv.data.connectors.composio.mode, 'composio_connect_mcp_live');
+    assert.equal(statusEnv.data.connectors.composio.endpoint, 'https://connect.composio.dev/mcp');
+
+    // Layer 1 unverified candidate must be blocked BEFORE any outbound Composio MCP request
+    const blockedRes = await sponsorHub.dispatchVerifiedPullRequest({
+        workOrderId: 'WO-101',
+        title: 'Unverified fix',
+        validatorVerdict: 'GATE_REJECTED',
+        auditReceipt: null
+    });
+    assert.equal(blockedRes.ok, false);
+    assert.equal(blockedRes.error.code, 'COMPOSIO_BLOCKED_UNVERIFIED');
+    assert.equal(capturedMcp.length, 0);
+
+    // Verified candidate with valid 64-hex SHA-256 audit receipt authenticates over x-consumer-api-key
+    const validAuditReceipt = {
+        seq: 3,
+        entryHash: 'a'.repeat(64)
+    };
+    const liveRes = await sponsorHub.dispatchVerifiedPullRequest({
+        workOrderId: 'WO-101',
+        title: 'Fix integer basis-point residual allocation in fee-engine',
+        validatorVerdict: 'VERIFIED',
+        auditChainValid: true,
+        auditReceipt: validAuditReceipt
+    });
+    assert.equal(liveRes.ok, true);
+    assert.equal(liveRes.data.mode, 'composio_connect_mcp_live');
+    assert.equal(liveRes.data.mcpToolCount, 2);
+    assert.equal(liveRes.data.hasMultiExecute, true);
+    assert.equal(liveRes.data.autoMerge, false);
+    assert.equal(liveRes.data.receiptSignature.length, 64);
+
+    assert.equal(capturedMcp.length, 1);
+    assert.equal(capturedMcp[0].hostname, 'connect.composio.dev');
+    assert.equal(capturedMcp[0].pathname, '/mcp');
+    assert.equal(capturedMcp[0].headers['x-consumer-api-key'], 'ck_unit_fixture_consumer_key');
+    assert.equal(capturedMcp[0].body.method, 'tools/list');
+});

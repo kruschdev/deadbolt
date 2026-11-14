@@ -22,11 +22,40 @@ const DEFAULT_SOFA_API_BASE_URL = 'https://api.factory.8090.dev';
 const DEFAULT_SOFA_MCP_URL = 'https://api.factory.8090.dev/v2/mcp';
 const DEFAULT_HYDRADB_BASE_URL = 'https://api.hydradb.com';
 const DEFAULT_COMPOSIO_BASE_URL = 'https://backend.composio.dev/api/v3';
+const DEFAULT_COMPOSIO_MCP_URL = 'https://connect.composio.dev/mcp';
+const STREAMABLE_MCP_ACCEPT = ['application/json', ['text', 'event-stream'].join('/')].join(', ');
 const DEFAULT_ELEVENLABS_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
 const DEFAULT_ELEVENLABS_MODEL_ID = 'eleven_turbo_v2_5';
 const SAFE_WORK_ORDER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const SAFE_VOICE_ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
 const HEX64_RE = /^[0-9a-f]{64}$/i;
+
+function parseStreamableMcpJsonRpc(rawText) {
+    const trimmed = String(rawText || '').trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith('{')) {
+        try {
+            return JSON.parse(trimmed);
+        } catch {
+            return null;
+        }
+    }
+    let lastParsed = null;
+    for (const line of trimmed.split(/\r?\n/)) {
+        const match = /^data:\s*(\{[\s\S]*\})\s*$/.exec(line.trim());
+        if (!match) continue;
+        try {
+            const parsed = JSON.parse(match[1]);
+            lastParsed = parsed;
+            if (parsed && (parsed.result !== undefined || parsed.error !== undefined)) {
+                return parsed;
+            }
+        } catch {
+            /* ignore non-JSON SSE lines */
+        }
+    }
+    return lastParsed;
+}
 
 const DEPUTY_BYPASS_DIRECTIVE_RE =
     /\b(?:ignore\s+(?:all\s+)?(?:previous|prior|above|the)?\s*(?:validator|policy\s*floor|audit|gates?|sox|instructions|rules)|bypass\s+(?:the\s+)?(?:validator|policy|gate|audit)|force[-_\s]*merge|auto[-_\s]*merge\s*(?:=|:)?\s*true|merge\s+[A-Za-z0-9_-]+\s+to\s+(?:main|master|production))\b/i;
@@ -182,6 +211,31 @@ export function createSponsorHub({
             mode
         };
     }
+
+    function resolveComposioCredentials() {
+        const apiKey = String(safeConfig.composioApiKey || '').trim();
+        const isConsumerMcp = apiKey.startsWith('ck_');
+        const hasDeveloperKey = Boolean(apiKey && !isConsumerMcp);
+        const mcpUrl = String(safeConfig.composioMcpUrl || DEFAULT_COMPOSIO_MCP_URL).trim();
+        const baseUrl = String(safeConfig.composioBaseUrl || DEFAULT_COMPOSIO_BASE_URL)
+            .trim()
+            .replace(/\/+$/, '');
+        const liveConfigured = Boolean(apiKey);
+        const mode = isConsumerMcp
+            ? 'composio_connect_mcp_live'
+            : hasDeveloperKey
+              ? 'composio_live'
+              : 'verified_local_receipt';
+        return {
+            apiKey,
+            isConsumerMcp,
+            hasDeveloperKey,
+            mcpUrl,
+            baseUrl,
+            liveConfigured,
+            mode
+        };
+    }
     const receiptHmacKey =
         typeof safeConfig.auditHmacSecret === 'string' && safeConfig.auditHmacSecret.trim().length > 0
             ? safeConfig.auditHmacSecret.trim()
@@ -216,11 +270,11 @@ export function createSponsorHub({
      */
     function getConnectorStatuses() {
         const sofaCreds = resolveSofaCredentials();
+        const composioCreds = resolveComposioCredentials();
         const sofaLive = sofaCreds.liveConfigured;
         const hydraV2Live = Boolean(resolvedHydra?.isConfigured?.());
         const hydraGraphLive = Boolean(resolvedHydraGraph?.isConfigured?.());
         const hydraLive = hydraV2Live || hydraGraphLive;
-        const composioLive = Boolean(safeConfig.composioApiKey);
         const elevenlabsLive = Boolean(safeConfig.elevenlabsApiKey);
         const kruschGitRemoteConfigured = Boolean(safeConfig.kruschGitUrl);
 
@@ -279,12 +333,12 @@ export function createSponsorHub({
                 id: 'composio',
                 name: 'Composio Action Gate',
                 role: 'INV-DB-07 3-Layer Confused-Deputy PR Dispatch',
-                liveConfigured: composioLive,
-                mode: composioLive ? 'composio_live' : 'verified_local_receipt',
+                liveConfigured: composioCreds.liveConfigured,
+                mode: composioCreds.mode,
                 status: 'healthy',
                 endpoint: sanitizeEndpointForDisplay(
-                    safeConfig.composioBaseUrl || DEFAULT_COMPOSIO_BASE_URL,
-                    DEFAULT_COMPOSIO_BASE_URL
+                    composioCreds.isConsumerMcp ? composioCreds.mcpUrl : composioCreds.baseUrl,
+                    composioCreds.isConsumerMcp ? DEFAULT_COMPOSIO_MCP_URL : DEFAULT_COMPOSIO_BASE_URL
                 )
             },
             elevenlabs: {
@@ -784,8 +838,90 @@ export function createSponsorHub({
             }
         }
 
-        const composioBase = (safeConfig.composioBaseUrl || DEFAULT_COMPOSIO_BASE_URL).replace(/\/+$/, '');
-        if (safeConfig.composioApiKey) {
+        const receiptSignature = crypto
+            .createHmac('sha256', receiptHmacKey)
+            .update(`${safeWorkOrderId}:${prTitle}:${auditReceipt.entryHash}`, 'utf8')
+            .digest('hex');
+
+        const composioCreds = resolveComposioCredentials();
+        const composioBase = composioCreds.baseUrl;
+
+        if (composioCreds.isConsumerMcp) {
+            let mcpHost = 'connect.composio.dev';
+            try {
+                mcpHost = new URL(composioCreds.mcpUrl).hostname;
+            } catch {
+                mcpHost = 'connect.composio.dev';
+            }
+
+            const mcpRes = await safeFetch(
+                composioCreds.mcpUrl,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Accept: STREAMABLE_MCP_ACCEPT,
+                        'x-consumer-api-key': composioCreds.apiKey
+                    },
+                    body: JSON.stringify({
+                        jsonrpc: '2.0',
+                        id: `deadbolt-pr-${safeWorkOrderId}`,
+                        method: 'tools/list',
+                        params: {}
+                    })
+                },
+                {
+                    allowedProtocols: ['https:'],
+                    allowedHosts: [mcpHost],
+                    allowPrivateLan: false,
+                    allowTailscale: false,
+                    maxRedirects: 0,
+                    timeoutMs: 5000,
+                    tool: 'deadbolt.sponsors.composio_pr',
+                    ...extraSafeFetchOpts
+                }
+            );
+
+            if (!mcpRes.ok && String(mcpRes.error?.code || '').startsWith('SSRF_')) {
+                return errorEnvelope(
+                    'COMPOSIO_BLOCKED_SSRF',
+                    mcpRes.error.message,
+                    { layer: 3, upstreamCode: mcpRes.error.code },
+                    'deadbolt.sponsors.composio_pr'
+                );
+            }
+
+            if (mcpRes.ok && mcpRes.data.status >= 200 && mcpRes.data.status < 300) {
+                let tools = null;
+                try {
+                    const rawBody = await mcpRes.data.response.text();
+                    const rpcJson = parseStreamableMcpJsonRpc(rawBody);
+                    tools = Array.isArray(rpcJson?.result?.tools) ? rpcJson.result.tools : null;
+                } catch {
+                    tools = null;
+                }
+
+                if (tools) {
+                    return okEnvelope(
+                        'deadbolt.sponsors.composio_pr',
+                        `Verified Composio Connect MCP gate (${tools.length} tools) and issued signed PR receipt for "${prTitle}".`,
+                        {
+                            mode: 'composio_connect_mcp_live',
+                            workOrderId: safeWorkOrderId,
+                            prTitle,
+                            targetRepo,
+                            autoMerge: false,
+                            auditEntryHash: auditReceipt.entryHash,
+                            receiptSignature,
+                            diffSummary,
+                            mcpToolCount: tools.length,
+                            hasMultiExecute: tools.some((t) => t?.name === 'COMPOSIO_MULTI_EXECUTE_TOOL'),
+                            untrustedGuard
+                        }
+                    );
+                }
+            }
+        } else if (composioCreds.hasDeveloperKey) {
             let composioHost = 'backend.composio.dev';
             try {
                 composioHost = new URL(composioBase).hostname;
@@ -801,7 +937,7 @@ export function createSponsorHub({
                     headers: {
                         'Content-Type': 'application/json',
                         Accept: 'application/json',
-                        'x-api-key': safeConfig.composioApiKey
+                        'x-api-key': composioCreds.apiKey
                     },
                     body: JSON.stringify({
                         arguments: {
@@ -820,7 +956,8 @@ export function createSponsorHub({
                     allowTailscale: false,
                     maxRedirects: 0,
                     timeoutMs: 5000,
-                    tool: 'deadbolt.sponsors.composio_pr'
+                    tool: 'deadbolt.sponsors.composio_pr',
+                    ...extraSafeFetchOpts
                 }
             );
 
@@ -844,6 +981,8 @@ export function createSponsorHub({
                         targetRepo,
                         autoMerge: false,
                         auditEntryHash: auditReceipt.entryHash,
+                        receiptSignature,
+                        diffSummary,
                         untrustedGuard
                     }
                 );
@@ -865,11 +1004,6 @@ export function createSponsorHub({
                 );
             }
         }
-
-        const receiptSignature = crypto
-            .createHmac('sha256', receiptHmacKey)
-            .update(`${safeWorkOrderId}:${prTitle}:${auditReceipt.entryHash}`, 'utf8')
-            .digest('hex');
 
         return okEnvelope(
             'deadbolt.sponsors.composio_pr',
