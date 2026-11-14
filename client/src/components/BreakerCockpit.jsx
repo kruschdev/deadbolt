@@ -747,6 +747,10 @@ export function BreakerCockpit() {
         ? scanResult.findings
         : [];
 
+    const dependencyPreview = Array.isArray(scanResult.dependencyPreview)
+      ? scanResult.dependencyPreview
+      : [];
+
     return {
       target: scanResult.target || scanInput,
       scannedFiles: scanResult.scannedFiles ?? slopRaw.scannedFiles ?? 0,
@@ -756,6 +760,8 @@ export function BreakerCockpit() {
       breakerTripped: Boolean(slopRaw.breakerTripped ?? findings.length > 0),
       elapsedMs: scanResult.elapsedMs ?? 0,
       recommendedBrickIds: slopRaw.recommendedBrickIds || [],
+      sealedBrickIds: slopRaw.sealedBrickIds || [],
+      dependencyPreview,
       findings
     };
   }, [scanResult, scanInput]);
@@ -1371,6 +1377,34 @@ export function BreakerCockpit() {
                   type="button"
                   className="db-btn db-btn-sm"
                   disabled={scanLoading}
+                  onClick={() => handleScanRepo('https://github.com/taniarascia/pdo')}
+                >
+                  Preset: PHP CRUD (taniarascia/pdo)
+                </button>
+                <button
+                  type="button"
+                  className="db-btn db-btn-sm"
+                  disabled={scanLoading}
+                  onClick={() =>
+                    handleScanRepo(
+                      'https://github.com/amirsanni/Mini-Inventory-and-Sales-Management-System'
+                    )
+                  }
+                >
+                  Preset: PHP POS + VAT (amirsanni/POS)
+                </button>
+                <button
+                  type="button"
+                  className="db-btn db-btn-sm db-btn-emerald"
+                  disabled={scanLoading}
+                  onClick={() => handleScanRepo('pdo-nextjs-governed')}
+                >
+                  Preset: Next.js Port (pdo-nextjs-governed)
+                </button>
+                <button
+                  type="button"
+                  className="db-btn db-btn-sm"
+                  disabled={scanLoading}
                   onClick={() => handleScanRepo('https://github.com/OWASP/NodeGoat')}
                 >
                   Preset: OWASP/NodeGoat
@@ -1390,7 +1424,7 @@ export function BreakerCockpit() {
                 className="db-input"
                 value={scanInput}
                 onChange={(e) => setScanInput(e.target.value)}
-                placeholder="https://github.com/OWASP/NodeGoat or acme-legacy-billing"
+                placeholder="https://github.com/taniarascia/pdo, pdo-nextjs-governed, or acme-legacy-billing"
                 aria-label="GitHub repository URL or local fixture path"
               />
               <button
@@ -1443,6 +1477,30 @@ export function BreakerCockpit() {
                   </div>
                 </div>
 
+                {normalizedScan.dependencyPreview.length > 0 && (
+                  <div className="db-subcard" style={{ marginBottom: '0.75rem' }}>
+                    <div className="db-subcard-head">
+                      <h3 className="db-subcard-title">
+                        Extracted Dependency Graph ({normalizedScan.dependencyPreview.length} edge(s))
+                      </h3>
+                      <span className="db-badge db-badge-cyan">
+                        AST / PHP require &amp; Next.js import map
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.45rem' }}>
+                      {normalizedScan.dependencyPreview.slice(0, 14).map((edge, idx) => (
+                        <span
+                          key={`${edge.from}-${edge.to}-${idx}`}
+                          className="db-badge db-mono"
+                          style={{ fontSize: '0.75rem' }}
+                        >
+                          {edge.from} -&gt; {edge.to} ({edge.relation})
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {normalizedScan.findings.length > 0 ? (
                   <div className="db-table-wrap">
                     <table className="db-table">
@@ -1476,9 +1534,16 @@ export function BreakerCockpit() {
                   </div>
                 ) : (
                   <div className="db-subcard">
-                    <span className="db-badge db-badge-emerald">
-                      ZERO HAND-ROLLED BOILERPLATE DETECTED ({normalizedScan.elapsedMs}ms)
-                    </span>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
+                      <span className="db-badge db-badge-emerald">
+                        ZERO HAND-ROLLED BOILERPLATE DETECTED ({normalizedScan.elapsedMs}ms)
+                      </span>
+                      {normalizedScan.sealedBrickIds.map((brickId) => (
+                        <span key={brickId} className="db-badge db-badge-cyan db-mono">
+                          @krusch/toolkit/{brickId}
+                        </span>
+                      ))}
+                    </div>
                   </div>
                 )}
               </>

@@ -898,3 +898,109 @@ test('Restart-safe file-backed audit HMAC key persistence and markdown-fenced cr
     assert.equal(trail.data.valid, true);
     assert.equal(trail.data.verifiedCount, 2);
 });
+
+test('Legacy PHP -> Next.js Brownfield Scanner, 2-hop PHP dependency graph, and pdo-nextjs-governed 100% brick verification', async (t) => {
+    const osMod = await import('node:os');
+    const orch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        stackDbPath: ':memory:',
+        auditDbPath: ':memory:',
+        kruschGitClient: null
+    });
+    t.after(() => orch.close());
+
+    // 1. Materialize a miniature legacy PHP CRUD + POS site in os.tmpdir()
+    const phpDir = fs.mkdtempSync(path.join(osMod.default.tmpdir(), 'deadbolt-php-legacy-'));
+    t.after(() => fs.rmSync(phpDir, { recursive: true, force: true }));
+
+    fs.mkdirSync(path.join(phpDir, 'public', 'templates'), { recursive: true });
+    fs.writeFileSync(
+        path.join(phpDir, 'config.php'),
+        '<?php\n$host = "localhost";\n$username = "root";\n$password = "root";\n$dsn = "mysql:host=$host;dbname=test";\n',
+        'utf8'
+    );
+    fs.writeFileSync(
+        path.join(phpDir, 'common.php'),
+        '<?php\nsession_start();\nfunction escape($html) { return htmlspecialchars($html, ENT_QUOTES, "UTF-8"); }\n',
+        'utf8'
+    );
+    fs.writeFileSync(
+        path.join(phpDir, 'public', 'templates', 'header.php'),
+        '<!doctype html><html><body><h1>Legacy PHP App</h1>\n',
+        'utf8'
+    );
+    fs.writeFileSync(
+        path.join(phpDir, 'public', 'update.php'),
+        '<?php\nrequire "../config.php";\nrequire "../common.php";\n$conn = new PDO($dsn, $username, $password);\n$stmt = $conn->prepare("SELECT * FROM users");\n$stmt->execute();\nrequire "templates/header.php";\n?>\n<a href="update-single.php?id=1"><?php echo escape("Edit"); ?></a>\n',
+        'utf8'
+    );
+    fs.writeFileSync(
+        path.join(phpDir, 'public', 'update-single.php'),
+        '<?php\nrequire "../config.php";\nrequire "../common.php";\n$id = $_GET["id"];\n$expectedTotPrice = round($qty * $unitPrice, 2);\ntry {\n  $conn = new PDO($dsn, $username, $password);\n} catch (PDOException $error) {\n  echo $error->getMessage();\n}\n',
+        'utf8'
+    );
+
+    const phpScan = await orch.scanRepository({ repoUrlOrPath: phpDir, maxFiles: 30 });
+    assert.equal(phpScan.ok, true);
+    assert.equal(phpScan.data.scannedFiles, 5);
+    assert.ok(phpScan.data.symbolCount >= 5, 'Expected PHP functions and route/template symbols indexed');
+    assert.equal(phpScan.data.slopAudit.breakerTripped, true);
+    assert.equal(phpScan.data.slopAudit.sealedCoverageRatio, 0);
+
+    const ruleIds = new Set(phpScan.data.slopAudit.findings.map((f) => f.ruleId));
+    assert.equal(ruleIds.has('php-hardcoded-db-credentials'), true);
+    assert.equal(ruleIds.has('php-legacy-session-or-weak-crypto'), true);
+    assert.equal(ruleIds.has('php-per-request-pdo-or-sql-leak'), true);
+    assert.equal(ruleIds.has('php-unbounded-table-scan'), true);
+    assert.equal(ruleIds.has('php-unvalidated-superglobal-input'), true);
+    assert.equal(ruleIds.has('php-float-currency-math'), true);
+
+    const hasRequireEdge = phpScan.data.dependencyPreview.some(
+        (e) => e.from === 'public/update.php' && e.to === 'config.php' && e.relation === 'requires'
+    );
+    const hasTemplateEdge = phpScan.data.dependencyPreview.some(
+        (e) =>
+            e.from === 'public/update.php' &&
+            e.to === 'public/templates/header.php' &&
+            e.relation === 'requires'
+    );
+    assert.equal(hasRequireEdge, true);
+    assert.equal(hasTemplateEdge, true);
+
+    // 2. Verify Stage 2 2-hop blast radius across PHP `require` + `links` + `escape()` calls
+    const phpBlast = await orch.stack.git ? await (async () => {
+        const { createPlannerEngine } = await import('../src/engines/planner-graph.js');
+        const planner = createPlannerEngine({ stack: orch.stack, kruschGitClient: null });
+        return planner.analyzeBlastRadius({
+            repoDir: phpDir,
+            repoName: 'legacy-php-blast-test',
+            entryFile: 'common.php',
+            workOrders: [
+                {
+                    id: 'WO-PHP-1',
+                    title: 'Port common.php session & escape helper to Next.js Golden Bricks',
+                    targetFiles: ['common.php']
+                }
+            ]
+        });
+    })() : null;
+
+    assert.equal(phpBlast.ok, true);
+    assert.ok(
+        phpBlast.data.hop1Files.includes('public/update.php') ||
+            phpBlast.data.hop2Files.includes('public/update.php')
+    );
+    assert.ok(
+        phpBlast.data.hop1Files.includes('public/update-single.php') ||
+            phpBlast.data.hop2Files.includes('public/update-single.php')
+    );
+
+    // 3. Verify the governed Next.js port preset (`pdo-nextjs-governed`) achieves 100% Sealed Golden Brick coverage
+    const nextScan = await orch.scanRepository({ repoUrlOrPath: 'pdo-nextjs-governed', maxFiles: 60 });
+    assert.equal(nextScan.ok, true);
+    assert.equal(nextScan.data.scannedFiles, 13);
+    assert.equal(nextScan.data.slopAudit.slopFindingCount, 0);
+    assert.equal(nextScan.data.slopAudit.breakerTripped, false);
+    assert.equal(nextScan.data.slopAudit.sealedCoverageRatio, 1);
+    assert.ok(nextScan.data.dependencyPreview.length >= 5);
+});

@@ -17,6 +17,7 @@ import { createHydraDbClient } from '@krusch/toolkit/hydradb';
 import { createKruschGitClient } from '@krusch/toolkit/krusch-git';
 import { config as defaultConfig } from './config.js';
 import {
+    BILLING_REPO_SNAPSHOT,
     BILLING_WORK_ORDERS,
     ORG_CONTEXT_MODALITIES,
     CANDIDATE_PATCHES,
@@ -805,6 +806,45 @@ export async function createDeadboltOrchestrator(options = {}) {
             } finally {
                 try {
                     fs.rmSync(tempBrownfieldDir, { recursive: true, force: true });
+                } catch {
+                    /* ignore temp cleanup errors */
+                }
+            }
+        }
+
+        if (cleanTarget.toLowerCase() === 'pdo-nextjs-governed') {
+            const tempPortDir = fs.mkdtempSync(
+                path.join(os.tmpdir(), 'deadbolt-pdo-nextjs-governed-')
+            );
+            try {
+                const portFiles = BILLING_REPO_SNAPSHOT.governedNextjsPdoFiles || {};
+                for (const [relPath, fileContent] of Object.entries(portFiles)) {
+                    const normalizedRel = String(relPath).replace(/\\/g, '/').replace(/^\/+/, '');
+                    const destAbs = path.resolve(tempPortDir, normalizedRel);
+                    if (destAbs !== tempPortDir && !destAbs.startsWith(tempPortDir + path.sep)) {
+                        continue;
+                    }
+                    fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+                    fs.writeFileSync(destAbs, String(fileContent), 'utf8');
+                }
+                const scanEnv = await planner.scanExternalRepository({
+                    repoUrlOrPath: tempPortDir,
+                    maxFiles
+                });
+                if (!scanEnv.ok) {
+                    return scanEnv;
+                }
+                return okEnvelope(
+                    'deadbolt.planner.repo_scan',
+                    `Scanned ${scanEnv.data.scannedFiles} file(s) and ${scanEnv.data.symbolCount} AST symbol(s) in pdo-nextjs-governed (${scanEnv.data.slopAudit?.slopFindingCount ?? 0} slop finding(s), ${scanEnv.data.elapsedMs}ms).`,
+                    {
+                        ...scanEnv.data,
+                        target: 'pdo-nextjs-governed'
+                    }
+                );
+            } finally {
+                try {
+                    fs.rmSync(tempPortDir, { recursive: true, force: true });
                 } catch {
                     /* ignore temp cleanup errors */
                 }

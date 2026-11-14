@@ -25,12 +25,14 @@ const SCANNABLE_EXTENSIONS = new Set([
   '.ts',
   '.jsx',
   '.tsx',
-  '.py'
+  '.py',
+  '.php'
 ]);
 
 const SKIPPED_SCAN_DIRS = new Set([
   '.git',
   'node_modules',
+  'vendor',
   'dist',
   'build',
   'coverage',
@@ -220,6 +222,330 @@ function resolveRelativeImportTarget(importerRelFile, specifier, repoFileSet) {
     }
   }
   return null;
+}
+
+/**
+ * Mask PHP block (`/* ... *\/`), line (`//`), and hash (`#`, excluding `#[` attributes)
+ * comments outside single/double-quoted strings while preserving newlines.
+ * @param {string} source
+ * @returns {string}
+ */
+function stripPhpCommentsPreservingNewlines(source) {
+  const raw = String(source || '');
+  let out = '';
+  let i = 0;
+  const len = raw.length;
+
+  while (i < len) {
+    const ch = raw[i];
+    const next = raw[i + 1];
+
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      out += ch;
+      i += 1;
+      while (i < len) {
+        if (raw[i] === '\\' && i + 1 < len) {
+          out += raw[i] + raw[i + 1];
+          i += 2;
+          continue;
+        }
+        out += raw[i];
+        if (raw[i] === quote) {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+
+    if (ch === '/' && next === '*') {
+      out += '  ';
+      i += 2;
+      while (i < len && !(raw[i] === '*' && raw[i + 1] === '/')) {
+        out += raw[i] === '\n' ? '\n' : ' ';
+        i += 1;
+      }
+      if (i < len) {
+        out += '  ';
+        i += 2;
+      }
+      continue;
+    }
+
+    if ((ch === '/' && next === '/') || (ch === '#' && next !== '[')) {
+      while (i < len && raw[i] !== '\n') {
+        out += ' ';
+        i += 1;
+      }
+      continue;
+    }
+
+    out += ch;
+    i += 1;
+  }
+
+  return out;
+}
+
+/**
+ * Extract PHP `include` / `require` file specifiers and local `.php` route links/actions.
+ * @param {string} source
+ * @returns {Array<{ specifier: string, relation: string }>}
+ */
+function extractPhpDependencies(source) {
+  const cleaned = stripPhpCommentsPreservingNewlines(source);
+  const found = [];
+  const seen = new Set();
+
+  const addSpec = (rawSpec, relation) => {
+    const trimmed = String(rawSpec || '')
+      .trim()
+      .split(/[?#]/)[0]
+      .trim();
+    if (!trimmed || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) return;
+    const key = `${relation}:${trimmed}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      found.push({ specifier: trimmed, relation });
+    }
+  };
+
+  // Match `require "config.php"`, `include_once('templates/header.php')`,
+  // `require_once __DIR__ . '/../common.php'`, `include APPPATH . 'views/head.php'`
+  const includePatterns = [
+    /\b(?:include|include_once|require|require_once)\s*\(?\s*(?:(?:__DIR__|dirname\s*\(\s*__FILE__\s*\)|APPPATH|APP|BASEPATH)\s*\.\s*)?['"]([^'"]+\.php)['"]\s*\)?/gi
+  ];
+
+  for (const regex of includePatterns) {
+    for (const match of cleaned.matchAll(regex)) {
+      if (match[1]) addSpec(match[1], 'requires');
+    }
+  }
+
+  // Match multi-page PHP route transitions (`href="update-single.php?id=..."`, `action="create.php"`)
+  const routeLinkRe = /\b(?:href|action)\s*=\s*['"]([^'"]*?\.php)(?:\?[^'"]*)?['"]/gi;
+  for (const match of cleaned.matchAll(routeLinkRe)) {
+    if (match[1]) addSpec(match[1], 'links');
+  }
+
+  return found;
+}
+
+/**
+ * Resolve a PHP `include`/`require` or `.php` route target against `repoFileSet`.
+ * @param {string} importerRelFile
+ * @param {string} rawSpecifier
+ * @param {Set<string>} repoFileSet
+ * @returns {string|null}
+ */
+function resolvePhpDependencyTarget(importerRelFile, rawSpecifier, repoFileSet) {
+  const cleanSpec = String(rawSpecifier || '')
+    .replace(/\\/g, '/')
+    .split(/[?#]/)[0]
+    .replace(/^\/+/, '')
+    .trim();
+  if (!cleanSpec) return null;
+
+  const baseDir = path.posix.dirname(importerRelFile);
+  const relJoined = path.posix.normalize(path.posix.join(baseDir, cleanSpec));
+  const rootJoined = path.posix.normalize(cleanSpec);
+
+  const candidates = [];
+  if (!relJoined.startsWith('..')) {
+    candidates.push(relJoined, `${relJoined}.php`);
+  }
+  if (!rootJoined.startsWith('..')) {
+    candidates.push(
+      rootJoined,
+      `${rootJoined}.php`,
+      `public/${rootJoined}`,
+      `application/${rootJoined}`,
+      `src/${rootJoined}`
+    );
+  }
+
+  for (const candidate of candidates) {
+    if (repoFileSet.has(candidate) && candidate !== importerRelFile) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract PHP AST declarations (`namespace`, `class`, `interface`, `trait`, `function`)
+ * plus deterministic route/module symbols for top-level procedural PHP scripts.
+ * @param {string} source
+ * @param {string} relFile
+ * @returns {Array<{ symbol_name: string, symbol_type: string, start_line: number }>}
+ */
+function extractPhpFileSymbols(source, relFile) {
+  const cleaned = stripPhpCommentsPreservingNewlines(source);
+  const lines = cleaned.split(/\r?\n/);
+  const symbols = [];
+  const seen = new Set();
+
+  const pushSym = (symbolName, symbolType, lineNumber) => {
+    const cleanName = String(symbolName || '').trim();
+    if (!cleanName || seen.has(cleanName)) return;
+    seen.add(cleanName);
+    symbols.push({
+      symbol_name: cleanName,
+      symbol_type: symbolType,
+      start_line: lineNumber
+    });
+  };
+
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = lines[idx];
+    const lineNo = idx + 1;
+
+    const nsMatch = line.match(/\bnamespace\s+([A-Za-z_\\][A-Za-z0-9_\\]*)\s*;/);
+    if (nsMatch) {
+      pushSym(nsMatch[1], 'namespace', lineNo);
+    }
+
+    const classMatch = line.match(
+      /\b(?:(?:abstract|final|readonly)\s+)*(class|interface|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b/
+    );
+    if (classMatch) {
+      pushSym(classMatch[2], classMatch[1], lineNo);
+    }
+
+    const fnMatch = line.match(
+      /\bfunction\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/
+    );
+    if (fnMatch) {
+      pushSym(fnMatch[1], 'function', lineNo);
+    }
+  }
+
+  // Procedural PHP pages (`public/create.php`, `config.php`, `templates/header.php`) often execute
+  // top-level statements without declaring functions; emit a deterministic entrypoint symbol.
+  if (symbols.length === 0) {
+    const baseName = path.posix.basename(relFile, '.php');
+    const lowerRel = relFile.toLowerCase();
+    const isTemplate = lowerRel.includes('template') || lowerRel.includes('header') || lowerRel.includes('footer');
+    const isConfig = lowerRel.includes('config');
+    const prefix = isTemplate ? 'template' : isConfig ? 'config' : 'route';
+    pushSym(`${prefix}:${baseName}`, prefix, 1);
+  }
+
+  return symbols;
+}
+
+/**
+ * Deterministic `<1ms` PHP-to-Next.js migration & slop hazard scanner mapping legacy PHP
+ * constructs to sealed `@krusch/toolkit` Golden Bricks.
+ * @param {string} source
+ * @param {string} filePath
+ * @returns {Array<{ filePath: string, ruleId: string, brickId: string, importPath: string, severity: string, message: string }>}
+ */
+function auditPhpMigrationFile(source, filePath) {
+  const cleaned = stripPhpCommentsPreservingNewlines(source);
+  const findings = [];
+
+  const pushFinding = (ruleId, brickId, importPath, message) => {
+    findings.push({
+      filePath,
+      ruleId,
+      brickId,
+      importPath,
+      severity: 'error',
+      message
+    });
+  };
+
+  if (
+    /\b(?:round|number_format)\s*\([^;\n]*\$(?:this->)?[A-Za-z0-9_]*(?:price|amount|vat|tax|discount|fee|total|subtotal|cash|pos|tendered|balance)[A-Za-z0-9_]*/i.test(
+      cleaned
+    ) ||
+    /\$(?:this->)?[A-Za-z0-9_]*(?:price|amount|vat|tax|discount|fee|total|subtotal)[A-Za-z0-9_]*\s*=\s*round\s*\(/i.test(
+      cleaned
+    )
+  ) {
+    pushFinding(
+      'php-float-currency-math',
+      'audit-log',
+      '@krusch/toolkit/audit-log',
+      'Floating-point PHP currency rounding (round(..., 2)) risks sub-cent batch drift during Next.js migration; port to integer-cent largest-remainder allocation (INV-FIN-03) with @krusch/toolkit/audit-log.'
+    );
+  }
+
+  if (
+    /["']\s*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b[^"'\n]*\$[A-Za-z_]/i.test(cleaned) ||
+    /\bmysqli_query\s*\([^;\n]*\$_(?:GET|POST|REQUEST)/i.test(cleaned)
+  ) {
+    pushFinding(
+      'php-raw-sql-interpolation',
+      'sqlite',
+      '@krusch/toolkit/sqlite',
+      'Interpolated PHP variable inside SQL statement risks SQL injection; port to parameterized @krusch/toolkit/sqlite (openSqliteDb) or @krusch/toolkit/pg (createPgPool) queries.'
+    );
+  }
+
+  if (
+    /\bnew\s+PDO\s*\(/.test(cleaned) ||
+    /\bmysqli_connect\s*\(/.test(cleaned) ||
+    /\becho\b[^;\n]*->getMessage\s*\(\s*\)/.test(cleaned)
+  ) {
+    pushFinding(
+      'php-per-request-pdo-or-sql-leak',
+      'sqlite',
+      '@krusch/toolkit/sqlite',
+      'Per-request PHP DB connection or raw PDOException HTML echo detected; centralize pooled DB access in Next.js server modules with @krusch/toolkit/sqlite or @krusch/toolkit/pg and @krusch/toolkit/http (errorEnvelope).'
+    );
+  }
+
+  if (/\$_(?:POST|GET|REQUEST)\s*\[/.test(cleaned)) {
+    pushFinding(
+      'php-unvalidated-superglobal-input',
+      'schema',
+      '@krusch/toolkit/schema',
+      'Untyped PHP $_POST/$_GET superglobal intake; port to Next.js App Router Route Handlers or Server Actions validated with @krusch/toolkit/schema (s, validateSchema).'
+    );
+  }
+
+  if (
+    /\bsession_start\s*\(/.test(cleaned) ||
+    /\bmcrypt_create_iv\s*\(/.test(cleaned) ||
+    /\b(?:md5|sha1)\s*\(/.test(cleaned)
+  ) {
+    pushFinding(
+      'php-legacy-session-or-weak-crypto',
+      'auth',
+      '@krusch/toolkit/auth',
+      'Stateful PHP session_start() or weak/deprecated crypto (mcrypt/md5/sha1) detected; port to stateless httpOnly JWT sessions via @krusch/toolkit/auth (createAuth).'
+    );
+  }
+
+  if (
+    /\$(?:password|passwd|db_pass|dbpass)\s*=\s*['"][^'"]+['"]/i.test(cleaned) ||
+    /\bdefine\s*\(\s*['"]DB_PASS(?:WORD)?['"]\s*,\s*['"][^'"]+['"]\s*\)/i.test(cleaned)
+  ) {
+    pushFinding(
+      'php-hardcoded-db-credentials',
+      'config',
+      '@krusch/toolkit/config',
+      'Hardcoded PHP database credentials in source; externalize server-only configuration via @krusch/toolkit/config (loadProjectConfig, envOr).'
+    );
+  }
+
+  if (
+    /\bSELECT\s+\*\s+FROM\s+[A-Za-z0-9_`]+(?:\s*;|\s*["'])/i.test(cleaned) &&
+    !/\bLIMIT\b/i.test(cleaned)
+  ) {
+    pushFinding(
+      'php-unbounded-table-scan',
+      'pagination',
+      '@krusch/toolkit/pagination',
+      'Unbounded SELECT * table scan without cursor limit; port Next.js list routes to HMAC-signed keyset pagination via @krusch/toolkit/pagination (encodeCursor, paginateItems).'
+    );
+  }
+
+  return findings;
 }
 
 /**
@@ -443,7 +769,8 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       }
     };
 
-    // 1. Walk relative ESM/CJS imports across indexed repository files
+    // 1. Walk relative ESM/CJS imports and PHP `require`/`include` dependencies across repository files
+    const phpSourceByFile = new Map();
     for (const relFile of allFiles) {
       const ext = path.extname(relFile).toLowerCase();
       if (ext === '.py') continue;
@@ -453,6 +780,18 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       } catch {
         continue;
       }
+
+      if (ext === '.php') {
+        phpSourceByFile.set(relFile, content);
+        for (const dep of extractPhpDependencies(content)) {
+          const resolvedTarget = resolvePhpDependencyTarget(relFile, dep.specifier, repoFileSet);
+          if (resolvedTarget) {
+            recordDirectedDependency(relFile, resolvedTarget, dep.relation);
+          }
+        }
+        continue;
+      }
+
       const specifiers = extractRelativeSpecifiers(content);
       for (const spec of specifiers) {
         const resolvedTarget = resolveRelativeImportTarget(relFile, spec, repoFileSet);
@@ -462,9 +801,28 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       }
     }
 
-    // 2. Walk AST symbols and `stack.git.dependencyGraph` symbol call edges
+    // 2. Walk AST symbols (`stack.git` for JS/TS/PY + PHP symbol/call extractor for `.php`)
     let totalSymbols = 0;
+    const phpDeclaredSymbolOwner = new Map();
+
     for (const relFile of allFiles) {
+      const ext = path.extname(relFile).toLowerCase();
+      if (ext === '.php') {
+        const phpContent = phpSourceByFile.get(relFile) || '';
+        const phpSyms = extractPhpFileSymbols(phpContent, relFile);
+        symbolsByFile.set(relFile, phpSyms);
+        totalSymbols += phpSyms.length;
+        for (const sym of phpSyms) {
+          if (
+            (sym.symbol_type === 'function' || sym.symbol_type === 'class') &&
+            !phpDeclaredSymbolOwner.has(sym.symbol_name)
+          ) {
+            phpDeclaredSymbolOwner.set(sym.symbol_name, relFile);
+          }
+        }
+        continue;
+      }
+
       const fileSymRes = stack.git.fileSymbols({ repo: repoName, file_path: relFile });
       const syms = Array.isArray(fileSymRes?.data?.symbols) ? fileSymRes.data.symbols : [];
       symbolsByFile.set(relFile, syms);
@@ -480,6 +838,24 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           const callerFile = normalizeRelPath(caller.from_file);
           if (callerFile && callerFile !== relFile) {
             recordDirectedDependency(callerFile, relFile, 'calls', sym.symbol_name);
+          }
+        }
+      }
+    }
+
+    // Resolve cross-file PHP function & class invocation edges
+    if (phpDeclaredSymbolOwner.size > 0) {
+      for (const [callerFile, rawPhp] of phpSourceByFile.entries()) {
+        const cleanedPhp = stripPhpCommentsPreservingNewlines(rawPhp);
+        for (const [symName, ownerFile] of phpDeclaredSymbolOwner.entries()) {
+          if (callerFile === ownerFile) continue;
+          const escaped = symName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const callRe = new RegExp(`\\b(?:new\\s+${escaped}|${escaped}\\s*(?:\\(|::))`);
+          if (callRe.test(cleanedPhp)) {
+            const declLineRe = new RegExp(`\\b(?:function|class|interface|trait)\\s+&?\\s*${escaped}\\b`);
+            if (!declLineRe.test(cleanedPhp)) {
+              recordDirectedDependency(callerFile, ownerFile, 'calls', symName);
+            }
           }
         }
       }
@@ -1039,6 +1415,19 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       const repoFileSet = new Set(relFiles);
       const fileEntries = [];
       const dependencyPreview = [];
+      const seenPreviewEdge = new Set();
+      const phpSymbolsByFile = new Map();
+      const phpFindings = [];
+      let phpSymbolTotal = 0;
+
+      const pushPreviewEdge = (from, to, relation) => {
+        if (!from || !to || from === to || dependencyPreview.length >= 40) return;
+        const edgeKey = `${from}->${to}:${relation}`;
+        if (!seenPreviewEdge.has(edgeKey)) {
+          seenPreviewEdge.add(edgeKey);
+          dependencyPreview.push({ from, to, relation });
+        }
+      };
 
       for (const relFile of relFiles) {
         let content = '';
@@ -1052,15 +1441,24 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           content
         });
 
-        if (path.extname(relFile).toLowerCase() !== '.py') {
+        const ext = path.extname(relFile).toLowerCase();
+        if (ext === '.php') {
+          const phpSyms = extractPhpFileSymbols(content, relFile);
+          phpSymbolsByFile.set(relFile, phpSyms);
+          phpSymbolTotal += phpSyms.length;
+          phpFindings.push(...auditPhpMigrationFile(content, relFile));
+
+          for (const dep of extractPhpDependencies(content)) {
+            const target = resolvePhpDependencyTarget(relFile, dep.specifier, repoFileSet);
+            if (target) {
+              pushPreviewEdge(relFile, target, dep.relation);
+            }
+          }
+        } else if (ext !== '.py') {
           for (const spec of extractRelativeSpecifiers(content)) {
             const target = resolveRelativeImportTarget(relFile, spec, repoFileSet);
-            if (target && dependencyPreview.length < 40) {
-              dependencyPreview.push({
-                from: relFile,
-                to: target,
-                relation: 'imports'
-              });
+            if (target) {
+              pushPreviewEdge(relFile, target, 'imports');
             }
           }
         }
@@ -1074,11 +1472,18 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       });
 
       const topFiles = fileEntries.slice(0, 15).map((entry) => {
-        const symRes = stack.git.fileSymbols({
-          repo: scanRepoName,
-          file_path: entry.filePath
-        });
-        const syms = Array.isArray(symRes?.data?.symbols) ? symRes.data.symbols : [];
+        const ext = path.extname(entry.filePath).toLowerCase();
+        const syms =
+          ext === '.php'
+            ? phpSymbolsByFile.get(entry.filePath) || []
+            : (() => {
+                const symRes = stack.git.fileSymbols({
+                  repo: scanRepoName,
+                  file_path: entry.filePath
+                });
+                return Array.isArray(symRes?.data?.symbols) ? symRes.data.symbols : [];
+              })();
+
         return {
           filePath: entry.filePath,
           lineCount: entry.content.split(/\r?\n/).length,
@@ -1088,11 +1493,36 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       });
 
       const coverage = scoreLegoBrickCoverage(fileEntries);
-      const symbolCount = Number(indexRes?.data?.symbols_indexed ?? 0);
+      const baseAudit = coverage.data;
+      const mergedFindings = [...baseAudit.findings, ...phpFindings];
+      const flaggedFileSet = new Set(mergedFindings.map((item) => item.filePath));
+      const recommendedSet = new Set(baseAudit.recommendedBrickIds || []);
+      for (const item of phpFindings) {
+        if (item.brickId) recommendedSet.add(item.brickId);
+      }
+      const totalSlopCount = mergedFindings.length;
+      const totalTouchpoints = baseAudit.sealedTouchpoints + totalSlopCount;
+      const mergedCoverageRatio =
+        totalTouchpoints === 0
+          ? 1
+          : Number((baseAudit.sealedTouchpoints / totalTouchpoints).toFixed(4));
+
+      const mergedSlopAudit = {
+        ...baseAudit,
+        cleanFiles: Math.max(0, fileEntries.length - flaggedFileSet.size),
+        flaggedFiles: flaggedFileSet.size,
+        slopFindingCount: totalSlopCount,
+        recommendedBrickIds: [...recommendedSet].sort(),
+        sealedCoverageRatio: mergedCoverageRatio,
+        breakerTripped: totalSlopCount > 0,
+        findings: mergedFindings
+      };
+
+      const symbolCount = Number(indexRes?.data?.symbols_indexed ?? 0) + phpSymbolTotal;
       const elapsedMs = Number((Number(process.hrtime.bigint() - startNs) / 1e6).toFixed(3));
       const displayTarget = looksLikeUrl ? rawTarget : scanRepoName;
 
-      const summary = `Scanned ${fileEntries.length} file(s) and ${symbolCount} AST symbol(s) in ${displayTarget} (${coverage.data.slopFindingCount} slop finding(s), ${elapsedMs}ms).`;
+      const summary = `Scanned ${fileEntries.length} file(s) and ${symbolCount} AST symbol(s) in ${displayTarget} (${mergedSlopAudit.slopFindingCount} slop finding(s), ${elapsedMs}ms).`;
 
       return okEnvelope('deadbolt.planner.repo_scan', summary, {
         target: looksLikeUrl ? rawTarget : displayTarget,
@@ -1100,7 +1530,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         symbolCount,
         topFiles,
         dependencyPreview,
-        slopAudit: coverage.data,
+        slopAudit: mergedSlopAudit,
         elapsedMs
       });
     } finally {

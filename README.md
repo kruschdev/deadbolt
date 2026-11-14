@@ -71,3 +71,4 @@ Open `http://127.0.0.1:4090` to launch the **DEADBOLT Breaker Panel**, or attach
 - **ElevenLabs** (ElevenLabs TTS Streaming API, Sponsor Service Terms)
 - **Vercel** (Deployment & Preview Platform, Sponsor Service Terms)
 - **Node.js 22 ESM, PostgreSQL + `pgvector`, SQLite (`node:sqlite`), React 19 + Vite 6** (MIT / PostgreSQL License)
+- **Brownfield PHP -> Next.js Reference Targets**: [`taniarascia/pdo`](https://github.com/taniarascia/pdo) (MIT License, Copyright Tania Rascia; reference schema for `pdo-nextjs-governed` Next.js App Router port) and [`amirsanni/Mini-Inventory-and-Sales-Management-System`](https://github.com/amirsanni/Mini-Inventory-and-Sales-Management-System) (MIT License; live brownfield scanner preset).
