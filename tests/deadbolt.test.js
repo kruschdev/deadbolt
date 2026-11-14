@@ -155,6 +155,18 @@ test('HydraDB v0.4.0 OpenCypher client: cell decoding, /healthz, MERGE seeding, 
                 );
             }
 
+            if (cypher.startsWith('MERGE ')) {
+                assert.equal(
+                    cypher.includes('RETURN'),
+                    false,
+                    'HydraDB v0.4.0 MERGE mutations must not include trailing RETURN clauses'
+                );
+                return new Response(
+                    JSON.stringify({ columns: [], rows: [], read_epoch: null }),
+                    { status: 200, headers: { 'Content-Type': 'application/json' } }
+                );
+            }
+
             return new Response(
                 JSON.stringify({
                     columns: ['woVertexId', 'activeInvVertexId', 'supersededInvVertexId'],

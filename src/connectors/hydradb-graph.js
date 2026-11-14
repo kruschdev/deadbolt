@@ -324,10 +324,19 @@ export function createHydraGraphClient(options = {}) {
         }
 
         if (res.data.status < 200 || res.data.status >= 300) {
+            const errMsg =
+                typeof rawJson?.error === 'string'
+                    ? rawJson.error
+                    : rawJson?.error?.message ||
+                      rawJson?.message ||
+                      `HydraDB query returned HTTP ${res.data.status}.`;
             return errorEnvelope(
                 'HYDRADB_QUERY_HTTP_ERROR',
-                rawJson?.error || rawJson?.message || `HydraDB query returned HTTP ${res.data.status}.`,
-                { status: res.data.status },
+                errMsg,
+                {
+                    status: res.data.status,
+                    hydraCode: rawJson?.error?.code || null
+                },
                 'deadbolt.hydradb.query'
             );
         }
@@ -384,64 +393,48 @@ export function createHydraGraphClient(options = {}) {
             );
         }
 
-        const seedLineageCypher = [
-            'MERGE (wo:WorkOrder {id: $woId})',
-            'SET wo.code = $woCode',
-            'MERGE (prev:Invariant {id: $prevInvId})',
-            'SET prev.code = $prevCode, prev.status = $prevStatus',
-            'MERGE (curr:Invariant {id: $currInvId})',
-            'SET curr.code = $currCode, curr.status = $currStatus',
-            'MERGE (curr)-[:SUPERSEDES]->(prev)',
-            'MERGE (wo)-[:GOVERNED_BY]->(curr)',
-            'RETURN wo.id AS woVertexId, curr.id AS activeInvVertexId, prev.id AS supersededInvVertexId'
-        ].join('\n');
-
-        const lineageRes = await queryOpenCypher(seedLineageCypher, {
-            woId: 9001,
-            woCode: cleanWoId,
-            prevInvId: 8002,
-            prevCode: supersededCode,
-            prevStatus: 'SUPERSEDED',
-            currInvId: 8003,
-            currCode: activeCode,
-            currStatus: 'ACTIVE'
-        });
-
-        if (!lineageRes.ok) {
-            return lineageRes;
+        // HydraDB v0.4.0 OpenCypher dialect rules (verified live against ghcr.io/hydra-db/hydradb:0.4.0):
+        // 1. Single-statement MERGE accepts one-hop directed edge patterns without trailing SET/RETURN clauses.
+        // 2. Mutations return { columns: [], rows: [], read_epoch: null }; follow up with MATCH ... RETURN.
+        const supersedesRes = await queryOpenCypher(
+            'MERGE (curr:Invariant {id: $currInvId, code: $currCode, status: $currStatus})-[:SUPERSEDES]->(prev:Invariant {id: $prevInvId, code: $prevCode, status: $prevStatus})',
+            {
+                currInvId: 8003,
+                currCode: activeCode,
+                currStatus: 'ACTIVE',
+                prevInvId: 8002,
+                prevCode: supersededCode,
+                prevStatus: 'SUPERSEDED'
+            }
+        );
+        if (!supersedesRes.ok) {
+            return supersedesRes;
         }
 
-        for (let i = 0; i < fileVertices.length; i += 1) {
-            const node = fileVertices[i];
-            const nodeRes = await queryOpenCypher(
-                [
-                    'MERGE (f:CodeFile {id: $vertexId})',
-                    'SET f.path = $filePath, f.protected = $isProtected',
-                    'RETURN f.id AS vertexId, f.path AS filePath, f.protected AS isProtected'
-                ].join('\n'),
-                {
-                    vertexId: node.vertexId,
-                    filePath: node.filePath,
-                    isProtected: node.isProtected
-                }
-            );
-            if (!nodeRes.ok) {
-                return nodeRes;
+        const governedRes = await queryOpenCypher(
+            'MERGE (wo:WorkOrder {id: $woId, code: $woCode})-[:GOVERNED_BY]->(curr:Invariant {id: $currInvId})',
+            {
+                woId: 9001,
+                woCode: cleanWoId,
+                currInvId: 8003
             }
+        );
+        if (!governedRes.ok) {
+            return governedRes;
         }
 
         for (let i = 0; i < fileVertices.length - 1; i += 1) {
             const src = fileVertices[i];
             const dst = fileVertices[i + 1];
             const edgeRes = await queryOpenCypher(
-                [
-                    'MATCH (src:CodeFile {id: $srcId}), (dst:CodeFile {id: $dstId})',
-                    'MERGE (src)-[:DEPENDED_ON_BY]->(dst)',
-                    'RETURN src.id AS srcVertexId, dst.id AS dstVertexId'
-                ].join('\n'),
+                'MERGE (src:CodeFile {id: $srcId, path: $srcPath, protected: $srcProtected})-[:DEPENDED_ON_BY]->(dst:CodeFile {id: $dstId, path: $dstPath, protected: $dstProtected})',
                 {
                     srcId: src.vertexId,
-                    dstId: dst.vertexId
+                    srcPath: src.filePath,
+                    srcProtected: src.isProtected === true,
+                    dstId: dst.vertexId,
+                    dstPath: dst.filePath,
+                    dstProtected: dst.isProtected === true
                 }
             );
             if (!edgeRes.ok) {
@@ -449,17 +442,27 @@ export function createHydraGraphClient(options = {}) {
             }
         }
 
-        await queryOpenCypher(
-            [
-                'MATCH (wo:WorkOrder {id: $woId}), (entry:CodeFile {id: $entryId})',
-                'MERGE (wo)-[:TARGETS]->(entry)',
-                'RETURN wo.id AS woVertexId, entry.id AS entryVertexId'
-            ].join('\n'),
+        const targetEdgeRes = await queryOpenCypher(
+            'MERGE (wo:WorkOrder {id: $woId})-[:TARGETS]->(entry:CodeFile {id: $entryId})',
             {
                 woId: 9001,
                 entryId: fileVertices[0].vertexId
             }
         );
+        if (!targetEdgeRes.ok) {
+            return targetEdgeRes;
+        }
+
+        const lineageRes = await queryOpenCypher(
+            [
+                'MATCH (wo:WorkOrder {id: $woId})-[:GOVERNED_BY]->(curr:Invariant)-[:SUPERSEDES]->(prev:Invariant)',
+                'RETURN wo.id AS woVertexId, curr.id AS activeInvVertexId, prev.id AS supersededInvVertexId'
+            ].join('\n'),
+            { woId: 9001 }
+        );
+        if (!lineageRes.ok) {
+            return lineageRes;
+        }
 
         return okEnvelope(
             'deadbolt.hydradb.seed_graph',
