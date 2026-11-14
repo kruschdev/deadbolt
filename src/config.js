@@ -39,8 +39,37 @@ const baseConfig = await loadProjectConfig(projectRoot, {
     logDir: path.join(projectRoot, 'logs')
 });
 
+const resolvedAuditDbPath = path.resolve(
+    projectRoot,
+    envOr('AUDIT_DB_PATH', baseConfig.auditDbPath, './data/deadbolt-audit.db')
+);
+
+function resolvePersistentAuditHmacSecret(auditDbPath, explicitSecret) {
+    const cleanExplicit = String(explicitSecret || '').trim();
+    if (cleanExplicit) return cleanExplicit;
+    if (!auditDbPath || auditDbPath === ':memory:') {
+        return crypto.randomBytes(32).toString('hex');
+    }
+    const keyFilePath = `${path.resolve(auditDbPath)}.hmac`;
+    try {
+        if (fs.existsSync(keyFilePath)) {
+            const existing = fs.readFileSync(keyFilePath, 'utf8').trim();
+            if (existing.length >= 32) return existing;
+        }
+        fs.mkdirSync(path.dirname(keyFilePath), { recursive: true });
+        const generated = crypto.randomBytes(32).toString('hex');
+        fs.writeFileSync(keyFilePath, `${generated}\n`, { mode: 0o600 });
+        return generated;
+    } catch {
+        return crypto.randomBytes(32).toString('hex');
+    }
+}
+
 const configuredHmac = envOr('AUDIT_HMAC_SECRET', baseConfig.auditHmacSecret, '');
-const runtimeHmacSecret = configuredHmac || crypto.randomBytes(32).toString('hex');
+const runtimeHmacSecret = resolvePersistentAuditHmacSecret(resolvedAuditDbPath, configuredHmac);
+const resolvedGeminiApiKey = envOr('GEMINI_API_KEY', baseConfig.geminiApiKey, '');
+const resolvedOpenRouterApiKey = envOr('OPENROUTER_API_KEY', baseConfig.openRouterApiKey, '');
+const defaultEnableLiveReviewers = Boolean(resolvedOpenRouterApiKey || resolvedGeminiApiKey);
 
 export const config = Object.freeze({
     projectRoot,
@@ -48,7 +77,7 @@ export const config = Object.freeze({
     serviceName: envOr('SERVICE_NAME', baseConfig.serviceName, 'deadbolt'),
     dbPath: path.resolve(projectRoot, envOr('DB_PATH', baseConfig.dbPath, './data/deadbolt.db')),
     stackDbPath: path.resolve(projectRoot, envOr('STACK_DB_PATH', baseConfig.stackDbPath, './data/krusch-stack.db')),
-    auditDbPath: path.resolve(projectRoot, envOr('AUDIT_DB_PATH', baseConfig.auditDbPath, './data/deadbolt-audit.db')),
+    auditDbPath: resolvedAuditDbPath,
     logDir: path.resolve(projectRoot, envOr('LOG_DIR', baseConfig.logDir, './logs')),
     kruschGitUrl: envOr('KRUSCH_GIT_URL', baseConfig.kruschGitUrl, 'http://127.0.0.1:4890'),
     ollamaUrl: envOr('OLLAMA_URL', baseConfig.ollamaUrl, 'http://127.0.0.1:11434'),
@@ -75,8 +104,12 @@ export const config = Object.freeze({
     elevenlabsApiKey: envOr('ELEVENLABS_API_KEY', baseConfig.elevenlabsApiKey, ''),
     elevenlabsVoiceId: envOr('ELEVENLABS_VOICE_ID', baseConfig.elevenlabsVoiceId, 'JBFqnCBsd6RMkjVDRZzb'),
     elevenlabsModelId: envOr('ELEVENLABS_MODEL_ID', baseConfig.elevenlabsModelId, 'eleven_turbo_v2_5'),
-    geminiApiKey: envOr('GEMINI_API_KEY', baseConfig.geminiApiKey, ''),
-    openRouterApiKey: envOr('OPENROUTER_API_KEY', baseConfig.openRouterApiKey, ''),
-    enableLiveReviewers: envBool('ENABLE_LIVE_REVIEWERS', baseConfig.enableLiveReviewers, false),
+    geminiApiKey: resolvedGeminiApiKey,
+    openRouterApiKey: resolvedOpenRouterApiKey,
+    enableLiveReviewers: envBool(
+        'ENABLE_LIVE_REVIEWERS',
+        baseConfig.enableLiveReviewers,
+        defaultEnableLiveReviewers
+    ),
     auditHmacSecret: runtimeHmacSecret
 });

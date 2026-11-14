@@ -818,3 +818,83 @@ test('HydraDB v2 Cloud REST (API-Version: 2 /context/ingest, /query hybrid think
     assert.equal(fbReq.jsonBody.rating, 'positive');
     assert.ok(Array.isArray(fbReq.jsonBody.ground_truth.source_ids));
 });
+
+test('Restart-safe file-backed audit HMAC key persistence and markdown-fenced cross-family cost telemetry', async (t) => {
+    const osMod = await import('node:os');
+    const {
+        createValidatorEngine,
+        parseReviewerVerdictPayload,
+        estimateReviewerUsageCostUsd
+    } = await import('../src/engines/validator-gate.js');
+    const { CANDIDATE_PATCHES, materializeBillingRepo } = await import(
+        '../src/fixtures/billing-scenario.js'
+    );
+
+    // 1. Markdown-fenced JSON with "REJECT" inside rationale must still parse as APPROVE
+    const fencedApprove = parseReviewerVerdictPayload(
+        '```json\n{"verdict":"APPROVE","rationale":"Exact cent conservation holds; no reason to REJECT."}\n```'
+    );
+    assert.equal(fencedApprove.verdict, 'APPROVE');
+    assert.equal(
+        fencedApprove.rationale,
+        'Exact cent conservation holds; no reason to REJECT.'
+    );
+
+    const measuredCost = estimateReviewerUsageCostUsd('deepseek/deepseek-v3.2', {
+        inputTokens: 500,
+        outputTokens: 100
+    });
+    assert.ok(measuredCost > 0);
+
+    // 2. Two sequential validator instances sharing a file-backed auditDbPath without explicit hmacSecret
+    const tmpDir = fs.mkdtempSync(path.join(osMod.default.tmpdir(), 'deadbolt-audit-restart-'));
+    t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+    const repoDir = path.join(tmpDir, 'repo');
+    materializeBillingRepo(repoDir);
+    const auditDbPath = path.join(tmpDir, 'deadbolt-audit.db');
+
+    const v1 = createValidatorEngine({ auditDbPath });
+    const run1 = await v1.validateCandidate({
+        workOrderId: 'WO-101',
+        attemptLabel: 'boot1',
+        repoDir,
+        edits: CANDIDATE_PATCHES.verifiedRemediationPatch,
+        runCrossModel: false
+    });
+    assert.equal(run1.ok, true);
+    assert.equal(run1.data.verdict, 'VERIFIED');
+    v1.close();
+
+    assert.equal(fs.existsSync(`${auditDbPath}.hmac`), true);
+
+    const v2 = createValidatorEngine({
+        auditDbPath,
+        llmConfig: {
+            enableLiveReviewers: true,
+            openRouterApiKey: 'unit-test-or-key',
+            chatImpl: async (_sys, _usr, cfg) => ({
+                text: `\`\`\`json\n{"verdict":"APPROVE","rationale":"Verified by ${cfg.model}"}\n\`\`\``,
+                usage: { inputTokens: 420, outputTokens: 48 }
+            })
+        }
+    });
+    t.after(() => v2.close());
+
+    const run2 = await v2.validateCandidate({
+        workOrderId: 'WO-101',
+        attemptLabel: 'boot2',
+        repoDir,
+        edits: CANDIDATE_PATCHES.verifiedRemediationPatch,
+        runCrossModel: true
+    });
+    assert.equal(run2.ok, true);
+    assert.equal(run2.data.verdict, 'VERIFIED');
+    assert.equal(run2.data.crossModelReview.mode, 'live_api');
+    assert.ok(run2.data.telemetry.totalCostUsd > 0);
+
+    const trail = v2.getAuditTrail({ limit: 10 });
+    assert.equal(trail.ok, true);
+    assert.equal(trail.data.valid, true);
+    assert.equal(trail.data.verifiedCount, 2);
+});

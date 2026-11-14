@@ -153,6 +153,9 @@ function formatCostUsd(costValue) {
   }
   const num = Number(costValue);
   if (!Number.isFinite(num)) return String(costValue);
+  if (num > 0 && num < 0.001) {
+    return `$${num.toFixed(6)}`;
+  }
   return `$${num.toFixed(4)}`;
 }
 

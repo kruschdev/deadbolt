@@ -699,6 +699,91 @@ function runDeterministicStructuralReviewers({ normalizedEdits, reconciliationDa
     };
 }
 
+export function parseReviewerVerdictPayload(rawText = '') {
+    const raw = String(rawText || '').trim();
+    const unfenced = raw
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+
+    const jsonBraceMatch = /\{[\s\S]*\}/.exec(unfenced);
+    if (jsonBraceMatch) {
+        try {
+            const parsed = JSON.parse(jsonBraceMatch[0]);
+            const rawVerdict = String(parsed?.verdict || '').trim().toUpperCase();
+            const verdict = rawVerdict === 'REJECT' ? 'REJECT' : 'APPROVE';
+            const rationale = String(parsed?.rationale || parsed?.reason || unfenced)
+                .trim()
+                .slice(0, 280);
+            return { verdict, rationale };
+        } catch {
+            /* fall back to regex inspection */
+        }
+    }
+
+    if (/"verdict"\s*:\s*"APPROVE"/i.test(unfenced)) {
+        return { verdict: 'APPROVE', rationale: unfenced.slice(0, 280) };
+    }
+    if (/"verdict"\s*:\s*"REJECT"/i.test(unfenced)) {
+        return { verdict: 'REJECT', rationale: unfenced.slice(0, 280) };
+    }
+    const verdict = /\bREJECT\b/i.test(unfenced) ? 'REJECT' : 'APPROVE';
+    return { verdict, rationale: unfenced.slice(0, 280) };
+}
+
+export function estimateReviewerUsageCostUsd(modelName = '', usage = {}) {
+    const explicit = Number(usage?.estimatedCostUsd);
+    if (Number.isFinite(explicit) && explicit > 0) {
+        return explicit;
+    }
+    const inTok = Math.max(0, Number(usage?.inputTokens || 0));
+    const outTok = Math.max(
+        0,
+        Number(usage?.outputTokens || 0) + Number(usage?.thoughtTokens || 0)
+    );
+    if (inTok === 0 && outTok === 0) return 0;
+
+    const lower = String(modelName || '').toLowerCase();
+    if (lower.includes('ollama') || lower.includes(':latest')) {
+        return 0;
+    }
+    if (lower.includes('deepseek-chat-v3') || lower.includes('deepseek-v3')) {
+        return (inTok * 0.27 + outTok * 1.10) / 1_000_000;
+    }
+    if (lower.includes('deepseek')) {
+        return (inTok * 0.28 + outTok * 0.42) / 1_000_000;
+    }
+    if (lower.includes('gemini-2.5-flash-lite')) {
+        return (inTok * 0.10 + outTok * 0.40) / 1_000_000;
+    }
+    if (lower.includes('gemini-2.5-flash') || lower.includes('gemini-3')) {
+        return (inTok * 0.30 + outTok * 2.50) / 1_000_000;
+    }
+    return (inTok * 0.30 + outTok * 1.20) / 1_000_000;
+}
+
+function resolveValidatorAuditHmacSecret(auditDbPath = '', explicitHmacSecret = '') {
+    const cleanExplicit = String(explicitHmacSecret || '').trim();
+    if (cleanExplicit.length > 0) return cleanExplicit;
+    const cleanDb = String(auditDbPath || '').trim();
+    if (!cleanDb || cleanDb === ':memory:') {
+        return crypto.randomBytes(32).toString('hex');
+    }
+    const keyFilePath = `${path.resolve(cleanDb)}.hmac`;
+    try {
+        if (fs.existsSync(keyFilePath)) {
+            const existing = fs.readFileSync(keyFilePath, 'utf8').trim();
+            if (existing.length >= 32) return existing;
+        }
+        fs.mkdirSync(path.dirname(keyFilePath), { recursive: true });
+        const generated = crypto.randomBytes(32).toString('hex');
+        fs.writeFileSync(keyFilePath, `${generated}\n`, { mode: 0o600 });
+        return generated;
+    } catch {
+        return crypto.randomBytes(32).toString('hex');
+    }
+}
+
 async function runCrossFamilyReview({
     workOrderId,
     normalizedEdits,
@@ -716,9 +801,10 @@ async function runCrossFamilyReview({
         });
     }
 
+    const hasOpenRouter = Boolean(llmConfig.openRouterApiKey);
     const hasGemini = Boolean(llmConfig.geminiApiKey);
-    const hasSecondary = Boolean(llmConfig.openRouterApiKey || llmConfig.ollamaUrl);
-    if (!hasGemini || !hasSecondary) {
+    const hasOllama = Boolean(llmConfig.ollamaUrl);
+    if (!hasOpenRouter && !(hasGemini && hasOllama)) {
         return runDeterministicStructuralReviewers({
             normalizedEdits,
             reconciliationData,
@@ -728,59 +814,63 @@ async function runCrossFamilyReview({
     }
 
     const timeoutMs = Number.isFinite(Number(llmConfig.timeoutMs))
-        ? Math.max(500, Math.min(10_000, Number(llmConfig.timeoutMs)))
-        : 4000;
+        ? Math.max(500, Math.min(15_000, Number(llmConfig.timeoutMs)))
+        : 10_000;
 
     const patchDigest = normalizedEdits
-        .map((e) => `FILE: ${e.file_path}\n${e.content.slice(0, 2400)}`)
+        .map((e) => `FILE: ${e.file_path}\n${e.content.slice(0, 8000)}`)
         .join('\n---\n');
 
     const systemPrompt =
-        'You are an independent code reviewer in a 2-family governance gate. Reply with strict JSON: {"verdict":"APPROVE"|"REJECT","rationale":"concise 1-sentence technical reason"} without markdown fences.';
-    const userPrompt = `Work Order: ${workOrderId}\nSOX Batch Delta Cents: ${reconciliationData.deltaCents}\nCandidate Patch:\n${patchDigest}`;
+        'You are an independent governance reviewer in a 2-family Software Factory gate. Evaluate ONLY objective invariant compliance: (1) SOX batch deltaCents === 0, (2) protected src/sox-reconciler.js is untouched, and (3) integer largest-remainder cent conservation holds without floating-point drift. Do NOT reject for stylistic preferences when all 3 invariants hold. Reply with strict JSON: {"invariantChecks":{"zeroDelta":true,"protectedUntouched":true,"integerConservation":true},"verdict":"APPROVE"|"REJECT","rationale":"concise 1-sentence technical reason"} without markdown fences.';
+    const userPrompt = `Work Order: ${workOrderId}\nDeterministic SOX Batch Delta Cents: ${reconciliationData.deltaCents}\nSlop Breaker Findings: ${slopData.slopFindingCount}\nCandidate Patch:\n${patchDigest}`;
 
-    const configFamilyA = llmConfig.openRouterApiKey
+    const configFamilyA = hasOpenRouter
         ? {
               provider: 'openrouter',
+              familyLabel: 'deepseek',
               apiKey: llmConfig.openRouterApiKey,
-              model: llmConfig.openRouterModel || 'deepseek/deepseek-v3.2'
+              model: llmConfig.openRouterModel || 'deepseek/deepseek-chat-v3-0324'
           }
         : {
               provider: 'ollama',
+              familyLabel: 'qwen-moe',
               apiKey: '',
               apiUrl: `${String(llmConfig.ollamaUrl).replace(/\/+$/, '')}/v1/chat/completions`,
               model: llmConfig.ollamaModel || 'qwen3-coder-30b-moe:latest'
           };
 
-    const configFamilyB = {
-        provider: 'gemini',
-        apiKey: llmConfig.geminiApiKey,
-        model: llmConfig.geminiModel || 'gemini-3.8-flash'
-    };
+    const configFamilyB = hasOpenRouter
+        ? {
+              provider: 'openrouter',
+              familyLabel: 'google-gemini',
+              apiKey: llmConfig.openRouterApiKey,
+              model: llmConfig.openRouterSecondaryModel || 'google/gemini-2.5-flash-lite'
+          }
+        : {
+              provider: 'gemini',
+              familyLabel: 'google-gemini',
+              apiKey: llmConfig.geminiApiKey,
+              model: llmConfig.geminiModel || 'gemini-3.8-flash'
+          };
 
-    const parseVerdict = (rawText) => {
-        const text = String(rawText || '').trim();
-        if (/"verdict"\s*:\s*"REJECT"/i.test(text) || /\bREJECT\b/.test(text)) {
-            return 'REJECT';
-        }
-        return 'APPROVE';
-    };
+    const callImpl = typeof llmConfig.chatImpl === 'function' ? llmConfig.chatImpl : chat;
 
     try {
         const startedNs = process.hrtime.bigint();
         const [resA, resB] = await Promise.all([
-            chat(systemPrompt, userPrompt, configFamilyA, {
+            callImpl(systemPrompt, userPrompt, configFamilyA, {
                 returnFullResponse: true,
                 bypassCascade: true,
-                maxTokens: 256,
-                temperature: 0.1,
+                maxTokens: 1024,
+                temperature: 0.0,
                 signal: AbortSignal.timeout(timeoutMs)
             }),
-            chat(systemPrompt, userPrompt, configFamilyB, {
+            callImpl(systemPrompt, userPrompt, configFamilyB, {
                 returnFullResponse: true,
                 bypassCascade: true,
-                maxTokens: 256,
-                temperature: 0.1,
+                maxTokens: 1024,
+                temperature: 0.0,
                 signal: AbortSignal.timeout(timeoutMs)
             })
         ]);
@@ -788,35 +878,38 @@ async function runCrossFamilyReview({
 
         const inA = Number(resA?.usage?.inputTokens || 0);
         const outA = Number(resA?.usage?.outputTokens || 0);
-        const costA = Number(resA?.usage?.estimatedCostUsd || 0);
+        const costA = estimateReviewerUsageCostUsd(configFamilyA.model, resA?.usage);
 
         const inB = Number(resB?.usage?.inputTokens || 0);
         const outB = Number(resB?.usage?.outputTokens || 0);
-        const costB = Number(resB?.usage?.estimatedCostUsd || 0);
+        const costB = estimateReviewerUsageCostUsd(configFamilyB.model, resB?.usage);
+
+        const parsedA = parseReviewerVerdictPayload(resA?.text);
+        const parsedB = parseReviewerVerdictPayload(resB?.text);
 
         const reviewerA = {
-            family: configFamilyA.provider,
+            family: configFamilyA.familyLabel,
             model: configFamilyA.model,
             role: 'Arithmetic & Residual Conservation Reviewer',
             mode: 'live_api',
-            verdict: parseVerdict(resA?.text),
-            rationale: String(resA?.text || '').slice(0, 280),
+            verdict: parsedA.verdict,
+            rationale: parsedA.rationale,
             inputTokens: inA,
             outputTokens: outA,
-            costUsd: costA,
+            costUsd: Number(costA.toFixed(8)),
             latencyMs: reviewLatencyMs
         };
 
         const reviewerB = {
-            family: 'gemini',
+            family: configFamilyB.familyLabel,
             model: configFamilyB.model,
             role: 'Boundary & Governance Contract Reviewer',
             mode: 'live_api',
-            verdict: parseVerdict(resB?.text),
-            rationale: String(resB?.text || '').slice(0, 280),
+            verdict: parsedB.verdict,
+            rationale: parsedB.rationale,
             inputTokens: inB,
             outputTokens: outB,
-            costUsd: costB,
+            costUsd: Number(costB.toFixed(8)),
             latencyMs: reviewLatencyMs
         };
 
@@ -854,19 +947,16 @@ async function runCrossFamilyReview({
  *
  * @param {object} [options={}]
  * @param {string} [options.auditDbPath=''] - SQLite path for tamper-evident audit ledger (in-memory if omitted).
- * @param {string} [options.hmacSecret] - HMAC-SHA256 secret (generates ephemeral 256-bit key if omitted).
+ * @param {string} [options.hmacSecret] - HMAC-SHA256 secret (persists/loads <auditDbPath>.hmac when file-backed).
  * @param {object} [options.llmConfig={}] - Optional cross-family live LLM configuration.
  */
 export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig = {} } = {}) {
-    const resolvedHmacSecret =
-        typeof hmacSecret === 'string' && hmacSecret.trim().length > 0
-            ? hmacSecret.trim()
-            : crypto.randomBytes(32).toString('hex');
-
     const resolvedSqlitePath =
         typeof auditDbPath === 'string' && auditDbPath.trim().length > 0
             ? auditDbPath.trim()
             : '';
+
+    const resolvedHmacSecret = resolveValidatorAuditHmacSecret(resolvedSqlitePath, hmacSecret);
 
     const auditLog = createAuditLog({
         sqlitePath: resolvedSqlitePath,
