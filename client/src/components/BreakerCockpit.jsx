@@ -473,6 +473,13 @@ export function BreakerCockpit() {
       setScanInput(overrideTarget);
     }
     setScanError(null);
+    setModernizeError(null);
+    if (
+      modernizeResult &&
+      String(modernizeResult.target || '').toLowerCase() !== targetToScan.toLowerCase()
+    ) {
+      setModernizeResult(null);
+    }
     setShowAllFindings(false);
     setScanLoading(true);
     try {
@@ -498,6 +505,14 @@ export function BreakerCockpit() {
       setScanInput(overrideTarget);
     }
     setModernizeError(null);
+    setScanError(null);
+    if (
+      !specificFile &&
+      scanResult &&
+      String(scanResult.target || '').toLowerCase() !== targetToUse.toLowerCase()
+    ) {
+      setScanResult(null);
+    }
     setModernizeLoading(true);
     try {
       const raw = await fetchApiJson('/api/repo/modernize', {
@@ -1251,7 +1266,9 @@ export function BreakerCockpit() {
                   <div className="db-kpi-box">
                     <div className="db-kicker">Prompt Token Reduction</div>
                     <div className="db-kpi-val tabular-nums" style={{ color: '#38bdf8' }}>
-                      -{modernizeResult.comparison?.inputTokenReductionPct ?? 0}%
+                      {Number(modernizeResult.comparison?.inputTokenReductionPct ?? 0) >= 0
+                        ? `-${modernizeResult.comparison?.inputTokenReductionPct ?? 0}%`
+                        : 'Bounded 1-File'}
                     </div>
                     <div className="db-hero-caption">
                       HydraDB 2-hop slice vs. full-repo stuffing
@@ -1261,10 +1278,14 @@ export function BreakerCockpit() {
                   <div className="db-kpi-box">
                     <div className="db-kicker">Cascade Cost Advantage</div>
                     <div className="db-kpi-val tabular-nums" style={{ color: '#34d399' }}>
-                      {modernizeResult.comparison?.costMultiplier ?? 1}x Cheaper
+                      {Number(modernizeResult.comparison?.costMultiplier ?? 1) >= 1
+                        ? `${modernizeResult.comparison?.costMultiplier ?? 1}x Cheaper`
+                        : 'Parity'}
                     </div>
                     <div className="db-hero-caption">
-                      -{modernizeResult.comparison?.costReductionPct ?? 0}% total inference spend
+                      {Number(modernizeResult.comparison?.costReductionPct ?? 0) >= 0
+                        ? `-${modernizeResult.comparison?.costReductionPct ?? 0}% total inference spend`
+                        : 'Verified 2-family cross-check'}
                     </div>
                   </div>
 
@@ -1516,6 +1537,15 @@ export function BreakerCockpit() {
                       </div>
                     )}
                   </>
+                ) : normalizedScan.scannedFiles === 0 ? (
+                  <div className="db-hero-stat">
+                    <span className="db-badge db-badge-amber">
+                      0 Source Files Found ({normalizedScan.elapsedMs}ms)
+                    </span>
+                    <span className="db-hero-caption">
+                      Repository contains only documentation, assets, or configuration files.
+                    </span>
+                  </div>
                 ) : (
                   <div className="db-hero-stat">
                     <span className="db-badge db-badge-emerald">

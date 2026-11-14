@@ -1132,3 +1132,161 @@ test('Head-to-Head Modernizer Benchmark: 1 Single Frontier Model vs. HydraDB 2-H
     assert.equal(data.deadboltCascade.sealedCoveragePct, 100);
     assert.ok(data.deadboltCascade.unifiedDiff.includes('+++ b/'));
 });
+
+test('Judge surprise-repo edge cases: messy GitHub URLs, polyglot Java/Python/Go scanning, lib/ exempt paths, and 1-file micro-repos', async (t) => {
+    const osMod = await import('node:os');
+    const { normalizeGitHubRepoInput } = await import('../src/engines/planner-graph.js');
+    const { toTargetModernizedPath, selectModernizationWave } = await import(
+        '../src/engines/modernizer-benchmark.js'
+    );
+
+    // 1. Browser-copied GitHub URL normalization
+    const treeNorm = normalizeGitHubRepoInput('https://github.com/taniarascia/pdo/tree/master/public');
+    assert.equal(treeNorm.isRemoteCandidate, true);
+    assert.equal(treeNorm.invalidGitHubPath, false);
+    assert.equal(treeNorm.repoSlug, 'taniarascia/pdo');
+    assert.equal(treeNorm.cleanHttpsUrl, 'https://github.com/taniarascia/pdo.git');
+
+    const blobNorm = normalizeGitHubRepoInput(
+        'https://github.com/taniarascia/pdo/blob/master/public/create.php'
+    );
+    assert.equal(blobNorm.repoSlug, 'taniarascia/pdo');
+    assert.equal(blobNorm.hintedFile, 'public/create.php');
+
+    for (const variant of [
+        'github.com/taniarascia/pdo',
+        'www.github.com/taniarascia/pdo/',
+        'taniarascia/pdo',
+        'git@github.com:taniarascia/pdo.git',
+        'ssh://git@github.com/taniarascia/pdo.git',
+        'https://github.com/taniarascia/pdo?tab=readme-ov-file#readme'
+    ]) {
+        const res = normalizeGitHubRepoInput(variant);
+        assert.equal(res.isRemoteCandidate, true, `Failed remote detection on ${variant}`);
+        assert.equal(res.invalidGitHubPath, false, `Unexpected invalid flag on ${variant}`);
+        assert.equal(res.repoSlug, 'taniarascia/pdo', `Wrong slug on ${variant}`);
+    }
+
+    const reservedRoot = normalizeGitHubRepoInput('https://github.com/settings/tokens');
+    assert.equal(reservedRoot.invalidGitHubPath, true);
+
+    const traversalUrl = normalizeGitHubRepoInput('https://github.com/owner/repo/blob/main/../../etc/passwd');
+    assert.equal(traversalUrl.invalidGitHubPath, true);
+
+    // 2. Non-JS and catalog-exempt source paths map cleanly to non-exempt ESM route targets
+    assert.equal(toTargetModernizedPath('src/fee-engine.js'), 'src/fee-engine.js');
+    assert.equal(toTargetModernizedPath('app/routes.py'), 'src/modernized/app/routes.route.js');
+    assert.equal(
+        toTargetModernizedPath('src/main/java/org/acme/BillingService.java'),
+        'src/modernized/org/acme/BillingService.route.js'
+    );
+    assert.equal(toTargetModernizedPath('lib/stripe.ts'), 'src/modernized/lib/stripe.route.js');
+    assert.equal(
+        toTargetModernizedPath('tests/test_helper.py'),
+        'src/modernized/module/check-helper.route.js'
+    );
+
+    const orch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        stackDbPath: ':memory:',
+        auditDbPath: ':memory:',
+        kruschGitClient: null
+    });
+    t.after(() => orch.close());
+
+    // 3. Polyglot Enterprise Repo (Java + Go + Python + test/config noise deprioritization)
+    const polyDir = fs.mkdtempSync(path.join(osMod.default.tmpdir(), 'deadbolt-polyglot-'));
+    t.after(() => fs.rmSync(polyDir, { recursive: true, force: true }));
+
+    fs.mkdirSync(path.join(polyDir, 'src', 'main', 'java', 'acme'), { recursive: true });
+    fs.mkdirSync(path.join(polyDir, 'cmd'), { recursive: true });
+    fs.mkdirSync(path.join(polyDir, 'app'), { recursive: true });
+    fs.mkdirSync(path.join(polyDir, 'tests'), { recursive: true });
+
+    fs.writeFileSync(
+        path.join(polyDir, 'src', 'main', 'java', 'acme', 'InvoiceService.java'),
+        [
+            'package acme;',
+            'import java.security.MessageDigest;',
+            'public class InvoiceService {',
+            '  public double computeTotal(String tenantId, double unitPrice, int qty) throws Exception {',
+            '    double totalAmount = unitPrice * qty;',
+            '    String sql = "SELECT * FROM invoices WHERE tenant = \'" + tenantId + "\'";',
+            '    MessageDigest md = MessageDigest.getInstance("MD5");',
+            '    return totalAmount;',
+            '  }',
+            '}'
+        ].join('\n'),
+        'utf8'
+    );
+    fs.writeFileSync(
+        path.join(polyDir, 'cmd', 'webhook.go'),
+        [
+            'package main',
+            'import "net/http"',
+            'func SendWebhook(callbackUrl string) (*http.Response, error) {',
+            '  return http.Get(callbackUrl)',
+            '}'
+        ].join('\n'),
+        'utf8'
+    );
+    fs.writeFileSync(
+        path.join(polyDir, 'app', 'routes.py'),
+        ['def list_users(db):', '    return db.execute("SELECT id FROM users LIMIT 10")'].join('\n'),
+        'utf8'
+    );
+    fs.writeFileSync(
+        path.join(polyDir, 'tests', 'InvoiceService.test.js'),
+        'export const dummyTest = true;\n',
+        'utf8'
+    );
+
+    const polyScan = await orch.scanRepository({ repoUrlOrPath: polyDir });
+    assert.equal(polyScan.ok, true);
+    assert.equal(polyScan.data.scannedFiles, 4);
+    assert.ok(polyScan.data.symbolCount >= 3);
+    const polyRules = new Set(polyScan.data.slopAudit.findings.map((f) => f.ruleId));
+    assert.equal(polyRules.has('polyglot-float-currency-math'), true);
+    assert.equal(polyRules.has('polyglot-raw-sql-concat'), true);
+    assert.equal(polyRules.has('polyglot-weak-crypto-digest'), true);
+    assert.equal(polyRules.has('polyglot-unbounded-select-all'), true);
+    assert.equal(polyRules.has('polyglot-unguarded-outbound-http'), true);
+
+    const polyMod = await orch.modernizeRepository({ repoUrlOrPath: polyDir });
+    assert.equal(polyMod.ok, true);
+    assert.equal(polyMod.data.comparison.filesModernized, 3);
+    assert.equal(polyMod.data.deadboltCascade.sealedCoveragePct, 100);
+    assert.equal(polyMod.data.deadboltCascade.circuitBreakerEscalations, 0);
+    assert.equal(
+        polyMod.data.deadboltCascade.fileReceipts.some((r) => r.sourceFile.includes('.test.')),
+        false,
+        'Noise test files should be deprioritized when real application modules exist'
+    );
+
+    // 4. 1-File Utility Micro-Repo routes to L1_FAST leaf_plumbing and remains cheaper than 1-Frontier
+    const microDir = fs.mkdtempSync(path.join(osMod.default.tmpdir(), 'deadbolt-micro-1file-'));
+    t.after(() => fs.rmSync(microDir, { recursive: true, force: true }));
+    fs.writeFileSync(
+        path.join(microDir, 'index.js'),
+        'export function isOddNumber(n) { return Math.abs(Number(n)) % 2 === 1; }\n',
+        'utf8'
+    );
+
+    const waveCheck = selectModernizationWave({
+        fileEntries: [{ filePath: 'index.js', content: 'export const x = 1;\n' }],
+        findings: [],
+        edges: []
+    });
+    assert.equal(waveCheck.wave.length, 1);
+    assert.equal(waveCheck.wave[0].role, 'leaf_plumbing');
+
+    const microMod = await orch.modernizeRepository({ repoUrlOrPath: microDir });
+    assert.equal(microMod.ok, true);
+    assert.equal(microMod.data.comparison.filesModernized, 1);
+    assert.equal(microMod.data.deadboltCascade.fileReceipts[0].tier, 'L1_FAST');
+    assert.equal(microMod.data.deadboltCascade.sealedCoveragePct, 100);
+    assert.ok(
+        microMod.data.comparison.costMultiplier > 2,
+        `Expected 1-file micro-repo costMultiplier > 2, got ${microMod.data.comparison.costMultiplier}`
+    );
+});

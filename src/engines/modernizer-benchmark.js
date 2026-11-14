@@ -15,8 +15,7 @@ import { selectCascadeTier, DEFAULT_FLEET_CASCADE_TIERS } from '@krusch/toolkit/
 import { scoreLegoBrickCoverage } from '@krusch/toolkit/catalog';
 import { validateOutboundUrl } from '@krusch/toolkit/security';
 import { chat } from '@krusch/toolkit/llm';
-
-const GITHUB_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/;
+import { normalizeGitHubRepoInput } from './planner-graph.js';
 
 const SENSITIVE_LOCAL_PREFIXES = [
     '/etc',
@@ -111,17 +110,46 @@ function extractCleanCodeBlock(rawText = '') {
     return stripped ? `${stripped}\n` : '';
 }
 
-function toTargetModernizedPath(relPath = '') {
+const DIRECT_ESM_TARGET_EXT_RE = /\.(?:js|mjs|ts)$/i;
+const EXEMPT_OR_TEST_SEGMENT_RE =
+    /^(?:krusch_toolkit|krusch-stack|tests?|__tests__|benchmarks?|node_modules|site-packages|__pycache__|vendor|third_party|_?archive|archive_scratch|scratch)$/i;
+const TEST_OR_CONFIG_NOISE_RE =
+    /(?:^|\/)__init__\.py$|(?:^|\/)(?:tests?|__tests__|specs?|benchmarks?|examples?)\/|\.(?:test|spec|config|conf|setup)\.[A-Za-z0-9]+$|(?:^|\/)(?:jest|vitest|webpack|rollup|vite|next|postcss|tailwind|babel|eslint|prettier)\.config\.[A-Za-z0-9]+$/i;
+
+export function toTargetModernizedPath(relPath = '') {
     const normalized = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
-    if (normalized.toLowerCase().endsWith('.php')) {
-        const stem = normalized
-            .replace(/\.php$/i, '')
-            .replace(/^public\//i, '')
-            .replace(/[^A-Za-z0-9/_-]+/g, '-')
-            .replace(/^\/+|\/+$/g, '') || 'legacy-route';
-        return `src/modernized/${stem}.route.js`;
+    const segments = normalized.split('/').filter(Boolean);
+    const hasExemptSegment = segments.some(
+        (seg) => EXEMPT_OR_TEST_SEGMENT_RE.test(seg) || /^test[_-]/i.test(seg)
+    );
+    const isTestSpecFile = /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(normalized);
+
+    if (
+        normalized.startsWith('src/') &&
+        DIRECT_ESM_TARGET_EXT_RE.test(normalized) &&
+        !hasExemptSegment &&
+        !isTestSpecFile
+    ) {
+        return normalized;
     }
-    return normalized;
+
+    const strippedExt = normalized
+        .replace(/\.(?:test|spec)(?=\.[A-Za-z0-9]+$)/i, '')
+        .replace(/\.[A-Za-z0-9]+$/, '')
+        .replace(/^(?:public|src\/main\/java|src\/main\/kotlin|src\/test\/java|src)\//i, '');
+
+    const cleanSegments = strippedExt
+        .split('/')
+        .filter(Boolean)
+        .map((seg) => {
+            const safe = seg.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'mod';
+            if (EXEMPT_OR_TEST_SEGMENT_RE.test(safe)) return 'module';
+            if (/^test[_-]/i.test(safe)) return safe.replace(/^test[_-]/i, 'check-');
+            return safe;
+        });
+
+    const stem = cleanSegments.join('/') || 'legacy-route';
+    return `src/modernized/${stem}.route.js`;
 }
 
 /**
@@ -220,20 +248,34 @@ function buildOfflineUngovernedBaselineSnippet({ relPath }) {
     const fnCall = ['fet', 'ch'].join('');
     return [
         `// Ungoverned single-model rewrite of ${safeSource} (no Golden Brick catalog)`,
-        `export async function legacyRewriteHandler(reqUrl) {`,
-        `  const res = await ${fnCall}(reqUrl);`,
-        `  return res.json();`,
+        `export async function legacyRewriteHandler(reqUrl, payload = {}) {`,
+        `  const target = String(reqUrl || '').trim();`,
+        `  if (!target) {`,
+        `    return { ok: false, error: 'missing target url', source: '${safeSource}' };`,
+        `  }`,
+        `  const res = await ${fnCall}(target, {`,
+        `    method: payload.method || 'GET',`,
+        `    headers: { 'Content-Type': 'application/json' }`,
+        `  });`,
+        `  const data = await res.json();`,
+        `  return {`,
+        `    ok: res.ok,`,
+        `    status: res.status,`,
+        `    sourceFile: '${safeSource}',`,
+        `    items: Array.isArray(data?.items) ? data.items : [],`,
+        `    raw: data`,
+        `  };`,
         `}`,
         ``
     ].join('\n');
 }
 
 /**
- * Select 3 representative modernization targets from scanned files:
+ * Select up to 3 representative modernization targets from scanned files:
  * - Up to 2 bounded leaf/plumbing modules (routed to L1_FAST)
- * - 1 multi-hop or domain-critical seam module (routed to L3_FRONTIER_ARGON)
+ * - Up to 1 multi-hop or domain-critical seam module (routed to L3_FRONTIER_ARGON)
  */
-function selectModernizationWave({ fileEntries = [], findings = [], edges = [], requestedFile = '' }) {
+export function selectModernizationWave({ fileEntries = [], findings = [], edges = [], requestedFile = '' }) {
     const findingsByFile = new Map();
     for (const f of findings) {
         const fp = String(f.filePath || '').trim();
@@ -256,12 +298,14 @@ function selectModernizationWave({ fileEntries = [], findings = [], edges = [], 
         const fileFindings = findingsByFile.get(entry.filePath) || [];
         const inbound = [...(inboundMap.get(entry.filePath) || [])];
         const outbound = [...(outboundMap.get(entry.filePath) || [])];
+        const isNoiseFile = TEST_OR_CONFIG_NOISE_RE.test(entry.filePath);
         const isDomainSeam =
-            DOMAIN_CRITICAL_HINT_RE.test(entry.filePath) ||
-            inbound.length >= 2 ||
-            fileFindings.some((f) =>
-                /(?:float|currency|ssrf|rbac|auth|sql|hmac|reconcil)/i.test(String(f.ruleId || ''))
-            );
+            !isNoiseFile &&
+            (DOMAIN_CRITICAL_HINT_RE.test(entry.filePath) ||
+                inbound.length >= 2 ||
+                fileFindings.some((f) =>
+                    /(?:float|currency|ssrf|rbac|auth|sql|hmac|reconcil)/i.test(String(f.ruleId || ''))
+                ));
         return {
             filePath: entry.filePath,
             content: entry.content,
@@ -270,46 +314,77 @@ function selectModernizationWave({ fileEntries = [], findings = [], edges = [], 
             findingCount: fileFindings.length,
             inboundCallers: inbound,
             outboundDeps: outbound,
+            isNoiseFile,
             isDomainSeam
         };
     });
 
-    const flaggedOrAll = candidates.some((c) => c.findingCount > 0)
-        ? candidates.filter((c) => c.findingCount > 0)
+    const nonNoiseCandidates = candidates.some((c) => !c.isNoiseFile)
+        ? candidates.filter((c) => !c.isNoiseFile)
         : candidates;
+
+    const flaggedOrAll = nonNoiseCandidates.some((c) => c.findingCount > 0)
+        ? nonNoiseCandidates.filter((c) => c.findingCount > 0)
+        : nonNoiseCandidates;
 
     const picked = [];
     const used = new Set();
 
-    if (requestedFile) {
-        const exact = candidates.find((c) => c.filePath === requestedFile);
-        if (exact) {
-            picked.push({ ...exact, role: exact.isDomainSeam ? 'domain_seam' : 'leaf_plumbing' });
-            used.add(exact.filePath);
+    const cleanRequested = String(requestedFile || '')
+        .trim()
+        .replace(/\\/g, '/')
+        .replace(/^\/+/, '');
+    if (cleanRequested) {
+        const matched =
+            candidates.find((c) => c.filePath === cleanRequested) ||
+            candidates.find((c) => cleanRequested.endsWith(`/${c.filePath}`));
+        if (matched) {
+            picked.push({ ...matched, role: matched.isDomainSeam ? 'domain_seam' : 'leaf_plumbing' });
+            used.add(matched.filePath);
         }
     }
 
-    // Pick 1 domain/multi-hop seam (20% frontier work)
+    // Pick 1 domain/multi-hop seam (reserved for genuine domain seams or >=3-file Strangler-Fig waves)
     const domainSorted = [...flaggedOrAll]
         .filter((c) => !used.has(c.filePath))
         .sort((a, b) => {
-            const scoreA = (a.isDomainSeam ? 10 : 0) + a.inboundCallers.length * 3 + a.findingCount;
-            const scoreB = (b.isDomainSeam ? 10 : 0) + b.inboundCallers.length * 3 + b.findingCount;
+            const scoreA =
+                (a.isDomainSeam ? 10 : 0) +
+                a.inboundCallers.length * 3 +
+                a.findingCount -
+                (a.isNoiseFile ? 8 : 0);
+            const scoreB =
+                (b.isDomainSeam ? 10 : 0) +
+                b.inboundCallers.length * 3 +
+                b.findingCount -
+                (b.isNoiseFile ? 8 : 0);
             return scoreB - scoreA;
         });
 
-    if (domainSorted.length > 0 && !picked.some((p) => p.role === 'domain_seam')) {
+    if (
+        domainSorted.length > 0 &&
+        !picked.some((p) => p.role === 'domain_seam') &&
+        (domainSorted[0].isDomainSeam || candidates.length >= 3)
+    ) {
         const seam = domainSorted[0];
         picked.push({ ...seam, role: 'domain_seam' });
         used.add(seam.filePath);
     }
 
-    // Pick 2 bounded leaf/plumbing modules (80% cascade fast-tier work)
-    const leafSorted = [...flaggedOrAll, ...candidates]
+    // Pick bounded leaf/plumbing modules (80% cascade fast-tier work)
+    const leafSorted = [...flaggedOrAll, ...nonNoiseCandidates, ...candidates]
         .filter((c) => !used.has(c.filePath))
         .sort((a, b) => {
-            const leafA = a.inboundCallers.length * 4 + Math.min(a.lineCount, 400) / 100 - a.findingCount;
-            const leafB = b.inboundCallers.length * 4 + Math.min(b.lineCount, 400) / 100 - b.findingCount;
+            const leafA =
+                (a.isNoiseFile ? 12 : 0) +
+                a.inboundCallers.length * 4 +
+                Math.min(a.lineCount, 400) / 100 -
+                a.findingCount;
+            const leafB =
+                (b.isNoiseFile ? 12 : 0) +
+                b.inboundCallers.length * 4 +
+                Math.min(b.lineCount, 400) / 100 -
+                b.findingCount;
             return leafA - leafB;
         });
 
@@ -342,14 +417,10 @@ export function createModernizerBenchmarkEngine({
      */
     async function materializeTargetRepo(rawTarget, maxFiles = 60) {
         const rawTrimmed = String(rawTarget || '').trim();
-        const cleanTarget =
-            GITHUB_SLUG_RE.test(rawTrimmed) && !fs.existsSync(path.resolve(rawTrimmed))
-                ? `https://github.com/${rawTrimmed.replace(/\.git$/i, '')}`
-                : rawTrimmed;
-        const looksLikeUrl = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(cleanTarget);
+        const normalizedInput = normalizeGitHubRepoInput(rawTrimmed);
 
-        if (looksLikeUrl) {
-            const urlCheck = await validateOutboundUrl(cleanTarget, {
+        if (normalizedInput.isRemoteCandidate) {
+            const urlCheck = await validateOutboundUrl(normalizedInput.candidateUrl, {
                 allowedProtocols: ['https:'],
                 allowedHosts: ['github.com', 'www.github.com'],
                 tool: 'deadbolt.modernizer.clone'
@@ -358,33 +429,39 @@ export function createModernizerBenchmarkEngine({
                 return errorEnvelope(
                     'SSRF_BLOCKED',
                     urlCheck.error?.message || 'Outbound repository URL blocked by SSRF guard',
-                    urlCheck.error?.details ?? { target: cleanTarget },
+                    urlCheck.error?.details ?? { target: rawTrimmed },
                     'deadbolt.modernizer'
                 );
             }
 
-            const parsed = new URL(cleanTarget);
-            const cleanPath = parsed.pathname.replace(/^\/+|\/+$/g, '');
-            const parts = cleanPath.split('/');
             if (
-                !GITHUB_SLUG_RE.test(cleanPath) ||
-                parts.length !== 2 ||
-                parts.some((seg) => seg === '.' || seg === '..' || seg === '.git')
+                normalizedInput.invalidGitHubPath ||
+                !normalizedInput.repoSlug ||
+                !normalizedInput.cleanHttpsUrl
             ) {
                 return errorEnvelope(
                     'INVALID_GITHUB_REPO_PATH',
                     'GitHub URL must reference https://github.com/<owner>/<repo>',
-                    { target: cleanTarget },
+                    { target: rawTrimmed },
                     'deadbolt.modernizer'
                 );
             }
 
-            const repoSlug = cleanPath.replace(/\.git$/i, '');
+            const { repoSlug, cleanHttpsUrl, displayTarget, hintedFile } = normalizedInput;
             const cloneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-mod-clone-'));
             try {
                 execFileSync(
                     'git',
-                    ['clone', '--depth', '1', '--single-branch', '--', `https://github.com/${repoSlug}.git`, cloneDir],
+                    [
+                        'clone',
+                        '--depth',
+                        '1',
+                        '--single-branch',
+                        '--filter=blob:limit=256k',
+                        '--',
+                        cleanHttpsUrl,
+                        cloneDir
+                    ],
                     {
                         timeout: 22_000,
                         stdio: 'pipe',
@@ -405,12 +482,13 @@ export function createModernizerBenchmarkEngine({
                 repoDir: cloneDir,
                 ownedTempDir: cloneDir,
                 repoSlug,
-                displayTarget: cleanTarget,
+                displayTarget,
+                hintedFile: hintedFile || '',
                 maxFiles
             });
         }
 
-        const resolvedLocal = path.resolve(cleanTarget);
+        const resolvedLocal = path.resolve(rawTrimmed);
         if (isSensitiveLocalPath(resolvedLocal)) {
             return errorEnvelope(
                 'PATH_BLOCKED',
@@ -423,7 +501,7 @@ export function createModernizerBenchmarkEngine({
             return errorEnvelope(
                 'DIRECTORY_NOT_FOUND',
                 'Local repository path does not exist or is not a directory',
-                { target: cleanTarget },
+                { target: rawTrimmed },
                 'deadbolt.modernizer'
             );
         }
@@ -442,6 +520,7 @@ export function createModernizerBenchmarkEngine({
             ownedTempDir: null,
             repoSlug: path.basename(realLocal) || 'local-repo',
             displayTarget: path.basename(realLocal) || 'local-repo',
+            hintedFile: '',
             maxFiles
         });
     }
@@ -654,7 +733,7 @@ export function createModernizerBenchmarkEngine({
             return matEnv;
         }
 
-        const { repoDir, ownedTempDir, repoSlug, displayTarget } = matEnv.data;
+        const { repoDir, ownedTempDir, repoSlug, displayTarget, hintedFile = '' } = matEnv.data;
 
         try {
             const scanEnv = await planner.scanExternalRepository({
@@ -665,8 +744,11 @@ export function createModernizerBenchmarkEngine({
                 return scanEnv;
             }
 
-            // Collect full source contents for the scanned files from repoDir
+            // Collect full source contents for all scanned files from repoDir
             const topPaths = new Set();
+            for (const sp of scanEnv.data?.scannedFilePaths || []) {
+                if (sp) topPaths.add(sp);
+            }
             for (const f of scanEnv.data?.slopAudit?.findings || []) {
                 if (f.filePath) topPaths.add(f.filePath);
             }
@@ -692,11 +774,12 @@ export function createModernizerBenchmarkEngine({
 
             const findings = scanEnv.data?.slopAudit?.findings || [];
             const edges = scanEnv.data?.dependencyPreview || [];
+            const effectiveRequestedFile = String(targetFile || hintedFile || '').trim();
             const { wave } = selectModernizationWave({
                 fileEntries,
                 findings,
                 edges,
-                requestedFile: String(targetFile || '').trim()
+                requestedFile: effectiveRequestedFile
             });
 
             if (wave.length === 0) {
@@ -729,29 +812,31 @@ export function createModernizerBenchmarkEngine({
             const callImpl = typeof llmConfig.chatImpl === 'function' ? llmConfig.chatImpl : chat;
 
             // Resolve Frontier model config (used for 100% of Arm A, and ONLY for the 20% multi-hop domain seam in Arm B)
-            const frontierConfig = llmConfig.openRouterApiKey
-                ? {
-                      provider: 'openrouter',
-                      apiKey: llmConfig.openRouterApiKey,
-                      model: llmConfig.frontierBenchmarkModel || 'anthropic/claude-sonnet-5.5'
-                  }
-                : {
-                      provider: 'gemini',
-                      apiKey: llmConfig.geminiApiKey || '',
-                      model: 'gemini-4-argon'
-                  };
+            const frontierConfig =
+                llmConfig.openRouterApiKey || !llmConfig.geminiApiKey
+                    ? {
+                          provider: 'openrouter',
+                          apiKey: llmConfig.openRouterApiKey || '',
+                          model: llmConfig.frontierBenchmarkModel || 'anthropic/claude-sonnet-5.5'
+                      }
+                    : {
+                          provider: 'gemini',
+                          apiKey: llmConfig.geminiApiKey || '',
+                          model: 'gemini-4-argon'
+                      };
 
-            const frontierBackupConfig = llmConfig.openRouterApiKey
-                ? {
-                      provider: 'openrouter',
-                      apiKey: llmConfig.openRouterApiKey,
-                      model: 'google/gemini-4-argon'
-                  }
-                : {
-                      provider: 'gemini',
-                      apiKey: llmConfig.geminiApiKey || '',
-                      model: 'gemini-3.8-flash'
-                  };
+            const frontierBackupConfig =
+                llmConfig.openRouterApiKey || !llmConfig.geminiApiKey
+                    ? {
+                          provider: 'openrouter',
+                          apiKey: llmConfig.openRouterApiKey || '',
+                          model: 'google/gemini-4-argon'
+                      }
+                    : {
+                          provider: 'gemini',
+                          apiKey: llmConfig.geminiApiKey || '',
+                          model: 'gemini-3.8-flash'
+                      };
 
             async function callFrontierWithFailover(sysPrompt, usrPrompt, opts = {}) {
                 try {
@@ -774,17 +859,18 @@ export function createModernizerBenchmarkEngine({
                   }
                 : null;
 
-            const cloudFastConfig = llmConfig.openRouterApiKey
-                ? {
-                      provider: 'openrouter',
-                      apiKey: llmConfig.openRouterApiKey,
-                      model: 'deepseek/deepseek-v4.1-flash'
-                  }
-                : {
-                      provider: 'gemini',
-                      apiKey: llmConfig.geminiApiKey || '',
-                      model: 'gemini-3.8-flash'
-                  };
+            const cloudFastConfig =
+                llmConfig.openRouterApiKey || !llmConfig.geminiApiKey
+                    ? {
+                          provider: 'openrouter',
+                          apiKey: llmConfig.openRouterApiKey || '',
+                          model: 'deepseek/deepseek-v4.1-flash'
+                      }
+                    : {
+                          provider: 'gemini',
+                          apiKey: llmConfig.geminiApiKey || '',
+                          model: 'gemini-3.8-flash'
+                      };
 
             // Run <25us Cascade Router per file in the wave
             const customTiers = DEFAULT_FLEET_CASCADE_TIERS;

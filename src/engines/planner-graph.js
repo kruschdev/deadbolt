@@ -26,7 +26,22 @@ const SCANNABLE_EXTENSIONS = new Set([
   '.jsx',
   '.tsx',
   '.py',
-  '.php'
+  '.php',
+  '.java',
+  '.cs',
+  '.go',
+  '.rb',
+  '.rs',
+  '.kt'
+]);
+
+const POLYGLOT_EXTENSIONS = new Set([
+  '.java',
+  '.cs',
+  '.go',
+  '.rb',
+  '.rs',
+  '.kt'
 ]);
 
 const SKIPPED_SCAN_DIRS = new Set([
@@ -35,9 +50,16 @@ const SKIPPED_SCAN_DIRS = new Set([
   'vendor',
   'dist',
   'build',
+  'target',
+  'bin',
+  'obj',
   'coverage',
   '.next',
   '.cache',
+  '.gradle',
+  '.mvn',
+  '.venv',
+  'venv',
   '__pycache__',
   '.krusch-stack'
 ]);
@@ -73,6 +95,226 @@ const KNOWN_CHOKE_POINT_BASENAMES = new Set([
 ]);
 
 const GITHUB_OWNER_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/;
+const GITHUB_SEGMENT_RE = /^[A-Za-z0-9_.-]+$/;
+const RESERVED_GITHUB_ROOTS = new Set([
+  'about',
+  'codespaces',
+  'collections',
+  ' customer-stories',
+  'enterprise',
+  'events',
+  'explore',
+  'features',
+  'issues',
+  'login',
+  'marketplace',
+  'new',
+  'notifications',
+  'organizations',
+  'orgs',
+  'pricing',
+  'pulls',
+  'search',
+  'security',
+  'session',
+  'settings',
+  'signup',
+  'sponsors',
+  ' team',
+  'topics',
+  'trending'
+]);
+
+/**
+ * Normalize common browser-copied GitHub URLs (`/tree/<ref>/...`, `/blob/<ref>/<file>`,
+ * `github.com/owner/repo`, `owner/repo`, `git@github.com:owner/repo.git`) while preserving
+ * outbound SSRF validation for any non-GitHub or non-HTTPS URL.
+ *
+ * @param {string} rawInput
+ * @returns {{
+ *   isRemoteCandidate: boolean,
+ *   candidateUrl: string,
+ *   repoSlug: string | null,
+ *   cleanHttpsUrl: string | null,
+ *   displayTarget: string,
+ *   hintedFile: string,
+ *   invalidGitHubPath: boolean
+ * }}
+ */
+export function normalizeGitHubRepoInput(rawInput) {
+  const raw = String(rawInput || '').trim();
+  if (!raw) {
+    return {
+      isRemoteCandidate: false,
+      candidateUrl: '',
+      repoSlug: null,
+      cleanHttpsUrl: null,
+      displayTarget: '',
+      hintedFile: '',
+      invalidGitHubPath: false
+    };
+  }
+
+  let candidateUrl = raw;
+  let isRemoteCandidate = false;
+
+  // 1. SCP-style SSH URL: git@host:owner/repo.git
+  const scpMatch = /^git@([A-Za-z0-9.-]+):(.+)$/i.exec(raw);
+  if (scpMatch) {
+    isRemoteCandidate = true;
+    const sshHost = scpMatch[1].toLowerCase();
+    const sshPath = scpMatch[2].replace(/^\/+/, '');
+    candidateUrl = `https://${sshHost}/${sshPath}`;
+  } else if (/^ssh:\/\/(?:[^@\/]+@)?([A-Za-z0-9.-]+)\/(.+)$/i.test(raw)) {
+    const sshUrlMatch = /^ssh:\/\/(?:[^@\/]+@)?([A-Za-z0-9.-]+)\/(.+)$/i.exec(raw);
+    isRemoteCandidate = true;
+    candidateUrl = `https://${sshUrlMatch[1].toLowerCase()}/${sshUrlMatch[2]}`;
+  } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) {
+    isRemoteCandidate = true;
+    candidateUrl = raw;
+  } else if (
+    /^(?:www\.)?github\.com\/.+/i.test(raw) &&
+    !fs.existsSync(path.resolve(raw))
+  ) {
+    isRemoteCandidate = true;
+    candidateUrl = `https://${raw}`;
+  } else if (
+    !raw.startsWith('.') &&
+    !raw.startsWith('/') &&
+    !raw.includes('\\') &&
+    GITHUB_OWNER_REPO_RE.test(raw) &&
+    !fs.existsSync(path.resolve(raw))
+  ) {
+    const [segA, segB] = raw.split('/');
+    if (
+      segA !== '.' &&
+      segA !== '..' &&
+      segA !== '.git' &&
+      segB !== '.' &&
+      segB !== '..' &&
+      segB !== '.git'
+    ) {
+      isRemoteCandidate = true;
+      candidateUrl = `https://github.com/${raw.replace(/\.git$/i, '')}`;
+    }
+  }
+
+  if (!isRemoteCandidate) {
+    return {
+      isRemoteCandidate: false,
+      candidateUrl: raw,
+      repoSlug: null,
+      cleanHttpsUrl: null,
+      displayTarget: raw,
+      hintedFile: '',
+      invalidGitHubPath: false
+    };
+  }
+
+  let parsed = null;
+  try {
+    parsed = new URL(candidateUrl);
+  } catch {
+    return {
+      isRemoteCandidate: true,
+      candidateUrl,
+      repoSlug: null,
+      cleanHttpsUrl: null,
+      displayTarget: raw,
+      hintedFile: '',
+      invalidGitHubPath: true
+    };
+  }
+
+  const hostLower = parsed.hostname.toLowerCase();
+  if (
+    parsed.protocol !== 'https:' ||
+    (hostLower !== 'github.com' && hostLower !== 'www.github.com')
+  ) {
+    return {
+      isRemoteCandidate: true,
+      candidateUrl,
+      repoSlug: null,
+      cleanHttpsUrl: null,
+      displayTarget: raw,
+      hintedFile: '',
+      invalidGitHubPath: false
+    };
+  }
+
+  const rawPathPortion = raw.split(/[?#]/)[0];
+  const hasDotTraversal = /(?:^|[/:\\])\.\.(?:[\/\\]|$)|%2e%2e/i.test(rawPathPortion);
+
+  const rawSegments = parsed.pathname
+    .replace(/^\/+|\/+$/g, '')
+    .split('/')
+    .filter(Boolean)
+    .map((seg) => {
+      try {
+        return decodeURIComponent(seg);
+      } catch {
+        return seg;
+      }
+    });
+
+  if (
+    hasDotTraversal ||
+    rawSegments.length < 2 ||
+    rawSegments.some(
+      (seg) => seg === '.' || seg === '..' || seg.includes('\\') || seg.includes('\0')
+    )
+  ) {
+    return {
+      isRemoteCandidate: true,
+      candidateUrl: `https://${hostLower}${parsed.pathname}`,
+      repoSlug: null,
+      cleanHttpsUrl: null,
+      displayTarget: raw,
+      hintedFile: '',
+      invalidGitHubPath: true
+    };
+  }
+
+  const owner = rawSegments[0];
+  const repo = rawSegments[1].replace(/\.git$/i, '');
+  if (
+    !owner ||
+    !repo ||
+    !GITHUB_SEGMENT_RE.test(owner) ||
+    !GITHUB_SEGMENT_RE.test(repo) ||
+    owner === '.git' ||
+    repo === '.git' ||
+    repo === '.' ||
+    repo === '..' ||
+    RESERVED_GITHUB_ROOTS.has(owner.toLowerCase())
+  ) {
+    return {
+      isRemoteCandidate: true,
+      candidateUrl: `https://${hostLower}${parsed.pathname}`,
+      repoSlug: null,
+      cleanHttpsUrl: null,
+      displayTarget: raw,
+      hintedFile: '',
+      invalidGitHubPath: true
+    };
+  }
+
+  let hintedFile = '';
+  if (rawSegments[2] === 'blob' && rawSegments.length >= 5) {
+    hintedFile = rawSegments.slice(4).join('/').replace(/^\/+/, '');
+  }
+
+  const repoSlug = `${owner}/${repo}`;
+  return {
+    isRemoteCandidate: true,
+    candidateUrl: `https://github.com/${repoSlug}`,
+    repoSlug,
+    cleanHttpsUrl: `https://github.com/${repoSlug}.git`,
+    displayTarget: `https://github.com/${repoSlug}`,
+    hintedFile,
+    invalidGitHubPath: false
+  };
+}
 
 /**
  * Normalize a repository-relative POSIX path without leading `./` or `/`.
@@ -145,7 +387,7 @@ function collectRepoCodeFiles(rootDir, maxFiles = 200) {
 
     for (const entry of entries) {
       if (collected.length >= maxFiles) break;
-      if (SKIPPED_SCAN_DIRS.has(entry.name)) continue;
+      if (entry.name.startsWith('.') || SKIPPED_SCAN_DIRS.has(entry.name)) continue;
       if (entry.isSymbolicLink()) continue;
 
       const fullPath = path.join(currentDir, entry.name);
@@ -542,6 +784,160 @@ function auditPhpMigrationFile(source, filePath) {
       'pagination',
       '@krusch/toolkit/pagination',
       'Unbounded SELECT * table scan without cursor limit; port Next.js list routes to HMAC-signed keyset pagination via @krusch/toolkit/pagination (encodeCursor, paginateItems).'
+    );
+  }
+
+  return findings;
+}
+
+/**
+ * Extract top-level class, interface, struct, trait, module, and function/method declarations
+ * from polyglot enterprise repositories (Java, C#, Go, Ruby, Rust, Kotlin).
+ * @param {string} source
+ * @param {string} relFile
+ * @param {string} ext
+ * @returns {Array<{ symbol_name: string, symbol_type: string, start_line: number }>}
+ */
+function extractPolyglotFileSymbols(source, relFile, ext) {
+  const cleaned = stripPhpCommentsPreservingNewlines(source);
+  const lines = cleaned.split(/\r?\n/);
+  const symbols = [];
+  const seen = new Set();
+
+  const pushSym = (symbolName, symbolType, lineNumber) => {
+    const cleanName = String(symbolName || '').trim();
+    if (!cleanName || seen.has(cleanName) || symbols.length >= 24) return;
+    seen.add(cleanName);
+    symbols.push({
+      symbol_name: cleanName,
+      symbol_type: symbolType,
+      start_line: lineNumber
+    });
+  };
+
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const line = lines[idx];
+    const lineNo = idx + 1;
+
+    const typeMatch = line.match(
+      /\b(class|interface|struct|enum|trait|record|module)\s+([A-Za-z_][A-Za-z0-9_]*)\b/
+    );
+    if (typeMatch) {
+      pushSym(typeMatch[2], typeMatch[1], lineNo);
+    }
+
+    const fnMatch =
+      line.match(/\b(?:func|fn|def|fun)\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_?!]*)/) ||
+      line.match(
+        /\b(?:public|protected|private|internal)\s+(?:(?:static|final|virtual|override|async|synchronized)\s+)*[A-Za-z0-9_<>\[\].,?\s]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/
+      );
+    if (
+      fnMatch &&
+      !['if', 'for', 'while', 'switch', 'catch', 'return', 'new'].includes(fnMatch[1])
+    ) {
+      pushSym(fnMatch[1], 'function', lineNo);
+    }
+  }
+
+  if (symbols.length === 0) {
+    const stem = path.posix.basename(relFile, ext);
+    pushSym(`module:${stem}`, 'module', 1);
+  }
+
+  return symbols;
+}
+
+/**
+ * Deterministic `<1ms` polyglot enterprise brownfield hazard scanner (Java, C#, Go, Ruby, Rust, Kotlin)
+ * mapping legacy backend patterns to sealed `@krusch/toolkit` Golden Bricks.
+ * @param {string} source
+ * @param {string} filePath
+ * @returns {Array<{ filePath: string, ruleId: string, brickId: string, importPath: string, severity: string, message: string }>}
+ */
+function auditPolyglotMigrationFile(source, filePath) {
+  const cleaned = stripPhpCommentsPreservingNewlines(source);
+  const findings = [];
+
+  const pushFinding = (ruleId, brickId, importPath, message) => {
+    findings.push({
+      filePath,
+      ruleId,
+      brickId,
+      importPath,
+      severity: 'error',
+      message
+    });
+  };
+
+  if (
+    /\b(?:double|float)\s+[A-Za-z0-9_]*(?:price|amount|fee|tax|vat|total|subtotal|balance|discount|rate)[A-Za-z0-9_]*\b/i.test(
+      cleaned
+    ) ||
+    /\b[A-Za-z0-9_]*(?:price|amount|fee|tax|vat|total|subtotal|balance)[A-Za-z0-9_]*\s*\.\s*round\s*\(\s*2\s*\)/i.test(
+      cleaned
+    )
+  ) {
+    pushFinding(
+      'polyglot-float-currency-math',
+      'audit-log',
+      '@krusch/toolkit/audit-log',
+      'IEEE-754 float/double currency arithmetic risks sub-cent batch drift; port to integer-cent largest-remainder allocation (INV-FIN-03) with @krusch/toolkit/audit-log.'
+    );
+  }
+
+  if (
+    /"\s*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b[^"\n]*"\s*\+/i.test(cleaned) ||
+    /'\s*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b[^'\n]*'\s*\+/i.test(cleaned) ||
+    /\b(?:fmt\.Sprintf|String\.format)\s*\(\s*["'`]\s*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b/i.test(
+      cleaned
+    ) ||
+    /\$"\s*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b[^"\n]*\{/i.test(cleaned) ||
+    /"\s*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b[^"\n]*#\{/i.test(cleaned)
+  ) {
+    pushFinding(
+      'polyglot-raw-sql-concat',
+      'pg',
+      '@krusch/toolkit/pg',
+      'Interpolated or concatenated SQL query string detected; port to parameterized @krusch/toolkit/pg (createPgPool) or @krusch/toolkit/sqlite (openSqliteDb) queries.'
+    );
+  }
+
+  if (
+    /\b(?:http\.(?:Get|Post|NewRequest)|new\s+HttpClient\s*\(|RestTemplate\b|WebClient\.create|Net::HTTP\.|URI\.open\s*\(|reqwest::get\s*\()/.test(
+      cleaned
+    )
+  ) {
+    pushFinding(
+      'polyglot-unguarded-outbound-http',
+      'security',
+      '@krusch/toolkit/security',
+      'Direct outbound HTTP client call without DNS-pinned SSRF protection; port outbound calls to @krusch/toolkit/security (safeFetch, validateOutboundUrl).'
+    );
+  }
+
+  if (
+    /\bMessageDigest\.getInstance\s*\(\s*["'](?:MD5|SHA-?1)["']\s*\)/i.test(cleaned) ||
+    /\b(?:MD5|SHA1)\.Create\s*\(/i.test(cleaned) ||
+    /\b(?:md5|sha1)\.(?:New|Sum)\s*\(/.test(cleaned) ||
+    /\bDigest::(?:MD5|SHA1)\b/.test(cleaned)
+  ) {
+    pushFinding(
+      'polyglot-weak-crypto-digest',
+      'auth',
+      '@krusch/toolkit/auth',
+      'Legacy MD5/SHA-1 cryptographic digest detected; port authentication and token signing to @krusch/toolkit/auth (createAuth) or SHA-256 HMAC.'
+    );
+  }
+
+  if (
+    /\bSELECT\s+\*\s+FROM\s+[A-Za-z0-9_.`"]+/i.test(cleaned) &&
+    !/\b(?:LIMIT|TOP|FETCH\s+FIRST|Pageable)\b/i.test(cleaned)
+  ) {
+    pushFinding(
+      'polyglot-unbounded-select-all',
+      'pagination',
+      '@krusch/toolkit/pagination',
+      'Unbounded SELECT * query without cursor/limit pagination; port list endpoints to @krusch/toolkit/pagination (encodeCursor, paginateItems).'
     );
   }
 
@@ -1311,15 +1707,15 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
     }
 
     const safeMaxFiles = Math.max(1, Math.min(200, Math.trunc(Number(maxFiles) || 60)));
-    const looksLikeUrl = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawTarget);
+    const normalizedInput = normalizeGitHubRepoInput(rawTarget);
 
     let tempCloneDir = null;
     let scanRoot = '';
     let scanRepoName = 'scanned-repo';
 
     try {
-      if (looksLikeUrl) {
-        const urlCheck = await validateOutboundUrl(rawTarget, {
+      if (normalizedInput.isRemoteCandidate) {
+        const urlCheck = await validateOutboundUrl(normalizedInput.candidateUrl, {
           allowedProtocols: ['https:'],
           allowedHosts: ['github.com', 'www.github.com'],
           tool: 'deadbolt.planner.repo_scan'
@@ -1334,31 +1730,36 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           );
         }
 
-        const parsedUrl = new URL(rawTarget);
-        const cleanPathname = parsedUrl.pathname.replace(/^\/+|\/+$/g, '');
-        const pathParts = cleanPathname.split('/');
         if (
-          !GITHUB_OWNER_REPO_RE.test(cleanPathname) ||
-          pathParts.length !== 2 ||
-          pathParts.some((seg) => seg === '.' || seg === '..' || seg === '.git')
+          normalizedInput.invalidGitHubPath ||
+          !normalizedInput.repoSlug ||
+          !normalizedInput.cleanHttpsUrl
         ) {
           return errorEnvelope(
             'INVALID_GITHUB_REPO_PATH',
             'GitHub URL must reference a valid https://github.com/<owner>/<repo> path',
-            { target: rawTarget, pathname: parsedUrl.pathname },
+            { target: rawTarget },
             'deadbolt.planner.repo_scan'
           );
         }
 
-        const repoSlug = cleanPathname.replace(/\.git$/i, '');
+        const { repoSlug, cleanHttpsUrl } = normalizedInput;
         scanRepoName = repoSlug.replace(/\//g, '__');
-        const cleanHttpsUrl = `https://github.com/${repoSlug}.git`;
 
         tempCloneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-scan-'));
         try {
           execFileSync(
             'git',
-            ['clone', '--depth', '1', '--single-branch', '--', cleanHttpsUrl, tempCloneDir],
+            [
+              'clone',
+              '--depth',
+              '1',
+              '--single-branch',
+              '--filter=blob:limit=256k',
+              '--',
+              cleanHttpsUrl,
+              tempCloneDir
+            ],
             {
               timeout: 20_000,
               stdio: 'pipe',
@@ -1411,13 +1812,16 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         scanRepoName = path.basename(realDir) || 'local-scan';
       }
 
+      const scanStartNs = process.hrtime.bigint();
+      const cloneElapsedMs = Number((Number(scanStartNs - startNs) / 1e6).toFixed(3));
       const relFiles = collectRepoCodeFiles(scanRoot, safeMaxFiles);
       const repoFileSet = new Set(relFiles);
       const fileEntries = [];
       const dependencyPreview = [];
       const seenPreviewEdge = new Set();
       const phpSymbolsByFile = new Map();
-      const phpFindings = [];
+      const polyglotSymbolsByFile = new Map();
+      const extraFindings = [];
       let phpSymbolTotal = 0;
 
       const pushPreviewEdge = (from, to, relation) => {
@@ -1446,7 +1850,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           const phpSyms = extractPhpFileSymbols(content, relFile);
           phpSymbolsByFile.set(relFile, phpSyms);
           phpSymbolTotal += phpSyms.length;
-          phpFindings.push(...auditPhpMigrationFile(content, relFile));
+          extraFindings.push(...auditPhpMigrationFile(content, relFile));
 
           for (const dep of extractPhpDependencies(content)) {
             const target = resolvePhpDependencyTarget(relFile, dep.specifier, repoFileSet);
@@ -1454,6 +1858,10 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
               pushPreviewEdge(relFile, target, dep.relation);
             }
           }
+        } else if (POLYGLOT_EXTENSIONS.has(ext)) {
+          const polySyms = extractPolyglotFileSymbols(content, relFile, ext);
+          polyglotSymbolsByFile.set(relFile, polySyms);
+          extraFindings.push(...auditPolyglotMigrationFile(content, relFile));
         } else if (ext !== '.py') {
           for (const spec of extractRelativeSpecifiers(content)) {
             const target = resolveRelativeImportTarget(relFile, spec, repoFileSet);
@@ -1464,12 +1872,49 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         }
       }
 
-      const indexRes = stack.git.indexRepo({
-        path: scanRoot,
-        repoPath: scanRoot,
-        name: scanRepoName,
-        repoName: scanRepoName
-      });
+      let boundedIndexDir = null;
+      let indexTargetRoot = scanRoot;
+      if (fileEntries.length >= safeMaxFiles) {
+        boundedIndexDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-bounded-idx-'));
+        for (const entry of fileEntries) {
+          const destAbs = path.resolve(boundedIndexDir, entry.filePath);
+          if (destAbs.startsWith(boundedIndexDir + path.sep)) {
+            fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+            fs.writeFileSync(destAbs, entry.content, 'utf8');
+          }
+        }
+        indexTargetRoot = boundedIndexDir;
+      }
+
+      let indexRes = null;
+      try {
+        indexRes = stack.git.indexRepo({
+          path: indexTargetRoot,
+          repoPath: indexTargetRoot,
+          name: scanRepoName,
+          repoName: scanRepoName
+        });
+      } finally {
+        if (boundedIndexDir) {
+          try {
+            fs.rmSync(boundedIndexDir, { recursive: true, force: true });
+          } catch {
+            // Best-effort cleanup of bounded index directory
+          }
+        }
+      }
+
+      let fallbackPolyglotSymbols = 0;
+      for (const [relFile, polySyms] of polyglotSymbolsByFile.entries()) {
+        const symRes = stack.git.fileSymbols({
+          repo: scanRepoName,
+          file_path: relFile
+        });
+        const indexedSyms = Array.isArray(symRes?.data?.symbols) ? symRes.data.symbols : [];
+        if (indexedSyms.length === 0) {
+          fallbackPolyglotSymbols += polySyms.length;
+        }
+      }
 
       const topFiles = fileEntries.slice(0, 15).map((entry) => {
         const ext = path.extname(entry.filePath).toLowerCase();
@@ -1481,7 +1926,9 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
                   repo: scanRepoName,
                   file_path: entry.filePath
                 });
-                return Array.isArray(symRes?.data?.symbols) ? symRes.data.symbols : [];
+                const indexed = Array.isArray(symRes?.data?.symbols) ? symRes.data.symbols : [];
+                if (indexed.length > 0) return indexed;
+                return polyglotSymbolsByFile.get(entry.filePath) || [];
               })();
 
         return {
@@ -1492,12 +1939,16 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         };
       });
 
-      const coverage = scoreLegoBrickCoverage(fileEntries);
+      const jsPyEntries = fileEntries.filter((entry) => {
+        const ext = path.extname(entry.filePath).toLowerCase();
+        return ext !== '.php' && !POLYGLOT_EXTENSIONS.has(ext);
+      });
+      const coverage = scoreLegoBrickCoverage(jsPyEntries);
       const baseAudit = coverage.data;
-      const mergedFindings = [...baseAudit.findings, ...phpFindings];
+      const mergedFindings = [...baseAudit.findings, ...extraFindings];
       const flaggedFileSet = new Set(mergedFindings.map((item) => item.filePath));
       const recommendedSet = new Set(baseAudit.recommendedBrickIds || []);
-      for (const item of phpFindings) {
+      for (const item of extraFindings) {
         if (item.brickId) recommendedSet.add(item.brickId);
       }
       const totalSlopCount = mergedFindings.length;
@@ -1509,6 +1960,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
       const mergedSlopAudit = {
         ...baseAudit,
+        scannedFiles: fileEntries.length,
         cleanFiles: Math.max(0, fileEntries.length - flaggedFileSet.size),
         flaggedFiles: flaggedFileSet.size,
         slopFindingCount: totalSlopCount,
@@ -1518,20 +1970,26 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         findings: mergedFindings
       };
 
-      const symbolCount = Number(indexRes?.data?.symbols_indexed ?? 0) + phpSymbolTotal;
-      const elapsedMs = Number((Number(process.hrtime.bigint() - startNs) / 1e6).toFixed(3));
-      const displayTarget = looksLikeUrl ? rawTarget : scanRepoName;
+      const symbolCount =
+        Number(indexRes?.data?.symbols_indexed ?? 0) + phpSymbolTotal + fallbackPolyglotSymbols;
+      const elapsedMs = Number((Number(process.hrtime.bigint() - scanStartNs) / 1e6).toFixed(3));
+      const displayTarget = normalizedInput.isRemoteCandidate
+        ? normalizedInput.displayTarget
+        : scanRepoName;
 
       const summary = `Scanned ${fileEntries.length} file(s) and ${symbolCount} AST symbol(s) in ${displayTarget} (${mergedSlopAudit.slopFindingCount} slop finding(s), ${elapsedMs}ms).`;
 
       return okEnvelope('deadbolt.planner.repo_scan', summary, {
-        target: looksLikeUrl ? rawTarget : displayTarget,
+        target: displayTarget,
+        hintedFile: normalizedInput.hintedFile || '',
         scannedFiles: fileEntries.length,
+        scannedFilePaths: fileEntries.map((entry) => entry.filePath),
         symbolCount,
         topFiles,
         dependencyPreview,
         slopAudit: mergedSlopAudit,
-        elapsedMs
+        elapsedMs,
+        cloneElapsedMs
       });
     } finally {
       if (tempCloneDir) {
