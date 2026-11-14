@@ -378,7 +378,9 @@ export function BreakerCockpit() {
       const ev = String(frame?.event || '').toLowerCase();
       const payload = unwrapEnvelopeData(frame?.data) || frame?.data;
 
-      if (ev.includes('refinery') || payload?.stage === 'refinery') {
+      if (ev === 'done') {
+        stages.donePayload = payload;
+      } else if (ev.includes('refinery') || payload?.stage === 'refinery') {
         stages.refinery = payload;
       } else if (ev.includes('planner') || payload?.stage === 'planner') {
         stages.planner = payload;
@@ -405,14 +407,12 @@ export function BreakerCockpit() {
         payload?.prReceipt
       ) {
         stages.prDispatched = payload;
-      } else if (ev === 'done') {
-        stages.donePayload = payload;
       }
     }
 
     return {
       ...stages,
-      done: Boolean(stages.donePayload)
+      done: Boolean(stages.donePayload || stages.prDispatched)
     };
   }, [runStream.events]);
 
