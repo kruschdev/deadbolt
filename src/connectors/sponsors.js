@@ -1399,6 +1399,7 @@ export function createSponsorHub({
                     body: JSON.stringify({
                         text: transcript,
                         model_id: safeConfig.elevenlabsModelId || DEFAULT_ELEVENLABS_MODEL_ID,
+                        language_code: 'en',
                         voice_settings: {
                             stability: 0.65,
                             similarity_boost: 0.8
