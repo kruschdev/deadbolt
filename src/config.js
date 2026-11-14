@@ -146,7 +146,7 @@ export const config = Object.freeze({
     composioMcpUrl: envOr('COMPOSIO_MCP_URL', baseConfig.composioMcpUrl, 'https://connect.composio.dev/mcp'),
     elevenlabsApiKey: envOr('ELEVENLABS_API_KEY', baseConfig.elevenlabsApiKey, ''),
     elevenlabsVoiceId: envOr('ELEVENLABS_VOICE_ID', baseConfig.elevenlabsVoiceId, 'JBFqnCBsd6RMkjVDRZzb'),
-    elevenlabsModelId: envOr('ELEVENLABS_MODEL_ID', baseConfig.elevenlabsModelId, 'eleven_turbo_v2_5'),
+    elevenlabsModelId: envOr('ELEVENLABS_MODEL_ID', baseConfig.elevenlabsModelId, 'eleven_turbo_v2'),
     geminiApiKey: resolvedGeminiApiKey,
     openRouterApiKey: resolvedOpenRouterApiKey,
     enableLiveReviewers: resolvedEnableLiveReviewers,

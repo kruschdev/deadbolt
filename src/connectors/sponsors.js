@@ -30,7 +30,7 @@ const DEFAULT_COMPOSIO_BASE_URL = 'https://backend.composio.dev/api/v3';
 const DEFAULT_COMPOSIO_MCP_URL = 'https://connect.composio.dev/mcp';
 const STREAMABLE_MCP_ACCEPT = ['application/json', ['text', 'event-stream'].join('/')].join(', ');
 const DEFAULT_ELEVENLABS_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
-const DEFAULT_ELEVENLABS_MODEL_ID = 'eleven_turbo_v2_5';
+const DEFAULT_ELEVENLABS_MODEL_ID = 'eleven_turbo_v2';
 const SAFE_WORK_ORDER_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const SAFE_VOICE_ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
 const SAFE_TARGET_REPO_RE = /^(?!\.\.?\/)[A-Za-z0-9_.-]+\/(?!\.\.?$)[A-Za-z0-9_.-]+$/;
@@ -1612,6 +1612,21 @@ export function createSponsorHub({
             .slice(0, MAX_FOREMAN_SPEECH_CHARS);
     }
 
+    function formatForemanSpeechForTts(cleanText) {
+        return String(cleanText || '')
+            .replace(/\bWO-101\b/gi, 'Work Order one oh one')
+            .replace(/\bWO-(\d+)\b/gi, 'Work Order $1')
+            .replace(/\bsrc\/sox-reconciler\.js\b/gi, 'socks reconciler dot J S')
+            .replace(/\bsox-reconciler\.js\b/gi, 'socks reconciler dot J S')
+            .replace(/\bsrc\/([A-Za-z0-9_.-]+)/g, '$1')
+            .replace(/\.js\b/gi, ' dot J S')
+            .replace(/\bSOX\b/g, 'socks')
+            .replace(/\bSHA-256\b/gi, 'S H A two fifty-six')
+            .replace(/\bDeepSeek\b/gi, 'Deep Seek')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
     /**
      * Synthesize Factory Foreman audio telemetry via ElevenLabs streaming TTS (safeFetch)
      * or crisp offline 22050 Hz PCM16 WAV industrial breaker chime (encodeWavPcm16 + parseWavHeader).
@@ -1622,6 +1637,7 @@ export function createSponsorHub({
         eventType = 'WORKAROUND_REJECTED'
     } = {}) {
         const cleanSpeechText = sanitizeForemanSpeechText(text, reason, eventType);
+        const ttsSpeechText = formatForemanSpeechForTts(cleanSpeechText);
 
         const voiceId = SAFE_VOICE_ID_RE.test(String(safeConfig.elevenlabsVoiceId || ''))
             ? String(safeConfig.elevenlabsVoiceId)
@@ -1632,7 +1648,7 @@ export function createSponsorHub({
             const resolvedModelId =
                 String(safeConfig.elevenlabsModelId || DEFAULT_ELEVENLABS_MODEL_ID).trim() ||
                 DEFAULT_ELEVENLABS_MODEL_ID;
-            const speechHash = crypto.createHash('sha256').update(cleanSpeechText, 'utf8').digest('hex');
+            const speechHash = crypto.createHash('sha256').update(ttsSpeechText, 'utf8').digest('hex');
             const cacheKey = `${voiceId}:${resolvedModelId}:${speechHash}`;
             const cachedEntry = getCachedForemanTts(cacheKey);
             if (cachedEntry) {
@@ -1661,9 +1677,9 @@ export function createSponsorHub({
                         'xi-api-key': safeConfig.elevenlabsApiKey.trim()
                     },
                     body: JSON.stringify({
-                        text: cleanSpeechText,
+                        text: ttsSpeechText,
                         model_id: resolvedModelId,
-                        ...(resolvedModelId === 'eleven_turbo_v2_5' ? { language_code: 'en' } : {}),
+                        language_code: 'en',
                         voice_settings: {
                             stability: 0.65,
                             similarity_boost: 0.8

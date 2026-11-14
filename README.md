@@ -71,7 +71,7 @@ Open `http://127.0.0.1:4090` to launch the **DEADBOLT Breaker Panel**, or attach
 - **8090 Software Factory** (Event Tool, subject to 8090 Event Tool Terms)
 - **HydraDB** ([`hydra-db/hydradb`](https://github.com/hydra-db/hydradb) `v0.4.0` OpenCypher Graph Engine & `API-Version: 2`, Elastic License 2.0 `ELv2` / Sponsor Event Tool Terms)
 - **Composio** (Composio Connect MCP + REST v3 API via DNS-pinned `safeFetch`, Sponsor Service Terms)
-- **ElevenLabs** (ElevenLabs TTS Streaming API, `eleven_turbo_v2_5`, Sponsor Service Terms)
+- **ElevenLabs** (ElevenLabs TTS Streaming API, `eleven_turbo_v2`, Sponsor Service Terms)
 - **OpenRouter** (`anthropic/claude-sonnet-5.5`, `deepseek/deepseek-chat-v3-0324`, `deepseek/deepseek-v3.2`, `google/gemini-2.5-flash-lite`, `google/gemini-2.5-flash`) & **Google Gemini API** (`gemini-3.8-flash`)
 - **Ollama** *(optional local GPU fast/reviewer tier: `qwen2.5-coder:7b`, `qwen3-coder-30b-moe`)*
 - **Vercel** (Deployment & Preview Platform, Sponsor Service Terms)
