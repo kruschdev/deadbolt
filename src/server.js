@@ -261,6 +261,32 @@ export function buildServer({
                 return result;
             },
 
+            'POST /api/repo/modernize': async (ctx) => {
+                const orch = await getOrchestrator();
+                const repoUrlOrPath = String(
+                    ctx.body?.repoUrlOrPath ||
+                        ctx.body?.target ||
+                        'https://github.com/taniarascia/pdo'
+                ).trim();
+                const targetFile = String(ctx.body?.targetFile || '').trim();
+                const maxFiles = Number.isFinite(Number(ctx.body?.maxFiles))
+                    ? Number(ctx.body.maxFiles)
+                    : 60;
+                run('INSERT INTO events (label) VALUES (?)', [
+                    `modernize:${repoUrlOrPath.slice(0, 64)}`
+                ]);
+                const result = await orch.modernizeRepository({
+                    repoUrlOrPath,
+                    targetFile,
+                    maxFiles
+                });
+                if (!result.ok) {
+                    ctx.sendJson(400, result);
+                    return;
+                }
+                return result;
+            },
+
             'POST /api/drills/crash-recovery': async () => {
                 const orch = await getOrchestrator();
                 run('INSERT INTO events (label) VALUES (?)', ['drill:crash-recovery']);

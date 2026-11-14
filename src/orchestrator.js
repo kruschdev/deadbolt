@@ -28,6 +28,7 @@ import { createRefineryEngine } from './engines/refinery-context.js';
 import { createPlannerEngine } from './engines/planner-graph.js';
 import { createFoundryEngine } from './engines/foundry-staging.js';
 import { createValidatorEngine } from './engines/validator-gate.js';
+import { createModernizerBenchmarkEngine } from './engines/modernizer-benchmark.js';
 import { createHydraGraphClient } from './connectors/hydradb-graph.js';
 import { createSponsorHub } from './connectors/sponsors.js';
 import { DEADBOLT_MCP_PERMISSION_TABLE } from './mcp/deadbolt-mcp.js';
@@ -220,6 +221,23 @@ export async function createDeadboltOrchestrator(options = {}) {
         config: activeConfig,
         hydraClient,
         hydraGraphClient
+    });
+
+    const modernizer = createModernizerBenchmarkEngine({
+        planner,
+        foundry,
+        validator,
+        hydraClient,
+        hydraGraphClient,
+        sponsors,
+        llmConfig: {
+            ...llmConfig,
+            ollamaFastModel: activeConfig.ollamaFastModel || 'qwen2.5-coder:7b',
+            frontierBenchmarkModel:
+                activeConfig.frontierBenchmarkModel || 'anthropic/claude-sonnet-5.5',
+            preferCloudFastTier: Boolean(activeConfig.preferCloudFastTier),
+            chatImpl: options.chatImpl || activeConfig.chatImpl || null
+        }
     });
 
     // Seed organizational context once at startup so GET /api/status and MCP tools are warm immediately
@@ -858,6 +876,109 @@ export async function createDeadboltOrchestrator(options = {}) {
     }
 
     /**
+     * Run Head-to-Head Legacy Software Modernization Benchmark on any public GitHub repo or preset:
+     * Arm A (1 Single All-Frontier Model, full-repo prompt stuffing) vs.
+     * Arm B (DEADBOLT: HydraDB Dual-Live 2-Hop Graph + <25us Cascade Router + <1ms Golden Brick Slop Breaker + 2-Family Review).
+     */
+    async function modernizeRepository({
+        repoUrlOrPath = 'https://github.com/taniarascia/pdo',
+        targetFile = '',
+        maxFiles = 60
+    } = {}) {
+        const cleanTarget = String(repoUrlOrPath || '').trim();
+        if (!cleanTarget) {
+            return errorEnvelope(
+                'EMPTY_MODERNIZE_TARGET',
+                'Please provide a GitHub repository URL or local directory path to modernize.',
+                null,
+                'deadbolt.orchestrator.repo_modernize'
+            );
+        }
+
+        if (cleanTarget.toLowerCase() === 'acme-legacy-billing') {
+            const tempBrownfieldDir = fs.mkdtempSync(
+                path.join(os.tmpdir(), 'deadbolt-mod-acme-')
+            );
+            try {
+                materializeBillingRepo(tempBrownfieldDir);
+                for (const sample of getLegacySlopSamples()) {
+                    const absSample = path.join(tempBrownfieldDir, sample.filePath);
+                    fs.mkdirSync(path.dirname(absSample), { recursive: true });
+                    fs.writeFileSync(absSample, sample.content, 'utf8');
+                }
+                return await modernizer.runModernizationComparison({
+                    repoUrlOrPath: 'acme-legacy-billing',
+                    targetFile,
+                    maxFiles,
+                    materializedOverride: okEnvelope(
+                        'deadbolt.modernizer.preset',
+                        'Materialized acme-legacy-billing',
+                        {
+                            repoDir: tempBrownfieldDir,
+                            ownedTempDir: null,
+                            repoSlug: 'acme-legacy-billing',
+                            displayTarget: 'acme-legacy-billing',
+                            maxFiles
+                        }
+                    )
+                });
+            } finally {
+                try {
+                    fs.rmSync(tempBrownfieldDir, { recursive: true, force: true });
+                } catch {
+                    /* ignore temp cleanup errors */
+                }
+            }
+        }
+
+        if (cleanTarget.toLowerCase() === 'pdo-nextjs-governed') {
+            const tempPortDir = fs.mkdtempSync(
+                path.join(os.tmpdir(), 'deadbolt-mod-pdo-nextjs-')
+            );
+            try {
+                const portFiles = BILLING_REPO_SNAPSHOT.governedNextjsPdoFiles || {};
+                for (const [relPath, fileContent] of Object.entries(portFiles)) {
+                    const normalizedRel = String(relPath).replace(/\\/g, '/').replace(/^\/+/, '');
+                    const destAbs = path.resolve(tempPortDir, normalizedRel);
+                    if (destAbs !== tempPortDir && !destAbs.startsWith(tempPortDir + path.sep)) {
+                        continue;
+                    }
+                    fs.mkdirSync(path.dirname(destAbs), { recursive: true });
+                    fs.writeFileSync(destAbs, String(fileContent), 'utf8');
+                }
+                return await modernizer.runModernizationComparison({
+                    repoUrlOrPath: 'pdo-nextjs-governed',
+                    targetFile,
+                    maxFiles,
+                    materializedOverride: okEnvelope(
+                        'deadbolt.modernizer.preset',
+                        'Materialized pdo-nextjs-governed',
+                        {
+                            repoDir: tempPortDir,
+                            ownedTempDir: null,
+                            repoSlug: 'pdo-nextjs-governed',
+                            displayTarget: 'pdo-nextjs-governed',
+                            maxFiles
+                        }
+                    )
+                });
+            } finally {
+                try {
+                    fs.rmSync(tempPortDir, { recursive: true, force: true });
+                } catch {
+                    /* ignore temp cleanup errors */
+                }
+            }
+        }
+
+        return modernizer.runModernizationComparison({
+            repoUrlOrPath: cleanTarget,
+            targetFile,
+            maxFiles
+        });
+    }
+
+    /**
      * Execute Stage 3 Foundry mid-apply crash simulation & journal recovery drill (`INV-DB-06`).
      */
     async function runCrashDrill() {
@@ -962,6 +1083,7 @@ export async function createDeadboltOrchestrator(options = {}) {
         applyVerifiedTask,
         runHeadToHead,
         scanRepository,
+        modernizeRepository,
         runCrashDrill,
         runDeputyDrill,
         speakForeman,

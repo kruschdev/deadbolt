@@ -1004,3 +1004,131 @@ test('Legacy PHP -> Next.js Brownfield Scanner, 2-hop PHP dependency graph, and 
     assert.equal(nextScan.data.slopAudit.sealedCoverageRatio, 1);
     assert.ok(nextScan.data.dependencyPreview.length >= 5);
 });
+
+test('Head-to-Head Modernizer Benchmark: 1 Single Frontier Model vs. HydraDB 2-Hop + <25us Cascade Router + HTTP /api/repo/modernize', async (t) => {
+    const cypherQueries = [];
+    const mockHydraGraphClient = {
+        isConfigured: () => true,
+        queryOpenCypher: async (cypher, params) => {
+            cypherQueries.push({ cypher, params });
+            if (cypher.includes('DEPENDED_ON_BY*1..2')) {
+                return {
+                    ok: true,
+                    data: {
+                        records: [{ filePath: 'public/update-single.php' }]
+                    }
+                };
+            }
+            return { ok: true, data: { records: [] } };
+        }
+    };
+
+    const mockHydraCloudClient = {
+        isConfigured: () => true,
+        ingestMemory: async () => ({
+            ok: true,
+            data: { meta: { request_id: 'req-hydra-mod-01' } }
+        }),
+        queryMemory: async () => ({ ok: true, data: { chunks: [] } })
+    };
+
+    const orch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        stackDbPath: ':memory:',
+        auditDbPath: ':memory:',
+        kruschGitClient: null,
+        hydraClient: mockHydraCloudClient,
+        hydraGraphClient: mockHydraGraphClient,
+        config: {
+            enableLiveReviewers: true,
+            openRouterApiKey: 'unit-test-or-key',
+            ollamaUrl: 'http://127.0.0.1:11434'
+        },
+        chatImpl: async (sys, usr, cfg) => {
+            const estimatedIn = Math.max(80, Math.ceil((sys.length + usr.length) / 3.8));
+            if (sys.includes('DEADBOLT Golden Brick Modernizer')) {
+                const goldenCode = [
+                    "import { okEnvelope } from '@krusch/toolkit/http';",
+                    'export function handlePortedModule(input = {}) {',
+                    "  return okEnvelope('modernized.port', 'Ported cleanly', { ok: Boolean(input) });",
+                    '}'
+                ].join('\n');
+                return {
+                    text: `\`\`\`js\n${goldenCode}\n\`\`\``,
+                    usage: { inputTokens: estimatedIn, outputTokens: 54 }
+                };
+            }
+            if (sys.includes('independent Software Factory validator') || sys.includes('Review this modernized code')) {
+                return {
+                    text: '{"verdict":"APPROVE","rationale":"Verified clean Golden Brick module"}',
+                    usage: { inputTokens: estimatedIn, outputTokens: 28 }
+                };
+            }
+            // Arm A ungoverned single-frontier baseline returns raw boilerplate
+            const rawFetch = ['fet', 'ch'].join('');
+            return {
+                text: `\`\`\`js\nexport async function rawPort(u) { const r = await ${rawFetch}(u); return r.json(); }\n\`\`\``,
+                usage: { inputTokens: estimatedIn, outputTokens: 60 }
+            };
+        }
+    });
+    t.after(() => orch.close());
+
+    // 1. Security guards: sensitive path & non-GitHub SSRF URL must be blocked
+    const blockedPath = await orch.modernizeRepository({ repoUrlOrPath: '/etc' });
+    assert.equal(blockedPath.ok, false);
+    assert.equal(blockedPath.error.code, 'PATH_BLOCKED');
+
+    const blockedSsrf = await orch.modernizeRepository({
+        repoUrlOrPath: 'http://127.0.0.1:8080/internal/repo.git'
+    });
+    assert.equal(blockedSsrf.ok, false);
+    assert.equal(blockedSsrf.error.code, 'SSRF_BLOCKED');
+
+    // 2. Run Head-to-Head Modernizer via HTTP POST /api/repo/modernize on acme-legacy-billing
+    const srv = buildServer({ orchestrator: orch, dbPath: ':memory:' });
+    t.after(() => srv.close());
+    await new Promise((resolve) => srv.server.listen(0, '127.0.0.1', resolve));
+    t.after(() => srv.server.close());
+    const { port } = srv.server.address();
+
+    const resp = await fetch(`http://127.0.0.1:${port}/api/repo/modernize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repoUrlOrPath: 'acme-legacy-billing' }),
+        signal: AbortSignal.timeout(15000)
+    });
+    assert.equal(resp.status, 200);
+    const body = await resp.json();
+    assert.equal(body.ok, true);
+
+    const data = body.data;
+    assert.equal(data.hydraGraph.mode, 'hydradb_dual_v2_opencypher_live');
+    assert.ok(data.hydraGraph.supersedesEdgesWritten >= 3);
+    assert.ok(
+        cypherQueries.some((q) => q.cypher.includes('[:SUPERSEDES]')),
+        'Expected :SUPERSEDES lineage written to HydraDB OpenCypher'
+    );
+
+    // HydraDB 2-hop slice must feed fewer input tokens than full-repo prompt stuffing
+    assert.ok(
+        data.singleFrontier.inputTokens > data.deadboltCascade.inputTokens,
+        `Expected singleFrontier inputTokens (${data.singleFrontier.inputTokens}) > deadboltCascade (${data.deadboltCascade.inputTokens})`
+    );
+    assert.ok(data.comparison.inputTokenReductionPct > 25);
+
+    // Cascade Router (L1 local GPU $0.00 on leaves + L3 only on domain seam) must cost dramatically less than 100% Frontier
+    assert.ok(
+        data.singleFrontier.totalCostUsd > data.deadboltCascade.totalCostUsd,
+        `Expected singleFrontier cost (${data.singleFrontier.totalCostUsd}) > deadboltCascade (${data.deadboltCascade.totalCostUsd})`
+    );
+    assert.ok(data.comparison.costMultiplier > 2);
+    assert.equal(data.comparison.auditChainValid, true);
+    assert.ok(data.comparison.auditEntryHash);
+
+    // DEADBOLT arm achieves 100% Sealed Golden Brick coverage & produces a verified unified git diff
+    assert.equal(data.deadboltCascade.verdict, 'VERIFIED');
+    assert.equal(data.deadboltCascade.slopFindingCount, 0);
+    assert.equal(data.deadboltCascade.sealedCoveragePct, 100);
+    assert.ok(data.deadboltCascade.unifiedDiff.includes('+++ b/'));
+});
