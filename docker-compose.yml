@@ -1,0 +1,18 @@
+# OS Drive Protection (INV-LEGO-04):
+# Point DATA_DIR to a dedicated non-OS storage volume in production.
+services:
+  app:
+    build:
+      context: .
+    container_name: deadbolt
+    restart: unless-stopped
+    ports:
+      - "${PORT:-4090}:4090"
+    environment:
+      PORT: "4090"
+      DB_PATH: /app/data/deadbolt.db
+      STACK_DB_PATH: /app/data/krusch-stack.db
+      AUDIT_DB_PATH: /app/data/deadbolt-audit.db
+      LOG_DIR: /app/data/logs
+    volumes:
+      - ${DATA_DIR:-./data}:/app/data

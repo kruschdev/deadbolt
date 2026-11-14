@@ -1,0 +1,31 @@
+{
+  "name": "deadbolt",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "DEADBOLT: Deterministic Governance Layer, 2-Hop Blast-Radius Planner, Self-Rejecting Validator, and Live Breaker Panel for the 8090 Software Factory",
+  "author": "Kevin Saylor Ruschman <kruschdev@users.noreply.github.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kruschdev/deadbolt.git"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "bin": {
+    "deadbolt-mcp": "./src/mcp/deadbolt-mcp.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "mcp": "node src/mcp/deadbolt-mcp.js",
+    "client:dev": "npm --prefix client run dev",
+    "client:build": "npm --prefix client run build",
+    "build": "npm --prefix client run build",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "@krusch/toolkit": "github:kruschdev/toolkit#b8bc750",
+    "krusch-stack": "github:kruschdev/krusch-stack#9b8c4a2"
+  }
+}
