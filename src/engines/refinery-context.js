@@ -119,6 +119,50 @@ function clampTextToTokenBudget(text, maxTokens) {
   };
 }
 
+function extractHydraChunkText(chunk) {
+  if (!chunk || typeof chunk !== 'object') return '';
+  const direct = String(chunk.text ?? chunk.content ?? '').trim();
+  if (direct) return direct;
+  const rawChunkContent = String(chunk.chunk_content ?? '').trim();
+  if (!rawChunkContent) return '';
+  if (rawChunkContent.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(rawChunkContent);
+      const inner = String(
+        parsed?.content?.text ?? parsed?.text ?? parsed?.content ?? ''
+      ).trim();
+      if (inner) return inner;
+    } catch {
+      /* treat non-JSON chunk_content as plain text */
+    }
+  }
+  return rawChunkContent;
+}
+
+function formatHydraV2Snippet(queryResult) {
+  if (!queryResult || typeof queryResult !== 'object') return '';
+  const rawChunks = Array.isArray(queryResult.chunks) ? queryResult.chunks : [];
+  const normalizedChunks = rawChunks.map((chunk) => ({
+    ...chunk,
+    source_id: chunk?.source_id || chunk?.id,
+    title: chunk?.title || chunk?.source_title || chunk?.id,
+    score:
+      typeof chunk?.score === 'number'
+        ? chunk.score
+        : typeof chunk?.relevancy_score === 'number'
+          ? chunk.relevancy_score
+          : undefined,
+    text: extractHydraChunkText(chunk)
+  }));
+  const formatted = buildHydraContextString(
+    { ...queryResult, chunks: normalizedChunks },
+    { maxChunks: 3 }
+  );
+  if (formatted.trim()) return formatted;
+  const promptFallback = String(queryResult.llm_prompt || '').trim();
+  return promptFallback ? promptFallback.slice(0, 900) : '';
+}
+
 export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot } = {}) {
   const stackRoot = path.resolve(stack?.workspaceRoot || workspaceRoot || process.cwd());
   const mirrorSlot = crypto
@@ -409,7 +453,7 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
             title: 'INV-FIN-02 (Superseded Legacy Rounding Policy)',
             text:
               'INV-FIN-02 permitted +/-1 cent batch settlement rounding variance during MVP rollout. Superseded by INV-FIN-03.',
-            metadata: {
+            additional_metadata: {
               status: 'superseded',
               invariant_code: 'INV-FIN-02',
               superseded_by: 'deadbolt-inv-fin-03'
@@ -417,10 +461,10 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
           },
           {
             id: 'deadbolt-inv-fin-03',
-            title: 'INV-FIN-03 (Active SOX Zero-Cent Batch Parity)',
+            title: 'INV-FIN-03 (Active SOX-Style Zero-Cent Batch Parity)',
             text:
               'INV-FIN-03 mandates exact zero-cent parity between settled line-item net payouts plus batch processor fee and gross invoice cents (deltaCents === 0, strictSox = true).',
-            metadata: {
+            additional_metadata: {
               status: 'active',
               invariant_code: 'INV-FIN-03',
               supersedes_id: 'deadbolt-inv-fin-02',
@@ -428,11 +472,13 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
             }
           }
         ];
-        await hydraClient.ingestMemories(hydraMemories, { upsert: true });
+        const ingestRes = await hydraClient.ingestMemories(hydraMemories, { upsert: true });
         hydraSync = {
           configured: true,
           synced: true,
           mode: 'hydradb_v2_live',
+          apiVersion: ingestRes?._meta?.api_version || '2',
+          requestId: ingestRes?._meta?.request_id || null,
           ingestedCount: hydraMemories.length
         };
       } catch (err) {
@@ -640,14 +686,20 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
       try {
         const hydraQueryRes = await hydraClient.queryContext({
           query: `${workOrder.id} ${query}`,
+          type: 'all',
+          queryBy: 'hybrid',
+          mode: 'thinking',
           maxResults: 4,
           graphContext: true
         });
-        const formattedHydra = buildHydraContextString(hydraQueryRes, { maxChunks: 3 });
+        const formattedHydra = formatHydraV2Snippet(hydraQueryRes);
         hydraSync = {
           configured: true,
           queried: true,
           mode: 'hydradb_v2_live',
+          apiVersion: hydraQueryRes?._meta?.api_version || '2',
+          requestId: hydraQueryRes?._meta?.request_id || null,
+          chunkCount: Array.isArray(hydraQueryRes?.chunks) ? hydraQueryRes.chunks.length : 0,
           contextSnippet: formattedHydra
         };
       } catch (err) {
@@ -655,6 +707,7 @@ export function createRefineryEngine({ stack, hydraClient = null, workspaceRoot 
           configured: true,
           queried: false,
           mode: 'hydradb_error_fallback',
+          requestId: null,
           contextSnippet: '',
           error: err instanceof Error ? err.message : String(err)
         };

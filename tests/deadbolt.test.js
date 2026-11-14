@@ -485,14 +485,29 @@ test('8090 Software Factory v2 Organization Admin (sofa-admin-*) and External AP
         if (parsed.pathname === '/v2/external-api/work_orders') {
             return new Response(
                 JSON.stringify({
-                    items: [{ id: 'wo-uuid-101', title: 'WO-101 Fee Residual' }],
+                    items: [
+                        {
+                            id: 'wo-uuid-101',
+                            work_order_number: 1,
+                            title: '[WO-101] Fix integer basis-point residual allocation in src/fee-engine.js',
+                            status: 'in_review',
+                            priority: 'urgent'
+                        }
+                    ],
                     total: 3,
                     page: 1,
-                    page_size: 5,
+                    page_size: 20,
                     total_pages: 1
                 }),
                 { status: 200, headers: { 'Content-Type': 'application/json' } }
             );
+        }
+
+        if (parsed.pathname === '/v2/reporting-api/feedback') {
+            return new Response(JSON.stringify({ feedback_number: 1 }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
         }
 
         return new Response(JSON.stringify({ detail: 'not found' }), { status: 404 });
@@ -502,7 +517,8 @@ test('8090 Software Factory v2 Organization Admin (sofa-admin-*) and External AP
         config: {
             sofaApiBaseUrl: 'https://api.factory.8090.dev',
             sofaAdminApiKey: 'sofa-admin-unit-fixture',
-            sofaApiKey: 'sofa-ext-unit-fixture'
+            sofaApiKey: 'sofa-ext-unit-fixture',
+            sofaReportingApiKey: 'sf-rpt-unit-fixture'
         },
         lookupFn: async () => [{ address: '93.184.216.34', family: 4 }],
         fetchImpl: mockSofaFetch
@@ -511,17 +527,23 @@ test('8090 Software Factory v2 Organization Admin (sofa-admin-*) and External AP
     const statusEnv = sponsorHub.getConnectorStatuses();
     assert.equal(statusEnv.ok, true);
     assert.equal(statusEnv.data.connectors.softwareFactory8090.liveConfigured, true);
-    assert.equal(statusEnv.data.connectors.softwareFactory8090.mode, 'sofa_dual_api_live');
+    assert.equal(statusEnv.data.connectors.softwareFactory8090.mode, 'sofa_tri_api_live');
 
     const syncEnv = await sponsorHub.syncSoftwareFactoryWorkOrder({
         workOrder: { id: 'WO-101', title: 'Fix fee residual allocation' }
     });
     assert.equal(syncEnv.ok, true);
     assert.equal(syncEnv.data.liveMcpSync.connected, true);
-    assert.equal(syncEnv.data.liveMcpSync.mode, 'sofa_dual_api_live');
+    assert.equal(syncEnv.data.liveMcpSync.mode, 'sofa_tri_api_live');
     assert.equal(syncEnv.data.liveMcpSync.externalApiHealthy, true);
     assert.equal(syncEnv.data.liveMcpSync.externalWorkOrderCount, 3);
+    assert.equal(syncEnv.data.liveMcpSync.matchedLiveWorkOrder.workOrderNumber, 1);
     assert.equal(syncEnv.data.liveMcpSync.orgSpendStatus.current_period_spend_usd, '4.18');
+
+    const fbEnv = await sponsorHub.reportValidatorFeedback({ workOrderId: 'WO-101' });
+    assert.equal(fbEnv.ok, true);
+    assert.equal(fbEnv.data.liveReported, true);
+    assert.equal(fbEnv.data.feedbackNumber, 1);
 
     const orgReq = captured.find((r) => r.pathname === '/v2/organization-api/spend-status');
     assert.ok(orgReq);
@@ -616,4 +638,183 @@ test('Composio Connect MCP (ck_* x-consumer-api-key) connector and INV-DB-07 pre
     assert.equal(capturedMcp[0].pathname, '/mcp');
     assert.equal(capturedMcp[0].headers['x-consumer-api-key'], 'ck_unit_fixture_consumer_key');
     assert.equal(capturedMcp[0].body.method, 'tools/list');
+});
+
+test('HydraDB v2 Cloud REST (API-Version: 2 /context/ingest, /query hybrid thinking, /feedback ground_truth) + OpenCypher dual-live', async (t) => {
+    const capturedHydra = [];
+    const mockHydraFetch = async (url, init = {}) => {
+        const parsed = new URL(String(url));
+        let parsedJson = null;
+        if (typeof init.body === 'string') {
+            try {
+                parsedJson = JSON.parse(init.body);
+            } catch {
+                parsedJson = null;
+            }
+        }
+        capturedHydra.push({
+            hostname: parsed.hostname,
+            pathname: parsed.pathname,
+            headers: init.headers || {},
+            jsonBody: parsedJson,
+            isFormData: init.body instanceof FormData
+        });
+
+        if (parsed.pathname === '/context/ingest') {
+            return new Response(
+                JSON.stringify({
+                    success: true,
+                    data: {
+                        success: true,
+                        success_count: 3,
+                        failed_count: 0
+                    },
+                    error: null,
+                    meta: {
+                        request_id: 'req-ingest-001',
+                        api_version: '2.0.1',
+                        latency_ms: 18.4
+                    }
+                }),
+                { status: 202, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
+        if (parsed.pathname === '/query') {
+            return new Response(
+                JSON.stringify({
+                    success: true,
+                    data: {
+                        chunks: [
+                            {
+                                id: 'deadbolt-file-sox-reconciler',
+                                source_title: 'src/sox-reconciler.js',
+                                relevancy_score: 0.912,
+                                chunk_content: JSON.stringify({
+                                    content: {
+                                        text: 'Protected verifier (INV-FIN-03): enforces zero-cent SOX-style batch reconciliation parity.'
+                                    }
+                                })
+                            }
+                        ],
+                        sources: [
+                            { id: 'deadbolt-file-sox-reconciler', title: 'src/sox-reconciler.js' }
+                        ],
+                        graph_context: { query_paths: ['src/fee-engine.js -> src/sox-reconciler.js'] }
+                    },
+                    error: null,
+                    meta: {
+                        request_id: 'req-query-verbatim-777',
+                        api_version: '2.0.1',
+                        latency_ms: 29.1
+                    }
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
+        if (parsed.pathname === '/feedback') {
+            return new Response(
+                JSON.stringify({
+                    success: true,
+                    data: { accepted: true },
+                    error: null,
+                    meta: { request_id: 'req-fb-001', api_version: '2.0.1' }
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
+        if (parsed.pathname === '/v1/graphs/deadbolt-factory/query') {
+            const cypher = String(parsedJson?.query || '');
+            if (cypher.startsWith('MERGE ')) {
+                return new Response(
+                    JSON.stringify({ columns: [], rows: [], read_epoch: null }),
+                    { status: 200, headers: { 'Content-Type': 'application/json' } }
+                );
+            }
+            return new Response(
+                JSON.stringify({
+                    columns: ['woVertexId', 'activeInvVertexId', 'supersededInvVertexId'],
+                    rows: [
+                        [
+                            { type: 'vertex_id', value: 9001 },
+                            { type: 'vertex_id', value: 8003 },
+                            { type: 'vertex_id', value: 8002 }
+                        ]
+                    ]
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
+        return new Response(JSON.stringify({ error: 'not found' }), { status: 404 });
+    };
+
+    const dualHub = createSponsorHub({
+        config: {
+            hydradbApiKey: 'hydra-v2-unit-fixture-key',
+            hydradbBaseUrl: 'https://api.hydradb.com',
+            hydradbDatabase: 'default-tenant',
+            hydradbCollection: 'work_orders',
+            hydradbGraphUrl: 'https://hydradb-edge.example.com:8443',
+            hydradbGraphToken: 'open-cypher-unit-token'
+        },
+        lookupFn: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetchImpl: mockHydraFetch
+    });
+
+    const statuses = dualHub.getConnectorStatuses();
+    assert.equal(statuses.data.connectors.hydradb.mode, 'hydradb_dual_v2_opencypher_live');
+    assert.equal(statuses.data.connectors.hydradb.endpoint, 'https://api.hydradb.com/');
+
+    const syncRes = await dualHub.syncHydraLineage({ workOrderId: 'WO-101' });
+    assert.equal(syncRes.ok, true);
+    assert.equal(syncRes.data.mode, 'hydradb_dual_v2_opencypher_live');
+    assert.equal(syncRes.data.v2Synced, true);
+    assert.equal(syncRes.data.openCypherSynced, true);
+
+    // Ensure Cloud HydraDB key was NEVER leaked to self-hosted OpenCypher endpoint
+    const cypherReq = capturedHydra.find((r) => r.pathname === '/v1/graphs/deadbolt-factory/query');
+    assert.ok(cypherReq);
+    assert.equal(cypherReq.headers.Authorization, 'Bearer open-cypher-unit-token');
+
+    const orch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        stackDbPath: ':memory:',
+        auditDbPath: ':memory:',
+        kruschGitClient: null,
+        hydraClient: dualHub.hydraClient,
+        hydraGraphClient: dualHub.hydraGraphClient
+    });
+    t.after(() => orch.close());
+
+    const hyd = await orch.hydrateWorkOrder({ workOrderId: 'WO-101', tokenBudget: 4000 });
+    assert.equal(hyd.ok, true);
+    assert.equal(hyd.data.hydraSync.queried, true);
+    assert.equal(hyd.data.hydraSync.requestId, 'req-query-verbatim-777');
+    assert.ok(hyd.data.hydraSync.contextSnippet.includes('zero-cent SOX-style batch reconciliation'));
+
+    const queryReq = capturedHydra.find((r) => r.pathname === '/query');
+    assert.ok(queryReq);
+    assert.equal(queryReq.headers['API-Version'], '2');
+    assert.equal(queryReq.jsonBody.database, 'default-tenant');
+    assert.equal(queryReq.jsonBody.collection, 'work_orders');
+    assert.equal(queryReq.jsonBody.type, 'all');
+    assert.equal(queryReq.jsonBody.query_by, 'hybrid');
+    assert.equal(queryReq.jsonBody.mode, 'thinking');
+
+    const fbEnv = await dualHub.submitHydraTaskFeedback({
+        requestId: hyd.data.hydraSync.requestId,
+        workOrderId: 'WO-101',
+        rating: 'positive'
+    });
+    assert.equal(fbEnv.ok, true);
+    assert.equal(fbEnv.data.submitted, true);
+    const fbReq = capturedHydra.find((r) => r.pathname === '/feedback');
+    assert.ok(fbReq);
+    assert.equal(fbReq.jsonBody.request_id, 'req-query-verbatim-777');
+    assert.equal(fbReq.jsonBody.source, 'agent');
+    assert.equal(fbReq.jsonBody.rating, 'positive');
+    assert.ok(Array.isArray(fbReq.jsonBody.ground_truth.source_ids));
 });

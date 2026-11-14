@@ -22,6 +22,7 @@
     "client:dev": "npm --prefix client run dev",
     "client:build": "npm --prefix client run build",
     "build": "npm --prefix client run build",
+    "seed:8090": "node scripts/seed-8090-project.js",
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {

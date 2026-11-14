@@ -61,7 +61,7 @@ export const config = Object.freeze({
     vercelAiGatewayApiKey: envOr('AI_GATEWAY_API_KEY', baseConfig.vercelAiGatewayApiKey, ''),
     hydradbApiKey: envOr('HYDRADB_API_KEY', baseConfig.hydradbApiKey, ''),
     hydradbBaseUrl: envOr('HYDRADB_BASE_URL', baseConfig.hydradbBaseUrl, 'https://api.hydradb.com'),
-    hydradbDatabase: envOr('HYDRADB_DATABASE', baseConfig.hydradbDatabase, 'deadbolt_factory'),
+    hydradbDatabase: envOr('HYDRADB_DATABASE', baseConfig.hydradbDatabase, 'default-tenant'),
     hydradbCollection: envOr('HYDRADB_COLLECTION', baseConfig.hydradbCollection, 'work_orders'),
     hydradbGraphUrl: envOr('HYDRADB_GRAPH_URL', baseConfig.hydradbGraphUrl, ''),
     hydradbGraphToken: envOr('HYDRADB_GRAPH_TOKEN', baseConfig.hydradbGraphToken, ''),

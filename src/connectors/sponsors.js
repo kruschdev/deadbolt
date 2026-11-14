@@ -167,6 +167,7 @@ export function createSponsorHub({
     function resolveSofaCredentials() {
         const rawPrimary = String(safeConfig.sofaApiKey || '').trim();
         const rawAdmin = String(safeConfig.sofaAdminApiKey || '').trim();
+        const rawReporting = String(safeConfig.sofaReportingApiKey || '').trim();
         const projectId = String(safeConfig.sofaProjectId || '').trim();
         const apiBaseUrl = String(safeConfig.sofaApiBaseUrl || DEFAULT_SOFA_API_BASE_URL)
             .trim()
@@ -176,23 +177,33 @@ export function createSponsorHub({
         const adminKey =
             rawAdmin || (rawPrimary.startsWith('sofa-admin-') ? rawPrimary : '');
         const externalKey = rawPrimary.startsWith('sofa-ext-') ? rawPrimary : '';
+        const reportingKey =
+            rawReporting || (rawPrimary.startsWith('sf-rpt-') ? rawPrimary : '');
         const mcpBearerKey =
-            rawPrimary && !rawPrimary.startsWith('sofa-admin-') && !rawPrimary.startsWith('sofa-ext-')
+            rawPrimary &&
+            !rawPrimary.startsWith('sofa-admin-') &&
+            !rawPrimary.startsWith('sofa-ext-') &&
+            !rawPrimary.startsWith('sf-rpt-')
                 ? rawPrimary
                 : '';
 
         const hasOrgAdmin = Boolean(adminKey);
         const hasExternalApi = Boolean(externalKey);
+        const hasReportingApi = Boolean(reportingKey);
         const hasMcp = Boolean(mcpBearerKey && projectId);
-        const liveConfigured = hasOrgAdmin || hasExternalApi || hasMcp;
+        const liveConfigured = hasOrgAdmin || hasExternalApi || hasReportingApi || hasMcp;
 
         let mode = 'sw_factory_manifest_local';
-        if (hasOrgAdmin && hasExternalApi) {
+        if (hasOrgAdmin && hasExternalApi && hasReportingApi) {
+            mode = 'sofa_tri_api_live';
+        } else if (hasOrgAdmin && hasExternalApi) {
             mode = 'sofa_dual_api_live';
         } else if (hasOrgAdmin) {
             mode = 'sofa_org_admin_live';
         } else if (hasExternalApi) {
             mode = 'sofa_external_api_live';
+        } else if (hasReportingApi) {
+            mode = 'sofa_reporting_api_live';
         } else if (hasMcp) {
             mode = 'sofa_mcp_live';
         }
@@ -200,12 +211,14 @@ export function createSponsorHub({
         return {
             adminKey,
             externalKey,
+            reportingKey,
             mcpBearerKey,
             projectId,
             apiBaseUrl,
             mcpUrl,
             hasOrgAdmin,
             hasExternalApi,
+            hasReportingApi,
             hasMcp,
             liveConfigured,
             mode
@@ -246,23 +259,26 @@ export function createSponsorHub({
         createHydraDbClient({
             apiKey: safeConfig.hydradbApiKey || '',
             baseUrl: safeConfig.hydradbBaseUrl || DEFAULT_HYDRADB_BASE_URL,
-            database: safeConfig.hydradbDatabase || 'deadbolt_factory',
+            database: safeConfig.hydradbDatabase || 'default-tenant',
             collection: safeConfig.hydradbCollection || 'work_orders',
-            timeoutMs: 6000,
-            maxRetries: 1
+            timeoutMs: 8000,
+            maxRetries: 1,
+            ...(typeof fetchImpl === 'function' ? { fetchImpl } : {})
         });
 
     const resolvedHydraGraph =
         hydraGraphClient ||
         createHydraGraphClient({
             baseUrl: safeConfig.hydradbGraphUrl || '',
-            token: safeConfig.hydradbGraphToken || safeConfig.hydradbApiKey || '',
+            token: safeConfig.hydradbGraphToken || '',
             graphId: safeConfig.hydradbGraphId || 'deadbolt-factory',
             cellId: safeConfig.hydradbCellId || 'cell-0',
             namespace: safeConfig.hydradbNamespace || 'default',
             allowPrivateLan: Boolean(safeConfig.hydradbAllowLan),
             allowTailscale: Boolean(safeConfig.hydradbAllowLan),
-            timeoutMs: 5000
+            timeoutMs: 5000,
+            ...(typeof fetchImpl === 'function' ? { fetchImpl } : {}),
+            ...(typeof lookupFn === 'function' ? { lookupFn } : {})
         });
 
     /**
@@ -318,14 +334,19 @@ export function createSponsorHub({
                 apiVersion: '2',
                 openCypherEngine: 'v0.4.0',
                 liveConfigured: hydraLive,
-                mode: hydraGraphLive
-                    ? 'hydradb_opencypher_live'
-                    : hydraV2Live
-                      ? 'hydradb_v2_live'
-                      : 'sqlite_lineage_fallback',
+                mode:
+                    hydraV2Live && hydraGraphLive
+                        ? 'hydradb_dual_v2_opencypher_live'
+                        : hydraV2Live
+                          ? 'hydradb_v2_live'
+                          : hydraGraphLive
+                            ? 'hydradb_opencypher_live'
+                            : 'sqlite_lineage_fallback',
                 status: 'healthy',
                 endpoint: sanitizeEndpointForDisplay(
-                    safeConfig.hydradbGraphUrl || safeConfig.hydradbBaseUrl || DEFAULT_HYDRADB_BASE_URL,
+                    hydraV2Live
+                        ? safeConfig.hydradbBaseUrl || DEFAULT_HYDRADB_BASE_URL
+                        : safeConfig.hydradbGraphUrl || safeConfig.hydradbBaseUrl || DEFAULT_HYDRADB_BASE_URL,
                     DEFAULT_HYDRADB_BASE_URL
                 )
             },
@@ -514,8 +535,9 @@ export function createSponsorHub({
 
             if (healthRes.ok && healthRes.data.status >= 200 && healthRes.data.status < 300) {
                 let workOrderTotal = null;
+                let matchedLiveWorkOrder = null;
                 const woListRes = await safeFetch(
-                    `${sofaCreds.apiBaseUrl}/v2/external-api/work_orders?page=1&page_size=5`,
+                    `${sofaCreds.apiBaseUrl}/v2/external-api/work_orders?page=1&page_size=20`,
                     { method: 'GET', headers: extHeaders },
                     {
                         allowedProtocols: ['https:'],
@@ -529,11 +551,22 @@ export function createSponsorHub({
                 if (woListRes.ok && woListRes.data.status >= 200 && woListRes.data.status < 300) {
                     try {
                         const woJson = await woListRes.data.response.json();
+                        const items = Array.isArray(woJson?.items) ? woJson.items : [];
                         workOrderTotal = Number.isFinite(Number(woJson?.total))
                             ? Number(woJson.total)
-                            : Array.isArray(woJson?.items)
-                              ? woJson.items.length
-                              : null;
+                            : items.length;
+                        const matched =
+                            items.find((item) => String(item?.title || '').startsWith(`[${rawId}]`)) ||
+                            items.find((item) => String(item?.title || '').includes(rawId)) ||
+                            null;
+                        if (matched) {
+                            matchedLiveWorkOrder = {
+                                workOrderNumber: matched.work_order_number ?? null,
+                                title: matched.title,
+                                status: matched.status ?? null,
+                                priority: matched.priority ?? null
+                            };
+                        }
                     } catch {
                         workOrderTotal = null;
                     }
@@ -541,10 +574,14 @@ export function createSponsorHub({
                 liveMcpSync.connected = true;
                 liveMcpSync.externalApiHealthy = true;
                 liveMcpSync.externalWorkOrderCount = workOrderTotal;
+                liveMcpSync.matchedLiveWorkOrder = matchedLiveWorkOrder;
+                liveMcpSync.reportingFeedbackConfigured = sofaCreds.hasReportingApi;
                 liveMcpSync.status = healthRes.data.status;
                 liveMcpSync.mode =
                     liveMcpSync.mode === 'sofa_org_admin_live'
-                        ? 'sofa_dual_api_live'
+                        ? sofaCreds.hasReportingApi
+                            ? 'sofa_tri_api_live'
+                            : 'sofa_dual_api_live'
                         : 'sofa_external_api_live';
             } else if (!liveMcpSync.connected) {
                 liveMcpSync.fallbackReason = healthRes.ok
@@ -627,6 +664,38 @@ export function createSponsorHub({
         );
     }
 
+    function buildDefaultHydraKnowledgeItems(workOrderId, hopFiles) {
+        const ordered =
+            Array.isArray(hopFiles) && hopFiles.length >= 2
+                ? hopFiles.map((f) => String(f || '').trim()).filter(Boolean)
+                : ['src/fee-engine.js', 'src/settlement-service.js', 'src/sox-reconciler.js'];
+        const slugFor = (filePath) =>
+            `deadbolt-file-${path.basename(filePath, path.extname(filePath)).replace(/[^a-z0-9_-]/gi, '-')}`;
+        return ordered.map((filePath, idx) => {
+            const nextId =
+                idx < ordered.length - 1 ? slugFor(ordered[idx + 1]) : 'deadbolt-inv-fin-03';
+            return {
+                id: slugFor(filePath),
+                title: filePath,
+                type: 'code_file',
+                text:
+                    idx === 0
+                        ? `Entry target for ${workOrderId}: ${filePath} allocates multi-line processor fees using integer basis-point floor division plus largest-remainder cent carry.`
+                        : filePath.endsWith('sox-reconciler.js')
+                          ? `Protected downstream verifier (INV-FIN-03): ${filePath} enforces zero-cent SOX-style batch reconciliation parity (deltaCents === 0).`
+                          : `Downstream caller hop ${idx} (${filePath}) forwarding settled line payouts toward INV-FIN-03 batch reconciliation.`,
+                additional_metadata: {
+                    work_order_id: workOrderId,
+                    hop_index: idx,
+                    protected_verifier: filePath.endsWith('sox-reconciler.js')
+                },
+                relations: {
+                    ids: [nextId]
+                }
+            };
+        });
+    }
+
     /**
      * Sync superseding memory lineage and 2-hop IMPORTS graph edges to HydraDB v2 when configured,
      * falling back cleanly to local SQLite lineage mode offline.
@@ -647,6 +716,7 @@ export function createSponsorHub({
                 {
                     mode: 'sqlite_lineage_fallback',
                     apiVersion: '2',
+                    v2Synced: false,
                     openCypherSynced: false,
                     liveSynced: false,
                     workOrderId
@@ -658,12 +728,22 @@ export function createSponsorHub({
             let memoryRes = null;
             let graphRes = null;
             let openCypherRes = null;
+            let v2Ok = false;
             if (v2Configured) {
-                if (Array.isArray(memories) && memories.length > 0) {
-                    memoryRes = await resolvedHydra.ingestMemories(memories);
-                }
-                if (Array.isArray(graphItems) && graphItems.length > 0) {
-                    graphRes = await resolvedHydra.ingestAppKnowledge(graphItems);
+                try {
+                    if (Array.isArray(memories) && memories.length > 0) {
+                        memoryRes = await resolvedHydra.ingestMemories(memories, { upsert: true });
+                    }
+                    const effectiveKnowledge =
+                        Array.isArray(graphItems) && graphItems.length > 0
+                            ? graphItems
+                            : buildDefaultHydraKnowledgeItems(workOrderId, hopFiles);
+                    graphRes = await resolvedHydra.ingestAppKnowledge(effectiveKnowledge, {
+                        upsert: true
+                    });
+                    v2Ok = true;
+                } catch {
+                    v2Ok = false;
                 }
             }
             if (openCypherConfigured) {
@@ -673,14 +753,23 @@ export function createSponsorHub({
                 });
             }
             const openCypherOk = Boolean(openCypherRes?.ok && openCypherRes?.data?.liveSynced);
+            const resolvedMode =
+                v2Ok && openCypherOk
+                    ? 'hydradb_dual_v2_opencypher_live'
+                    : v2Ok
+                      ? 'hydradb_v2_live'
+                      : openCypherOk
+                        ? 'hydradb_opencypher_live'
+                        : 'sqlite_lineage_fallback';
             return okEnvelope(
                 'deadbolt.sponsors.hydradb_sync',
-                `Synced ${workOrderId} lineage and 2-hop graph edges to HydraDB.`,
+                `Synced ${workOrderId} lineage and 2-hop graph edges to HydraDB (${resolvedMode}).`,
                 {
-                    mode: openCypherOk ? 'hydradb_opencypher_live' : 'hydradb_v2_live',
-                    apiVersion: '2',
+                    mode: resolvedMode,
+                    apiVersion: graphRes?._meta?.api_version || memoryRes?._meta?.api_version || '2',
+                    v2Synced: v2Ok,
                     openCypherSynced: openCypherOk,
-                    liveSynced: Boolean(v2Configured || openCypherOk),
+                    liveSynced: Boolean(v2Ok || openCypherOk),
                     workOrderId,
                     memoryRes,
                     graphRes,
@@ -694,6 +783,7 @@ export function createSponsorHub({
                 {
                     mode: 'sqlite_lineage_fallback',
                     apiVersion: '2',
+                    v2Synced: false,
                     openCypherSynced: false,
                     liveSynced: false,
                     workOrderId,
@@ -701,6 +791,57 @@ export function createSponsorHub({
                 }
             );
         }
+    }
+
+    /**
+     * Submit a non-throwing HydraDB v2 end-of-task quality & ground-truth report (`POST /feedback`)
+     * correlated verbatim to the `meta.request_id` returned by `POST /query`.
+     */
+    async function submitHydraTaskFeedback({
+        requestId,
+        workOrderId = 'WO-101',
+        rating = 'positive',
+        feedback = '',
+        groundTruth = undefined
+    } = {}) {
+        if (!Boolean(resolvedHydra?.isConfigured?.()) || !requestId) {
+            return okEnvelope(
+                'deadbolt.sponsors.hydradb_feedback',
+                `Skipped live HydraDB feedback for ${workOrderId} (no active v2 query request_id).`,
+                {
+                    submitted: false,
+                    workOrderId
+                }
+            );
+        }
+        const defaultProse =
+            `Task: DEADBOLT Stage 4 verified [${workOrderId}] zero-cent SOX-style batch settlement reconciliation. ` +
+            'Sources deadbolt-file-sox-reconciler and deadbolt-inv-fin-03 supplied the active zero-cent parity constraint; deadbolt-inv-fin-02 was discarded as superseded.';
+        const fbRes = await resolvedHydra.submitFeedback({
+            requestId: String(requestId),
+            rating,
+            source: 'agent',
+            feedback: String(feedback || defaultProse),
+            groundTruth:
+                groundTruth || {
+                    source_ids: [
+                        'deadbolt-inv-fin-03',
+                        'deadbolt-file-sox-reconciler',
+                        'deadbolt-file-fee-engine'
+                    ]
+                }
+        });
+        return okEnvelope(
+            'deadbolt.sponsors.hydradb_feedback',
+            fbRes.submitted
+                ? `Submitted HydraDB v2 end-of-task feedback for ${workOrderId}.`
+                : `Skipped HydraDB v2 feedback (${fbRes.error || 'unsubmitted'}).`,
+            {
+                submitted: Boolean(fbRes.submitted),
+                workOrderId,
+                requestId: String(requestId)
+            }
+        );
     }
 
     /**
@@ -1235,12 +1376,107 @@ export function createSponsorHub({
         );
     }
 
+    /**
+     * Report a Stage 4 Validator governance signal into the 8090 Software Factory Feedback Inbox
+     * (`POST /v2/reporting-api/feedback`, `X-API-Key: sf-rpt-*`) over DNS-pinned `safeFetch`.
+     */
+    async function reportValidatorFeedback({
+        workOrderId = 'WO-101',
+        endUserEmail = 'validator-gate@deadbolt.dev',
+        content = ''
+    } = {}) {
+        const sofaCreds = resolveSofaCredentials();
+        const safeWoId = SAFE_WORK_ORDER_ID_RE.test(String(workOrderId || '').trim())
+            ? String(workOrderId).trim()
+            : 'WO-101';
+        const markdownBody =
+            String(content || '').trim() ||
+            `DEADBOLT Stage 4 Validator signal on [${safeWoId}]: Policy Floor blocked unverified workaround and enforced INV-FIN-03 SOX-style batch reconciliation.`;
+
+        if (!sofaCreds.hasReportingApi) {
+            return okEnvelope(
+                'deadbolt.sponsors.sofa_feedback',
+                `Recorded local Stage 4 Validator feedback receipt for ${safeWoId} (offline mode).`,
+                {
+                    mode: 'local_feedback_receipt',
+                    workOrderId: safeWoId,
+                    liveReported: false
+                }
+            );
+        }
+
+        let sofaApiHost = 'api.factory.8090.dev';
+        try {
+            sofaApiHost = new URL(sofaCreds.apiBaseUrl).hostname;
+        } catch {
+            sofaApiHost = 'api.factory.8090.dev';
+        }
+
+        const fbRes = await safeFetch(
+            `${sofaCreds.apiBaseUrl}/v2/reporting-api/feedback`,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json',
+                    'X-API-Key': sofaCreds.reportingKey
+                },
+                body: JSON.stringify({
+                    end_user_email: String(endUserEmail || 'validator-gate@deadbolt.dev').trim(),
+                    content: markdownBody
+                })
+            },
+            {
+                allowedProtocols: ['https:'],
+                allowedHosts: [sofaApiHost],
+                allowPrivateLan: false,
+                allowTailscale: false,
+                maxRedirects: 0,
+                timeoutMs: 5000,
+                tool: 'deadbolt.sponsors.sofa_feedback',
+                ...extraSafeFetchOpts
+            }
+        );
+
+        if (fbRes.ok && fbRes.data.status >= 200 && fbRes.data.status < 300) {
+            let fbJson = null;
+            try {
+                fbJson = await fbRes.data.response.json();
+            } catch {
+                fbJson = null;
+            }
+            return okEnvelope(
+                'deadbolt.sponsors.sofa_feedback',
+                `Reported Stage 4 Validator signal for ${safeWoId} to 8090 Feedback Inbox.`,
+                {
+                    mode: 'sofa_reporting_api_live',
+                    workOrderId: safeWoId,
+                    liveReported: true,
+                    feedbackNumber: fbJson?.feedback_number ?? null
+                }
+            );
+        }
+
+        return okEnvelope(
+            'deadbolt.sponsors.sofa_feedback',
+            `Preserved Stage 4 Validator signal for ${safeWoId} in local fallback.`,
+            {
+                mode: 'local_feedback_receipt',
+                workOrderId: safeWoId,
+                liveReported: false,
+                fallbackReason: fbRes.ok ? `HTTP_${fbRes.data.status}` : fbRes.error?.code || 'SOFA_FEEDBACK_UNREACHABLE'
+            }
+        );
+    }
+
     return Object.freeze({
         hydraClient: resolvedHydra,
         hydraGraphClient: resolvedHydraGraph,
         getConnectorStatuses,
         syncSoftwareFactoryWorkOrder,
+        reportValidatorFeedback,
         syncHydraLineage,
+        submitHydraTaskFeedback,
         dispatchVerifiedPullRequest,
         runConfusedDeputyDrill,
         synthesizeForemanAlert

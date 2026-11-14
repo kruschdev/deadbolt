@@ -101,8 +101,24 @@ function waitAbortable(delayMs, signal = null) {
  * @param {object|null} [options.kruschGitClient=null] - Optional injected remote KruschGit client
  */
 export async function createDeadboltOrchestrator(options = {}) {
+    const ephemeralOfflineDefaults =
+        options.ephemeral === true && !options.config
+            ? {
+                  sofaApiKey: '',
+                  sofaAdminApiKey: '',
+                  sofaReportingApiKey: '',
+                  hydradbApiKey: '',
+                  hydradbGraphUrl: '',
+                  hydradbGraphToken: '',
+                  composioApiKey: '',
+                  elevenlabsApiKey: '',
+                  enableLiveReviewers: false
+              }
+            : {};
+
     const activeConfig = {
         ...defaultConfig,
+        ...ephemeralOfflineDefaults,
         ...(options.config && typeof options.config === 'object' ? options.config : {})
     };
 
@@ -142,9 +158,9 @@ export async function createDeadboltOrchestrator(options = {}) {
         createHydraDbClient({
             apiKey: activeConfig.hydradbApiKey || '',
             baseUrl: activeConfig.hydradbBaseUrl || 'https://api.hydradb.com',
-            database: activeConfig.hydradbDatabase || 'deadbolt_factory',
+            database: activeConfig.hydradbDatabase || 'default-tenant',
             collection: activeConfig.hydradbCollection || 'work_orders',
-            timeoutMs: 5000,
+            timeoutMs: 8000,
             maxRetries: 1
         });
 
@@ -152,7 +168,7 @@ export async function createDeadboltOrchestrator(options = {}) {
         options.hydraGraphClient ||
         createHydraGraphClient({
             baseUrl: activeConfig.hydradbGraphUrl || '',
-            token: activeConfig.hydradbGraphToken || activeConfig.hydradbApiKey || '',
+            token: activeConfig.hydradbGraphToken || '',
             graphId: activeConfig.hydradbGraphId || 'deadbolt-factory',
             cellId: activeConfig.hydradbCellId || 'cell-0',
             namespace: activeConfig.hydradbNamespace || 'default',
@@ -675,10 +691,16 @@ export async function createDeadboltOrchestrator(options = {}) {
             );
             await emitBeat('pr.dispatched', prBeat);
 
+            const isVerified = attempt3Env.data?.verdict === 'VERIFIED';
+            const hydraFeedbackEnv = await sponsors.submitHydraTaskFeedback({
+                requestId: refineryEnv.data?.hydraSync?.requestId || '',
+                workOrderId: targetWo.id,
+                rating: isVerified ? 'positive' : 'neutral'
+            });
+
             const totalElapsedMs = Number(
                 (Number(process.hrtime.bigint() - startedNs) / 1e6).toFixed(2)
             );
-            const isVerified = attempt3Env.data?.verdict === 'VERIFIED';
             const measuredReviewerCost =
                 (attempt1Env.data?.telemetry?.totalCostUsd || 0) +
                 (attempt2Env.data?.telemetry?.totalCostUsd || 0) +
@@ -714,6 +736,7 @@ export async function createDeadboltOrchestrator(options = {}) {
                     appliedStage,
                     sofaSync: sofaEnv.data,
                     hydraSync: hydraSyncEnv.data,
+                    hydraFeedback: hydraFeedbackEnv.data,
                     prReceipt: prEnv.ok ? prEnv.data : null,
                     audit: auditEnv.ok ? auditEnv.data : null,
                     telemetry
