@@ -15,6 +15,55 @@ const SAFE_GRAPH_ID_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 const SAFE_NAMESPACE_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const SAFE_CELL_ID_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 
+const TAILSCALE_CGNAT_IPV4_RE =
+    /\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b/g;
+const RFC1918_10_IPV4_RE = /\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g;
+const RFC1918_192_IPV4_RE = /\b192\.168\.\d{1,3}\.\d{1,3}\b/g;
+const RFC1918_172_IPV4_RE = /\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/g;
+const TAILSCALE_IPV6_RE = /\bfd7a:115c:a1e0:(?:[0-9a-fA-F:]*[0-9a-fA-F]\b|:*)/gi;
+const REDACTED_PRIVATE_HOST = '[redacted-private-host]';
+const MAX_SCRUB_DEPTH = 5;
+
+function scrubPrivateNetworkRecursive(value, depth) {
+    if (typeof value === 'string') {
+        return value
+            .replace(TAILSCALE_CGNAT_IPV4_RE, REDACTED_PRIVATE_HOST)
+            .replace(RFC1918_10_IPV4_RE, REDACTED_PRIVATE_HOST)
+            .replace(RFC1918_192_IPV4_RE, REDACTED_PRIVATE_HOST)
+            .replace(RFC1918_172_IPV4_RE, REDACTED_PRIVATE_HOST)
+            .replace(TAILSCALE_IPV6_RE, REDACTED_PRIVATE_HOST);
+    }
+    if (value === null || value === undefined || typeof value !== 'object') {
+        return value;
+    }
+    if (depth >= MAX_SCRUB_DEPTH) {
+        return Array.isArray(value) ? [] : {};
+    }
+    if (Array.isArray(value)) {
+        return value.map((item) => scrubPrivateNetworkRecursive(item, depth + 1));
+    }
+    const proto = Object.getPrototypeOf(value);
+    if (proto === null || proto === Object.prototype) {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            out[k] = scrubPrivateNetworkRecursive(v, depth + 1);
+        }
+        return out;
+    }
+    return value;
+}
+
+/**
+ * Recursively redact Tailscale/CGNAT IPv4, RFC1918 IPv4, and Tailscale ULA IPv6 literals
+ * across strings, arrays, and plain objects (max depth 5) per INV-DB-08.
+ *
+ * @param {unknown} input
+ * @returns {unknown}
+ */
+export function scrubPrivateNetworkStrings(input) {
+    return scrubPrivateNetworkRecursive(input, 0);
+}
+
 /**
  * Decode a single HydraDB v0.4.0 OpenCypher result cell.
  * Handles typed wrappers ({"type":"vertex_id","value":1001}) and null cells that omit `value`.
@@ -134,7 +183,7 @@ function resolveCodeFileVertexId(filePath, index = 0) {
  * @param {string} [options.namespace='default'] - X-Graph-Namespace header value
  * @param {boolean} [options.allowPrivateLan=false] - Allow RFC1918 LAN endpoints when explicitly opted in
  * @param {boolean} [options.allowTailscale=false] - Allow Tailscale endpoints when explicitly opted in
- * @param {number} [options.timeoutMs=5000] - Per-request timeout in milliseconds
+ * @param {number} [options.timeoutMs=2000] - Per-request timeout in milliseconds
  * @param {Function|null} [options.lookupFn=null] - Optional DNS lookup override for testing
  * @param {typeof fetch} [options.fetchImpl] - Optional fetch implementation override for testing
  */
@@ -153,7 +202,7 @@ export function createHydraGraphClient(options = {}) {
     const timeoutMs =
         Number.isFinite(Number(opts.timeoutMs)) && Number(opts.timeoutMs) > 0
             ? Math.trunc(Number(opts.timeoutMs))
-            : 5000;
+            : 2000;
     const lookupFn = typeof opts.lookupFn === 'function' ? opts.lookupFn : null;
     const fetchImpl = typeof opts.fetchImpl === 'function' ? opts.fetchImpl : undefined;
 
@@ -225,8 +274,13 @@ export function createHydraGraphClient(options = {}) {
         if (!res.ok) {
             return errorEnvelope(
                 res.error?.code || 'HYDRADB_HEALTHZ_FAILED',
-                res.error?.message || 'HydraDB /healthz request failed.',
-                res.error?.details ?? null,
+                scrubPrivateNetworkStrings(
+                    res.error?.message || 'HydraDB /healthz request failed.'
+                ),
+                {
+                    graphId: cleanGraphId,
+                    reasonCode: res.error?.code || 'HYDRADB_UNREACHABLE'
+                },
                 'deadbolt.hydradb.healthz'
             );
         }
@@ -242,8 +296,13 @@ export function createHydraGraphClient(options = {}) {
         if (!statusOk) {
             return errorEnvelope(
                 'HYDRADB_UNHEALTHY',
-                `HydraDB /healthz returned HTTP ${res.data.status}.`,
-                { status: res.data.status, body: parsed },
+                scrubPrivateNetworkStrings(`HydraDB /healthz returned HTTP ${res.data.status}.`),
+                {
+                    graphId: cleanGraphId,
+                    reasonCode: 'HYDRADB_UNHEALTHY',
+                    status: res.data.status,
+                    body: scrubPrivateNetworkStrings(parsed)
+                },
                 'deadbolt.hydradb.healthz'
             );
         }
@@ -310,8 +369,13 @@ export function createHydraGraphClient(options = {}) {
         if (!res.ok) {
             return errorEnvelope(
                 res.error?.code || 'HYDRADB_QUERY_FAILED',
-                res.error?.message || 'HydraDB OpenCypher query request failed.',
-                res.error?.details ?? null,
+                scrubPrivateNetworkStrings(
+                    res.error?.message || 'HydraDB OpenCypher query request failed.'
+                ),
+                {
+                    graphId: cleanGraphId,
+                    reasonCode: res.error?.code || 'HYDRADB_UNREACHABLE'
+                },
                 'deadbolt.hydradb.query'
             );
         }
@@ -332,10 +396,12 @@ export function createHydraGraphClient(options = {}) {
                       `HydraDB query returned HTTP ${res.data.status}.`;
             return errorEnvelope(
                 'HYDRADB_QUERY_HTTP_ERROR',
-                errMsg,
+                scrubPrivateNetworkStrings(String(errMsg)),
                 {
+                    graphId: cleanGraphId,
+                    reasonCode: rawJson?.error?.code || 'HYDRADB_QUERY_HTTP_ERROR',
                     status: res.data.status,
-                    hydraCode: rawJson?.error?.code || null
+                    hydraCode: scrubPrivateNetworkStrings(rawJson?.error?.code || null)
                 },
                 'deadbolt.hydradb.query'
             );
@@ -393,9 +459,27 @@ export function createHydraGraphClient(options = {}) {
             );
         }
 
+        const toDegradedLineageFallback = (failedRes) =>
+            okEnvelope(
+                'deadbolt.hydradb.seed_graph',
+                `HydraDB OpenCypher unreachable; degraded cleanly to local lineage fallback for ${cleanWoId}.`,
+                {
+                    mode: 'sqlite_lineage_fallback',
+                    liveSynced: false,
+                    fallbackReason: scrubPrivateNetworkStrings(
+                        String(failedRes?.error?.code || 'HYDRADB_UNREACHABLE')
+                    ),
+                    graphId: cleanGraphId,
+                    cellId: cleanCellId,
+                    workOrderId: cleanWoId,
+                    verticesPrepared: fileVertices.length + 3
+                }
+            );
+
         // HydraDB v0.4.0 OpenCypher dialect rules (verified live against ghcr.io/hydra-db/hydradb:0.4.0):
         // 1. Single-statement MERGE accepts one-hop directed edge patterns without trailing SET/RETURN clauses.
         // 2. Mutations return { columns: [], rows: [], read_epoch: null }; follow up with MATCH ... RETURN.
+        // 3. Trip on the first failed OpenCypher probe so venue Wi-Fi stalls degrade in <= 2s rather than 6x timeouts.
         const supersedesRes = await queryOpenCypher(
             'MERGE (curr:Invariant {id: $currInvId, code: $currCode, status: $currStatus})-[:SUPERSEDES]->(prev:Invariant {id: $prevInvId, code: $prevCode, status: $prevStatus})',
             {
@@ -408,7 +492,7 @@ export function createHydraGraphClient(options = {}) {
             }
         );
         if (!supersedesRes.ok) {
-            return supersedesRes;
+            return toDegradedLineageFallback(supersedesRes);
         }
 
         const governedRes = await queryOpenCypher(
@@ -420,7 +504,7 @@ export function createHydraGraphClient(options = {}) {
             }
         );
         if (!governedRes.ok) {
-            return governedRes;
+            return toDegradedLineageFallback(governedRes);
         }
 
         for (let i = 0; i < fileVertices.length - 1; i += 1) {
@@ -438,7 +522,7 @@ export function createHydraGraphClient(options = {}) {
                 }
             );
             if (!edgeRes.ok) {
-                return edgeRes;
+                return toDegradedLineageFallback(edgeRes);
             }
         }
 
@@ -450,7 +534,7 @@ export function createHydraGraphClient(options = {}) {
             }
         );
         if (!targetEdgeRes.ok) {
-            return targetEdgeRes;
+            return toDegradedLineageFallback(targetEdgeRes);
         }
 
         const lineageRes = await queryOpenCypher(
@@ -461,7 +545,7 @@ export function createHydraGraphClient(options = {}) {
             { woId: 9001 }
         );
         if (!lineageRes.ok) {
-            return lineageRes;
+            return toDegradedLineageFallback(lineageRes);
         }
 
         return okEnvelope(

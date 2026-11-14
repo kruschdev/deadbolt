@@ -15,7 +15,7 @@ import {
     errorEnvelope
 } from '@krusch/toolkit/http';
 import { sseResponse } from '@krusch/toolkit/streaming';
-import { initDb, exec, query, run, closeDb } from '@krusch/toolkit/db';
+import { openSqliteDb } from '@krusch/toolkit/sqlite';
 import { setupLogging } from '@krusch/toolkit/log';
 import { config } from './config.js';
 import { createDeadboltOrchestrator } from './orchestrator.js';
@@ -90,6 +90,24 @@ function serveDistFileOrFallback(res, relPath, contentType, fallbackContent = nu
     res.end(notFound);
 }
 
+function resolveErrorHttpStatus(envelope) {
+    const code = String(envelope?.error?.code || '');
+    if (
+        code === 'PATH_BLOCKED' ||
+        code === 'SSRF_BLOCKED' ||
+        code.startsWith('COMPOSIO_BLOCKED')
+    ) {
+        return 403;
+    }
+    if (code === 'AUDIT_TAMPERED' || code === 'UNVERIFIED_STAGE_BLOCKED') {
+        return 409;
+    }
+    if (code === 'GIT_CLONE_FAILED') {
+        return 502;
+    }
+    return 400;
+}
+
 /**
  * Build the DEADBOLT HTTP + SSE + Static UI server.
  * Supports lazy or pre-injected `orchestrator` plus `:memory:` smoke tests.
@@ -110,8 +128,8 @@ export function buildServer({
     if (dbPath !== ':memory:') {
         fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
     }
-    initDb(dbPath);
-    exec(`
+    const telemetryDb = openSqliteDb(dbPath);
+    telemetryDb.exec(`
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             label TEXT NOT NULL,
@@ -132,10 +150,15 @@ export function buildServer({
                 ...(isEphemeral
                     ? { stackDbPath: ':memory:', auditDbPath: ':memory:' }
                     : {})
-            }).then((instance) => {
-                resolvedOrchestrator = instance;
-                return instance;
-            });
+            })
+                .then((instance) => {
+                    resolvedOrchestrator = instance;
+                    return instance;
+                })
+                .catch((err) => {
+                    orchestratorPromise = null;
+                    throw err;
+                });
         }
         return orchestratorPromise;
     }
@@ -203,11 +226,18 @@ export function buildServer({
             'POST /api/run': async (ctx) => {
                 const orch = await getOrchestrator();
                 const workOrderId = String(ctx.body?.workOrderId || 'WO-101').trim();
-                run('INSERT INTO events (label) VALUES (?)', [`run:${workOrderId}`]);
-                return orch.runHeadToHead({
+                telemetryDb.run('INSERT INTO events (label) VALUES (?)', [
+                    `run:${workOrderId.slice(0, 64)}`
+                ]);
+                const result = await orch.runHeadToHead({
                     workOrderId,
                     beatDelayMs: 0
                 });
+                if (!result.ok) {
+                    ctx.sendJson(resolveErrorHttpStatus(result), result);
+                    return;
+                }
+                return result;
             },
 
             'POST /api/run/stream': async (ctx) => {
@@ -216,7 +246,9 @@ export function buildServer({
                 const beatDelayMs = Number.isFinite(Number(ctx.body?.beatDelayMs))
                     ? Math.max(0, Math.min(500, Number(ctx.body.beatDelayMs)))
                     : 85;
-                run('INSERT INTO events (label) VALUES (?)', [`stream:${workOrderId}`]);
+                telemetryDb.run('INSERT INTO events (label) VALUES (?)', [
+                    `stream:${workOrderId.slice(0, 64)}`
+                ]);
 
                 const sse = sseResponse(ctx.res, ctx.req, {
                     tool: 'deadbolt.orchestrator.run_stream',
@@ -239,7 +271,7 @@ export function buildServer({
                         sse.done(finalEnvelope);
                     }
                 } catch (err) {
-                    if (!sse.isClosed()) {
+                    if (!sse.isClosed() && !sse.signal.aborted) {
                         sse.error(err);
                     }
                 }
@@ -255,7 +287,7 @@ export function buildServer({
                     : 60;
                 const result = await orch.scanRepository({ repoUrlOrPath, maxFiles });
                 if (!result.ok) {
-                    ctx.sendJson(400, result);
+                    ctx.sendJson(resolveErrorHttpStatus(result), result);
                     return;
                 }
                 return result;
@@ -272,7 +304,7 @@ export function buildServer({
                 const maxFiles = Number.isFinite(Number(ctx.body?.maxFiles))
                     ? Number(ctx.body.maxFiles)
                     : 60;
-                run('INSERT INTO events (label) VALUES (?)', [
+                telemetryDb.run('INSERT INTO events (label) VALUES (?)', [
                     `modernize:${repoUrlOrPath.slice(0, 64)}`
                 ]);
                 const result = await orch.modernizeRepository({
@@ -281,27 +313,42 @@ export function buildServer({
                     maxFiles
                 });
                 if (!result.ok) {
-                    ctx.sendJson(400, result);
+                    ctx.sendJson(resolveErrorHttpStatus(result), result);
                     return;
                 }
                 return result;
             },
 
-            'POST /api/drills/crash-recovery': async () => {
+            'POST /api/drills/crash-recovery': async (ctx) => {
                 const orch = await getOrchestrator();
-                run('INSERT INTO events (label) VALUES (?)', ['drill:crash-recovery']);
-                return orch.runCrashDrill();
+                telemetryDb.run('INSERT INTO events (label) VALUES (?)', ['drill:crash-recovery']);
+                const result = await orch.runCrashDrill();
+                if (!result.ok) {
+                    ctx.sendJson(resolveErrorHttpStatus(result), result);
+                    return;
+                }
+                return result;
             },
 
-            'POST /api/drills/confused-deputy': async () => {
+            'POST /api/drills/confused-deputy': async (ctx) => {
                 const orch = await getOrchestrator();
-                run('INSERT INTO events (label) VALUES (?)', ['drill:confused-deputy']);
-                return orch.runDeputyDrill();
+                telemetryDb.run('INSERT INTO events (label) VALUES (?)', ['drill:confused-deputy']);
+                const result = await orch.runDeputyDrill();
+                if (!result.ok) {
+                    ctx.sendJson(resolveErrorHttpStatus(result), result);
+                    return;
+                }
+                return result;
             },
 
             'POST /api/foreman/speak': async (ctx) => {
                 const orch = await getOrchestrator();
-                return orch.speakForeman(ctx.body || {});
+                const result = await orch.speakForeman(ctx.body || {});
+                if (!result.ok) {
+                    ctx.sendJson(resolveErrorHttpStatus(result), result);
+                    return;
+                }
+                return result;
             },
 
             'GET /api/audit': async (ctx) => {
@@ -309,12 +356,17 @@ export function buildServer({
                 const limit = Number.isFinite(Number(ctx.query?.limit))
                     ? Number(ctx.query.limit)
                     : 50;
-                return orch.getAuditStatus({ limit });
+                const result = await orch.getAuditStatus({ limit });
+                if (!result.ok) {
+                    ctx.sendJson(resolveErrorHttpStatus(result), result);
+                    return;
+                }
+                return result;
             },
 
             // Baseline metrics + SSE smoke endpoints
             'GET /api/metrics': () => {
-                const row = query('SELECT COUNT(*) AS count FROM events')[0];
+                const row = telemetryDb.query('SELECT COUNT(*) AS count FROM events')[0];
                 return okEnvelope('metrics.read', 'Loaded dashboard metrics', {
                     service: config.serviceName,
                     eventCount: row?.count ?? 0
@@ -322,8 +374,8 @@ export function buildServer({
             },
 
             'POST /api/stream': (ctx) => {
-                const prompt = String(ctx.body?.prompt || 'ping').trim();
-                run('INSERT INTO events (label) VALUES (?)', [prompt]);
+                const prompt = String(ctx.body?.prompt || 'ping').trim().slice(0, 256);
+                telemetryDb.run('INSERT INTO events (label) VALUES (?)', [prompt]);
                 const sse = sseResponse(ctx.res, ctx.req, { tool: 'stream.complete' });
                 if (!sse.signal.aborted) {
                     sse.sendToken(`Processed: ${prompt}`);
@@ -341,7 +393,11 @@ export function buildServer({
                 /* ignore orchestrator close error */
             }
         }
-        closeDb();
+        try {
+            telemetryDb.close();
+        } catch {
+            /* ignore telemetry db close error */
+        }
     };
 
     return { server, close, getOrchestrator };
@@ -352,8 +408,9 @@ if (isMain) {
     const logger = setupLogging(config.serviceName, { logDir: config.logDir });
     const orchestrator = await createDeadboltOrchestrator();
     const { server, close } = buildServer({ orchestrator, logger });
-    server.listen(config.port, () => {
-        logger.info(`${config.serviceName} listening on http://127.0.0.1:${config.port}`);
+    const bindHost = config.host || '127.0.0.1';
+    server.listen(config.port, bindHost, () => {
+        logger.info(`${config.serviceName} listening on http://${bindHost}:${config.port}`);
     });
     attachGracefulShutdown(server, [close, () => orchestrator.close()], { logger });
 }

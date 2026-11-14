@@ -567,19 +567,22 @@ code {
   white-space: nowrap;
 }
 
-.db-badge-emerald {
+.db-badge-emerald,
+.db-badge-ok {
   border-color: rgba(16, 185, 129, 0.4);
   background: var(--db-emerald-dim);
   color: #6ee7b7;
 }
 
-.db-badge-crimson {
+.db-badge-crimson,
+.db-badge-danger {
   border-color: rgba(239, 68, 68, 0.45);
   background: var(--db-crimson-dim);
   color: #fca5a5;
 }
 
-.db-badge-amber {
+.db-badge-amber,
+.db-badge-warn {
   border-color: rgba(245, 158, 11, 0.45);
   background: var(--db-amber-dim);
   color: #fcd34d;
@@ -689,7 +692,8 @@ code {
 }
 
 /* @krusch/toolkit/react StatusPill Compatibility */
-[role='status'] {
+span[role='status'],
+[role='status']:not(.db-alert-bar) {
   display: inline-flex;
   align-items: center;
   gap: 0.38rem;
@@ -702,7 +706,8 @@ code {
   white-space: nowrap;
 }
 
-[role='status'] > span[aria-hidden='true'] {
+span[role='status'] > span[aria-hidden='true'],
+[role='status']:not(.db-alert-bar) > span[aria-hidden='true'] {
   display: inline-block;
   width: 0.45rem;
   height: 0.45rem;

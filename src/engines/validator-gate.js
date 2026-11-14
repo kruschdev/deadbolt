@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
-import { createAuditLog, verifyAuditChain } from '@krusch/toolkit/audit-log';
+import { createAuditLog } from '@krusch/toolkit/audit-log';
 import { scoreLegoBrickCoverage } from '@krusch/toolkit/catalog';
 import { createFrozenPolicyFloor } from '@krusch/toolkit/harness-engineering';
 import { chat } from '@krusch/toolkit/llm';
@@ -255,6 +255,7 @@ function extractBreakdownFromResult(rawResult, lineAmountsCents, grossCents) {
         const candidateArrays = [
             payload.lineBreakdown,
             payload.settledLines,
+            payload.breakdown,
             payload.lineAllocations,
             payload.allocations,
             payload.lines,
@@ -266,6 +267,7 @@ function extractBreakdownFromResult(rawResult, lineAmountsCents, grossCents) {
             payload.feesCents,
             payload.fees,
             payload.settlement?.settledLines,
+            payload.settlement?.breakdown,
             payload.settlement?.lines,
             payload.settlement?.lineItems,
             payload.settlement?.lineBreakdown
@@ -280,6 +282,10 @@ function extractBreakdownFromResult(rawResult, lineAmountsCents, grossCents) {
                     actualNetCents: fromArray.reduce((acc, row) => acc + row.netCents, 0)
                 };
             }
+        }
+
+        if (lineAmountsCents.length > 1) {
+            return null;
         }
 
         const scalarFee =
@@ -594,7 +600,23 @@ async function evaluateInvoiceInSandbox({
     const { lineBreakdown, actualFeeCents, actualNetCents } = extracted;
     const deltaCents = actualNetCents - expectedNetCents;
     const feeDeltaCents = actualFeeCents - expectedFeeCents;
-    const conservationHolds = actualFeeCents + actualNetCents === grossCents;
+    const perLineConservationHolds =
+        Array.isArray(lineBreakdown) &&
+        lineBreakdown.length === lineAmountsCents.length &&
+        lineBreakdown.every((row, idx) => {
+            const expectedLineGross = lineAmountsCents[idx];
+            const floorLineFee = Math.floor((expectedLineGross * feeBps) / 10000);
+            return (
+                Boolean(row) &&
+                Number.isInteger(row.feeCents) &&
+                Number.isInteger(row.netCents) &&
+                row.grossCents === expectedLineGross &&
+                row.feeCents + row.netCents === expectedLineGross &&
+                Math.abs(row.feeCents - floorLineFee) <= 1
+            );
+        });
+    const conservationHolds =
+        actualFeeCents + actualNetCents === grossCents && perLineConservationHolds;
     const passed = deltaCents === 0 && feeDeltaCents === 0 && conservationHolds;
 
     return {
@@ -699,36 +721,128 @@ function runDeterministicStructuralReviewers({ normalizedEdits, reconciliationDa
     };
 }
 
+function extractBalancedJsonObjects(text = '') {
+    const blocks = [];
+    let depth = 0;
+    let startIdx = -1;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = 0; i < text.length; i += 1) {
+        const ch = text[i];
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch === '\\') {
+                escaped = true;
+            } else if (ch === '"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+        } else if (ch === '{') {
+            if (depth === 0) {
+                startIdx = i;
+            }
+            depth += 1;
+        } else if (ch === '}' && depth > 0) {
+            depth -= 1;
+            if (depth === 0 && startIdx >= 0) {
+                blocks.push(text.slice(startIdx, i + 1));
+                startIdx = -1;
+            }
+        }
+    }
+    return blocks;
+}
+
 export function parseReviewerVerdictPayload(rawText = '') {
-    const raw = String(rawText || '').trim();
-    const unfenced = raw
+    const raw = String(rawText ?? '').trim();
+    if (!raw) {
+        return {
+            verdict: 'REJECT',
+            rationale: 'Empty or missing reviewer verdict; failing closed.',
+            ambiguous: true
+        };
+    }
+
+    const cleaned = raw
         .replace(/^```(?:json)?\s*/i, '')
         .replace(/\s*```$/i, '')
         .trim();
 
-    const jsonBraceMatch = /\{[\s\S]*\}/.exec(unfenced);
-    if (jsonBraceMatch) {
+    const jsonCandidates = [];
+    const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+    const fencedBlocks = [];
+    let fenceMatch = fenceRe.exec(raw);
+    while (fenceMatch !== null) {
+        const block = fenceMatch[1].trim();
+        if (block) {
+            fencedBlocks.push(block);
+        }
+        fenceMatch = fenceRe.exec(raw);
+    }
+
+    const fencedWithVerdict = fencedBlocks.filter((b) => /["']?verdict["']?\s*:/i.test(b)).reverse();
+    const fencedOther = fencedBlocks.filter((b) => !/["']?verdict["']?\s*:/i.test(b)).reverse();
+    for (const block of [...fencedWithVerdict, ...fencedOther]) {
+        const innerObjects = extractBalancedJsonObjects(block);
+        const innerVerdict = innerObjects.filter((b) => /["']?verdict["']?\s*:/i.test(b)).reverse();
+        jsonCandidates.push(...innerVerdict, block);
+    }
+
+    const balancedBlocks = extractBalancedJsonObjects(cleaned);
+    const balancedWithVerdict = balancedBlocks
+        .filter((b) => /["']?verdict["']?\s*:/i.test(b))
+        .reverse();
+    jsonCandidates.push(...balancedWithVerdict);
+
+    if (cleaned.startsWith('{') && cleaned.endsWith('}')) {
+        jsonCandidates.push(cleaned);
+    }
+
+    for (const candidate of jsonCandidates) {
         try {
-            const parsed = JSON.parse(jsonBraceMatch[0]);
-            const rawVerdict = String(parsed?.verdict || '').trim().toUpperCase();
-            const verdict = rawVerdict === 'REJECT' ? 'REJECT' : 'APPROVE';
-            const rationale = String(parsed?.rationale || parsed?.reason || unfenced)
-                .trim()
-                .slice(0, 280);
-            return { verdict, rationale };
+            const parsed = JSON.parse(candidate);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                continue;
+            }
+            const rawUpper = String(parsed.verdict || '').trim().toUpperCase();
+            const verdict = rawUpper === 'APPROVE' ? 'APPROVE' : 'REJECT';
+            const ambiguous = verdict === 'APPROVE' ? false : rawUpper !== 'REJECT';
+            const rationale =
+                String(
+                    parsed.rationale ??
+                        parsed.reason ??
+                        (cleaned || 'Fail-closed on ambiguous or missing JSON verdict.')
+                )
+                    .trim()
+                    .slice(0, 280) || 'Fail-closed on ambiguous or missing JSON verdict.';
+            return { verdict, rationale, ambiguous };
         } catch {
-            /* fall back to regex inspection */
+            /* try next candidate */
         }
     }
 
-    if (/"verdict"\s*:\s*"APPROVE"/i.test(unfenced)) {
-        return { verdict: 'APPROVE', rationale: unfenced.slice(0, 280) };
+    const hasApproveToken = /\bAPPROVE\b/i.test(cleaned);
+    const hasNegativeToken = /\b(?:REJECT|FAIL|UNSAFE|ESCALATE)\b/i.test(cleaned);
+
+    if (hasApproveToken && !hasNegativeToken) {
+        return {
+            verdict: 'APPROVE',
+            rationale: cleaned.slice(0, 280),
+            ambiguous: false
+        };
     }
-    if (/"verdict"\s*:\s*"REJECT"/i.test(unfenced)) {
-        return { verdict: 'REJECT', rationale: unfenced.slice(0, 280) };
-    }
-    const verdict = /\bREJECT\b/i.test(unfenced) ? 'REJECT' : 'APPROVE';
-    return { verdict, rationale: unfenced.slice(0, 280) };
+
+    const explicitRejectOnly = /\bREJECT\b/i.test(cleaned) && !hasApproveToken;
+    return {
+        verdict: 'REJECT',
+        rationale: cleaned.slice(0, 280) || 'Unrecognized reviewer output; failing closed.',
+        ambiguous: !explicitRejectOnly
+    };
 }
 
 export function estimateReviewerUsageCostUsd(modelName = '', usage = {}) {
@@ -790,8 +904,15 @@ async function runCrossFamilyReview({
     reconciliationData,
     slopData,
     llmConfig = {},
-    simulateReviewerDisagreement = false
+    simulateReviewerDisagreement = false,
+    signal = null
 }) {
+    if (signal?.aborted) {
+        throw signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException('Cross-family review aborted by caller signal.', 'AbortError');
+    }
+
     if (simulateReviewerDisagreement || llmConfig.enableLiveReviewers !== true) {
         return runDeterministicStructuralReviewers({
             normalizedEdits,
@@ -813,9 +934,9 @@ async function runCrossFamilyReview({
         });
     }
 
-    const timeoutMs = Number.isFinite(Number(llmConfig.timeoutMs))
+    const effectiveTimeoutMs = Number.isFinite(Number(llmConfig.timeoutMs))
         ? Math.max(500, Math.min(15_000, Number(llmConfig.timeoutMs)))
-        : 10_000;
+        : 4_500;
 
     const patchDigest = normalizedEdits
         .map((e) => `FILE: ${e.file_path}\n${e.content.slice(0, 8000)}`)
@@ -855,6 +976,10 @@ async function runCrossFamilyReview({
           };
 
     const callImpl = typeof llmConfig.chatImpl === 'function' ? llmConfig.chatImpl : chat;
+    const createAttemptSignal = () =>
+        signal
+            ? AbortSignal.any([AbortSignal.timeout(effectiveTimeoutMs), signal])
+            : AbortSignal.timeout(effectiveTimeoutMs);
 
     try {
         const startedNs = process.hrtime.bigint();
@@ -864,14 +989,14 @@ async function runCrossFamilyReview({
                 bypassCascade: true,
                 maxTokens: 1024,
                 temperature: 0.0,
-                signal: AbortSignal.timeout(timeoutMs)
+                signal: createAttemptSignal()
             }),
             callImpl(systemPrompt, userPrompt, configFamilyB, {
                 returnFullResponse: true,
                 bypassCascade: true,
                 maxTokens: 1024,
                 temperature: 0.0,
-                signal: AbortSignal.timeout(timeoutMs)
+                signal: createAttemptSignal()
             })
         ]);
         const reviewLatencyMs = Number((Number(process.hrtime.bigint() - startedNs) / 1e6).toFixed(3));
@@ -894,6 +1019,7 @@ async function runCrossFamilyReview({
             mode: 'live_api',
             verdict: parsedA.verdict,
             rationale: parsedA.rationale,
+            ambiguous: parsedA.ambiguous,
             inputTokens: inA,
             outputTokens: outA,
             costUsd: Number(costA.toFixed(8)),
@@ -907,6 +1033,7 @@ async function runCrossFamilyReview({
             mode: 'live_api',
             verdict: parsedB.verdict,
             rationale: parsedB.rationale,
+            ambiguous: parsedB.ambiguous,
             inputTokens: inB,
             outputTokens: outB,
             costUsd: Number(costB.toFixed(8)),
@@ -932,7 +1059,10 @@ async function runCrossFamilyReview({
             totalCostUsd,
             reviewLatencyMs
         };
-    } catch {
+    } catch (err) {
+        if (signal?.aborted) {
+            throw err;
+        }
         return runDeterministicStructuralReviewers({
             normalizedEdits,
             reconciliationData,
@@ -1034,8 +1164,10 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
                 soxReconcilerMod
             });
 
-            const unitTestPassed = unitCheck.deltaCents === 0;
-            const passed = batchEval.deltaCents === 0 && batchEval.actualFeeCents === batchEval.expectedFeeCents && unitTestPassed;
+            const unitTestPassed = Boolean(unitCheck.passed && unitCheck.deltaCents === 0);
+            const passed = Boolean(
+                batchEval.passed && batchEval.reconcilerReportedPass !== false && unitTestPassed
+            );
             const signedDelta = batchEval.deltaCents > 0 ? `+${batchEval.deltaCents}` : String(batchEval.deltaCents);
 
             const batchCheck = {
@@ -1054,7 +1186,9 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
 
             const summary = passed
                 ? 'INV-FIN-03 SOX batch reconciliation passed with zero-cent variance (expected=9750c, actual=9750c, delta=0c).'
-                : `INV-FIN-03 SOX batch reconciliation failed: expected net 9750c vs actual ${batchEval.actualNetCents}c (delta=${signedDelta}c; single-line unitCheck=${unitTestPassed ? 'PASS' : 'FAIL'}).`;
+                : batchEval.deltaCents === 0
+                  ? `INV-FIN-03 SOX batch reconciliation failed: per-line integer cent conservation or reconciler parity check failed (reconcilerReportedPass=${String(batchEval.reconcilerReportedPass)}, unitCheck=${unitTestPassed ? 'PASS' : 'FAIL'}).`
+                  : `INV-FIN-03 SOX batch reconciliation failed: expected net 9750c vs actual ${batchEval.actualNetCents}c (delta=${signedDelta}c; single-line unitCheck=${unitTestPassed ? 'PASS' : 'FAIL'}).`;
 
             return okEnvelope('deadbolt.validator.reconcile', summary, {
                 passed,
@@ -1105,8 +1239,14 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
         edits = [],
         targetTools = ['edit_file'],
         runCrossModel = true,
-        simulateReviewerDisagreement = false
+        simulateReviewerDisagreement = false,
+        signal = null
     } = {}) {
+        if (signal?.aborted) {
+            throw signal.reason instanceof Error
+                ? signal.reason
+                : new DOMException('Validation aborted by caller signal.', 'AbortError');
+        }
         const startedNs = process.hrtime.bigint();
         const rawEditList = resolveCandidateEditsArray(edits);
         const normalizedEdits = rawEditList.map((item) => ({
@@ -1328,7 +1468,8 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
                   reconciliationData: reconRes.data,
                   slopData: slopCheck,
                   llmConfig,
-                  simulateReviewerDisagreement
+                  simulateReviewerDisagreement,
+                  signal
               })
             : {
                   executed: false,
@@ -1451,27 +1592,17 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
      * Query recent audit entries and cryptographically verify the entire SHA-256 hash chain.
      */
     function getAuditTrail({ limit = 50 } = {}) {
-        const safeLimit = Number.isFinite(Number(limit))
-            ? Math.max(1, Math.min(500, Math.trunc(Number(limit))))
-            : 50;
+        const safeLimit = Math.max(1, Math.min(200, Math.trunc(Number(limit) || 50)));
 
         const verifyRes = auditLog.verify({ tool: 'deadbolt.validator.audit_trail' });
-        const ascAllRes = auditLog.query({ order: 'asc', tool: 'deadbolt.validator.audit_trail' });
-        const independentChainCheck = ascAllRes.ok
-            ? verifyAuditChain(ascAllRes.data.entries, {
-                  hmacSecret: resolvedHmacSecret,
-                  tool: 'deadbolt.validator.audit_trail'
-              })
-            : verifyRes;
-
         const descRes = auditLog.query({
             limit: safeLimit,
             order: 'desc',
             tool: 'deadbolt.validator.audit_trail'
         });
 
-        if (!verifyRes.ok || !independentChainCheck.ok || !descRes.ok) {
-            const failed = !verifyRes.ok ? verifyRes : !independentChainCheck.ok ? independentChainCheck : descRes;
+        if (!verifyRes.ok || !descRes.ok) {
+            const failed = !verifyRes.ok ? verifyRes : descRes;
             return errorEnvelope(
                 failed.error?.code || 'AUDIT_VERIFY_FAILED',
                 failed.error?.message || 'Audit chain verification failed.',
@@ -1479,6 +1610,10 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
                 'deadbolt.validator.audit_trail'
             );
         }
+
+        const boundedEntries = Array.isArray(descRes.data?.entries)
+            ? descRes.data.entries.slice(0, safeLimit)
+            : [];
 
         return okEnvelope(
             'deadbolt.validator.audit_trail',
@@ -1489,7 +1624,7 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
                 headHash: verifyRes.data.headHash,
                 tailHash: verifyRes.data.tailHash,
                 total: descRes.data.total,
-                entries: descRes.data.entries
+                entries: boundedEntries
             }
         );
     }

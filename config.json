@@ -1,6 +1,7 @@
 {
+  "host": "127.0.0.1",
   "port": 4090,
   "serviceName": "deadbolt",
-  "dbPath": "./data/app.db",
+  "dbPath": "./data/deadbolt.db",
   "logDir": "./logs"
 }

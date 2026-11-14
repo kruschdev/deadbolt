@@ -126,8 +126,8 @@ export const DEADBOLT_MCP_TOOLS = Object.freeze([
     },
     readOnlyHint: true,
     destructiveHint: false,
-    idempotentHint: true,
-    openWorldHint: false
+    idempotentHint: false,
+    openWorldHint: true
   }),
   defineMcpTool({
     name: 'deadbolt_verify_audit_chain',
@@ -189,7 +189,8 @@ export const DEADBOLT_MCP_PERMISSION_TABLE = Object.freeze(
     Object.freeze({
       name: tool.name,
       title: tool.annotations.title,
-      sofaPermission: tool.annotations.readOnlyHint ? 'Allow' : 'Confirm',
+      sofaPermission:
+        tool.annotations.sofaPermission || (tool.annotations.readOnlyHint ? 'Allow' : 'Confirm'),
       sofaScope: tool.annotations.sofaScope,
       readOnlyHint: tool.annotations.readOnlyHint,
       destructiveHint: tool.annotations.destructiveHint,
@@ -287,8 +288,15 @@ export async function createDeadboltMcp({ orchestrator, connect = false } = {}) 
             ? args.workOrderId.trim()
             : 'WO-101';
           const mode = typeof args.mode === 'string' && args.mode.trim()
-            ? args.mode.trim()
+            ? args.mode.trim().toLowerCase()
             : 'remediated';
+          if (!Array.isArray(args.edits) && !['naive', 'workaround', 'remediated'].includes(mode)) {
+            return errorMcpResult(
+              name,
+              'INVALID_ARGUMENTS',
+              `Unsupported validation mode "${mode}". Expected one of: naive, workaround, remediated.`
+            );
+          }
           const res = await fn.call(orchestrator, {
             workOrderId,
             mode,

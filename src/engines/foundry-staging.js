@@ -11,9 +11,16 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createKruschStack, createHarnessEngine, fsyncDirectory } from 'krusch-stack';
+import {
+  createKruschStack,
+  createHarnessEngine,
+  openStackDatabase,
+  fsyncDirectory
+} from 'krusch-stack';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { scoreLegoBrickCoverage, auditBoilerplateText } from '@krusch/toolkit/catalog';
+
+const MAX_STAGED_TASKS = 32;
 
 const IGNORED_STAGE_DIRS = new Set([
   '.git',
@@ -153,7 +160,7 @@ function atomicSyncVerifiedFile(rootDir, relFilePath, content) {
  * @param {object} [options.stack] - Optional shared KruschStack instance
  */
 export function createFoundryEngine({ stack = null } = {}) {
-  /** @type {Map<string, { workOrderId: string, stagingDir: string, stagingDbDir: string|null, repoDir: string, harnessInstance: object, ownedStack: object|null, edits: Array<{ file_path: string, content: string }> }>} */
+  /** @type {Map<string, { workOrderId: string, stagingDir: string, stagingDbDir: string, repoDir: string, harnessInstance: object, stageDb: object, edits: Array<{ file_path: string, content: string }> }>} */
   const stagedTasks = new Map();
 
   // Warm V8 TurboFan JIT for catalog regex & comment strippers at initialization so live calls run <1ms
@@ -208,6 +215,64 @@ export function createFoundryEngine({ stack = null } = {}) {
   }
 
   /**
+   * Close isolated `stage.db`, delete ephemeral staging directories, and remove `taskId` from `stagedTasks`.
+   * @param {string|{ taskId?: string }} taskId
+   */
+  function releaseStage(taskId) {
+    const cleanTaskId = String(
+      typeof taskId === 'object' && taskId !== null ? taskId.taskId ?? '' : taskId ?? ''
+    ).trim();
+    if (!cleanTaskId) {
+      return okEnvelope('deadbolt.foundry.release', 'No staged task id provided.', {
+        taskId: null,
+        released: false
+      });
+    }
+
+    const entry = stagedTasks.get(cleanTaskId);
+    if (!entry) {
+      return okEnvelope(
+        'deadbolt.foundry.release',
+        `Staged task ${cleanTaskId} already released or not found.`,
+        {
+          taskId: cleanTaskId,
+          released: false
+        }
+      );
+    }
+
+    stagedTasks.delete(cleanTaskId);
+    try {
+      entry.stageDb?.close?.();
+    } catch {
+      // Ignore close error
+    }
+    if (entry.stagingDir) {
+      try {
+        fs.rmSync(entry.stagingDir, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup error
+      }
+    }
+    if (entry.stagingDbDir) {
+      try {
+        fs.rmSync(entry.stagingDbDir, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup error
+      }
+    }
+
+    return okEnvelope(
+      'deadbolt.foundry.release',
+      `Released staged task ${cleanTaskId} and cleaned isolated workspace.`,
+      {
+        taskId: cleanTaskId,
+        released: true
+      }
+    );
+  }
+
+  /**
    * Stage Work Order edits inside an isolated workspace copy without mutating `repoDir` (`INV-DB-06`).
    * @param {object} params
    * @param {string} [params.workOrderId='WO-101']
@@ -250,29 +315,44 @@ export function createFoundryEngine({ stack = null } = {}) {
       );
     }
 
+    while (stagedTasks.size >= MAX_STAGED_TASKS) {
+      const oldestKey = stagedTasks.keys().next().value;
+      if (oldestKey === undefined) break;
+      releaseStage(oldestKey);
+    }
+
     const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-stage-'));
-    copyWorkspaceTree(resolvedRepoDir, stagingDir);
+    const stagingDbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-stage-db-'));
+    let stageDb = null;
 
-    let harnessInstance = null;
-    let ownedStack = null;
-    let stagingDbDir = null;
-
-    if (stack?.db) {
-      // Share durable SQLite task/journal ledger & Tier 1 invariants while isolating disk root to stagingDir
-      harnessInstance = createHarnessEngine({
-        db: stack.db,
-        workspaceRoot: stagingDir,
-        contextEngine: stack.context
-      });
-    } else {
-      stagingDbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-stage-db-'));
-      ownedStack = createKruschStack({
+    try {
+      copyWorkspaceTree(resolvedRepoDir, stagingDir);
+      stageDb = openStackDatabase({
         workspaceRoot: stagingDir,
         dbPath: path.join(stagingDbDir, 'stage.db'),
-        profile: 'core'
+        ephemeral: false
       });
-      harnessInstance = ownedStack.harness;
+    } catch (setupErr) {
+      try {
+        stageDb?.close?.();
+      } catch {
+        // Ignore close error on failed stage setup
+      }
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+      fs.rmSync(stagingDbDir, { recursive: true, force: true });
+      return errorEnvelope(
+        'HARNESS_STAGE_FAILED',
+        setupErr?.message || 'Failed to initialize isolated staging workspace',
+        { workOrderId },
+        'deadbolt.foundry.stage'
+      );
     }
+
+    const harnessInstance = createHarnessEngine({
+      db: stageDb,
+      workspaceRoot: stagingDir,
+      contextEngine: stack?.context || null
+    });
 
     const cleanWoId = String(workOrderId || 'WO-101').trim();
     const cleanGoal = String(goal || 'Stage candidate remediation').trim();
@@ -286,14 +366,12 @@ export function createFoundryEngine({ stack = null } = {}) {
 
     if (!runRes.ok) {
       try {
-        ownedStack?.db?.close?.();
+        stageDb?.close?.();
       } catch {
         // Ignore close error on failed stage
       }
       fs.rmSync(stagingDir, { recursive: true, force: true });
-      if (stagingDbDir) {
-        fs.rmSync(stagingDbDir, { recursive: true, force: true });
-      }
+      fs.rmSync(stagingDbDir, { recursive: true, force: true });
       return errorEnvelope(
         'HARNESS_STAGE_FAILED',
         runRes.summary || 'Failed to stage edits in isolated harness',
@@ -313,7 +391,7 @@ export function createFoundryEngine({ stack = null } = {}) {
       stagingDbDir,
       repoDir: resolvedRepoDir,
       harnessInstance,
-      ownedStack,
+      stageDb,
       edits: normalizedEdits
     });
 
@@ -593,35 +671,18 @@ export function createFoundryEngine({ stack = null } = {}) {
    * Remove ephemeral staging directories created during this Foundry session.
    */
   function close() {
-    for (const record of stagedTasks.values()) {
-      try {
-        record.ownedStack?.db?.close?.();
-      } catch {
-        // Ignore close error
-      }
-      if (record.stagingDir) {
-        try {
-          fs.rmSync(record.stagingDir, { recursive: true, force: true });
-        } catch {
-          // Ignore cleanup error
-        }
-      }
-      if (record.stagingDbDir) {
-        try {
-          fs.rmSync(record.stagingDbDir, { recursive: true, force: true });
-        } catch {
-          // Ignore cleanup error
-        }
-      }
+    for (const key of [...stagedTasks.keys()]) {
+      releaseStage(key);
     }
     stagedTasks.clear();
   }
 
-  return {
+  return Object.freeze({
     auditWithSlopBreaker,
     stageWorkOrderEdits,
     applyVerifiedStage,
+    releaseStage,
     runCrashRecoveryDrill,
     close
-  };
+  });
 }

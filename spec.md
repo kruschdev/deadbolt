@@ -69,52 +69,44 @@ Files owned exclusively by Agent 2:
 - `src/engines/foundry-staging.js`
 
 Exports of `src/engines/planner-graph.js`:
+- `normalizeGitHubRepoInput(rawInput)`: Normalizes browser-copied GitHub URLs (`/tree/<ref>/...`, `/blob/<ref>/<file>`, `github.com/owner/repo`, `owner/repo`, `git@github.com:owner/repo.git`) while rejecting path-traversal segments and preserving SSRF checks.
 - `createPlannerEngine({ stack, kruschGitClient = null })`:
   - `analyzeBlastRadius({ repoDir, repoName = 'acme-legacy-billing', entryFile = 'src/fee-engine.js', workOrders = [] })`:
-    1. Indexes `repoDir` in `stack.git.indexRepo({ path: repoDir, name: repoName })` and queries `stack.git.dependencyGraph` + `stack.git.fileSymbols` to compute exact 1-hop (`src/settlement-service.js`) and 2-hop (`src/sox-reconciler.js`, `src/server.js`) callers/dependents.
-    2. Probes remote `kruschGitClient` (`health()` / `listRepos()`) when configured to report live Tier 2A fleet graph connectivity alongside local SQLite AST graph.
-    3. Routes bounded plumbing vs. multi-hop financial domain tasks using `<25µs` `selectCascadeTier` + `createTierCircuitBreaker` (`@krusch/toolkit/cascade`), measuring actual routing elapsed microseconds (`process.hrtime.bigint()`).
-    4. Computes **Parallel Work Order Disjoint AST Leases** across `workOrders` (`WO-101`, `WO-102`, `WO-103`), proving which Work Orders have disjoint 2-hop cones (`canRunInParallel: true`) vs colliding choke points (`src/server.js` reserved for orchestrator).
+    1. Enforces `isSensitiveLocalPath` + `realpathSync` checks on `repoDir`, indexes `repoDir` in `stack.git.indexRepo`, and queries symbol/edge graphs in $O(N)$ to compute 1-hop (`src/settlement-service.js`) and 2-hop (`src/sox-reconciler.js`, `src/server.js`) callers/dependents.
+    2. Probes remote `kruschGitClient` (`health()` / `listRepos()`) with private-IP scrubbing when configured.
+    3. Routes bounded plumbing vs. multi-hop financial domain tasks using `<25µs` `selectCascadeTier` (`@krusch/toolkit/cascade`).
+    4. Computes **Parallel Work Order Disjoint AST Leases** across `workOrders` (`WO-101`, `WO-102`, `WO-103`).
     Returns `okEnvelope('deadbolt.planner.blast_radius', summary, { entryFile, hop1Files, hop2Files, hopPath, symbolGraph, cascadeRoutes, routingLatencyUs, parallelLeases, remoteKruschGit })`.
   - `scanExternalRepository({ repoUrlOrPath, maxFiles = 60 })`:
-    Supports live *"Paste Any GitHub Repo URL or Local Path"* intake! Validates `https://github.com/<owner>/<repo>` URLs via `validateOutboundUrl` (`allowedHosts: ['github.com']`) before shallow-cloning (`git clone --depth 1 --single-branch` into `/tmp/deadbolt-scan-*` with `execFileSync` timeout `20000ms` and zero shell interpolation) OR reads an existing local directory path safely, indexes AST symbols with `stack.git.indexRepo`, and runs `<1ms` `scoreLegoBrickCoverage` (`@krusch/toolkit/catalog`) across JS/TS/JSX/PY files. Cleans up temp clone directory after scanning. Returns `okEnvelope('deadbolt.planner.repo_scan', summary, { target, scannedFiles, symbolCount, dependencyPreview, slopAudit, elapsedMs })`.
+    Validates GitHub URLs via `validateOutboundUrl` (`allowedHosts: ['github.com', 'www.github.com']`) before non-blocking shallow `git clone --depth 1 --single-branch --filter=blob:limit=256k` (`execFile` timeout `12000ms`), or safely walks local non-sensitive directories (`<= 256 KB` non-binary files) across 14 enterprise extensions (`.js`, `.mjs`, `.cjs`, `.jsx`, `.ts`, `.tsx`, `.py`, `.php`, `.java`, `.cs`, `.go`, `.rb`, `.rs`, `.kt`) and 28 deterministic Golden Brick + PHP + Polyglot hazard rules. Cleans up temp directories and ephemeral SQLite scan rows in `finally`.
 
 Exports of `src/engines/foundry-staging.js`:
 - `createFoundryEngine({ stack })`:
-  - `auditWithSlopBreaker({ files, label = 'candidate' })`: Runs `<1ms` `scoreLegoBrickCoverage` and `auditBoilerplateText` (`@krusch/toolkit/catalog`), measuring sub-millisecond execution (`process.hrtime.bigint()`), returning `okEnvelope('deadbolt.foundry.slop_breaker', summary, { label, elapsedMs, breakerTripped, slopFindingCount, sealedCoverageRatio, recommendedBrickIds, findings })`.
-  - `stageWorkOrderEdits({ workOrderId, goal, repoDir, edits })`: Stages `edits` (`[{ file_path, content }]`) in an isolated staging workspace copy + records durable apply intent in `stack.harness.run` (`harness_tasks`), returning `{ taskId, status, unifiedDiff, stagingDir, invariantFindings }` inside `okEnvelope('deadbolt.foundry.stage', ...)`.
-  - `applyVerifiedStage({ taskId })`: Calls `stack.harness.applyDiff({ task_id: taskId })` only after Validator approval. Returns `okEnvelope('deadbolt.foundry.apply', ...)`.
-  - `runCrashRecoveryDrill({ repoDir })`: Demonstrates journaled crash recovery on a scratch copy of `repoDir`: stages a 2-file edit, simulates a mid-apply crash leaving `harness_apply_journal.state = 'RECOVERY_PENDING'` with partial disk state, invokes `stack.harness.recoverInFlight()`, and verifies deterministic convergence (`halfWrittenFiles === 0`) with before/after SHA-256 file hashes. Returns `okEnvelope('deadbolt.foundry.crash_drill', ...)`.
+  - `auditWithSlopBreaker({ files, label = 'candidate' })`: Runs `<1ms` `scoreLegoBrickCoverage` and `auditBoilerplateText` (`@krusch/toolkit/catalog`).
+  - `stageWorkOrderEdits({ workOrderId, goal, repoDir, edits })`: Stages `edits` in an isolated staging workspace copy with an isolated per-stage journal (`stage.db`) and bounded `MAX_STAGED_TASKS = 32` LRU eviction.
+  - `applyVerifiedStage({ taskId, applyToRepoDir = false })`: Applies verified staged diffs only after Validator approval.
+  - `releaseStage(taskId)`: Deterministically removes staged scratch directories from `os.tmpdir()` and evicts `stagedTasks` state.
+  - `runCrashRecoveryDrill({ repoDir })`: Simulates a mid-apply crash (`RECOVERY_PENDING`) on an isolated `drill-stack.db` and verifies `recoverInFlight()` convergence (`halfWrittenFiles === 0`).
 
-### Module C (Agent 3): Stage 4 Validator & Sponsor Connectors
-Files owned exclusively by Agent 3:
+### Module C (Agent 3): Stage 4 Validator, Modernizer Benchmark & Sponsor Connectors
+Files owned by Agent 3 / Modernizer & Connector layer:
 - `src/engines/validator-gate.js`
+- `src/engines/modernizer-benchmark.js`
+- `src/connectors/hydradb-graph.js`
 - `src/connectors/sponsors.js`
 
 Exports of `src/engines/validator-gate.js`:
-- `createValidatorEngine({ auditDbPath, hmacSecret, llmConfig = {} })`:
-  - Uses `createAuditLog({ sqlitePath: auditDbPath, hmacSecret })` (`@krusch/toolkit/audit-log`) and `createFrozenPolicyFloor` (`@krusch/toolkit/harness-engineering`) with protected paths `['src/sox-reconciler.js', 'sox-reconciler.js', '.sw-factory/policy.lock']` and extra rule `FLOOR-SOX-TOLERANCE-BYPASS` blocking `strictSox\s*=\s*false` or `MAX_TOLERANCE_CENTS\s*=\s*[1-9]`.
-  - `runSoxReconciliationCheck({ repoDir, candidateEdits = [] })`: Materializes `repoDir` + `candidateEdits` in an isolated temp sandbox and executes both:
-    1. Single-invoice unit check (`$100.00` single item @ `250 bps` -> passes on both naive and fixed code, showing why naive unit tests miss the bug!).
-    2. Multi-line split batch settlement ledger (`INV-2026-9001`: 3 split line items `[3334, 3333, 3333]` cents = `10000` gross cents @ `250 bps` batch fee = `250` fee cents, `expectedNetCents = 9750`). Computes `actualLineFeeSumCents`, `actualNetCents`, `deltaCents`, and `invariantId: 'INV-FIN-03'`.
-    Returns `okEnvelope('deadbolt.validator.reconcile', summary, { passed, invariantId, unitTestPassed, batchCheck: { invoiceId, grossCents, expectedFeeCents, actualFeeCents, expectedNetCents, actualNetCents, deltaCents }, lineBreakdown })`.
-  - `validateCandidate({ workOrderId, attemptLabel, repoDir, edits, targetTools = ['edit_file'], runCrossModel = true })`:
-    Executes fixed review order (`INV-DB-04`):
-    1. **Policy Floor & Self-Rejection Workaround Check**: Checks every edited file path and diff content against `policyFloor.evaluate` and workaround detectors (editing `sox-reconciler.js`, changing tolerance, disabling `strictSox`). If tripped -> `verdict: 'WORKAROUND_REJECTED'` (appends `DENIED` entry to `auditLog`).
-    2. **Deterministic Slop Breaker** (`scoreLegoBrickCoverage`) + **SOX-Style Batch Reconciliation Gate** (`runSoxReconciliationCheck`). If `deltaCents !== 0` or slop found -> `verdict: 'GATE_REJECTED'` (appends `FAILURE` entry to `auditLog`).
-    3. **Separate-Family Cross-Model Review**: When `runCrossModel` is enabled, runs 2 separate model families (`@krusch/toolkit/llm` if live keys/endpoints respond within `4500ms`, otherwise deterministic structural family profiles clearly labeled `mode: 'offline_deterministic'` vs `mode: 'live_api'`), recording exact measured `inputTokens`, `outputTokens`, `latencyMs`, and `costUsd`.
-    4. **Disagreement Check**: If reviewers disagree -> `verdict: 'ESCALATE_TO_HUMAN'`. Only if all deterministic gates pass AND reviewers converge -> `verdict: 'VERIFIED'` (appends `SUCCESS` entry to `auditLog`).
-    Returns `okEnvelope('deadbolt.validator.validate', summary, { verdict, reviewOrder, policyCheck, slopCheck, reconciliation, crossModelReview, auditReceipt, telemetry })`.
-  - `getAuditTrail({ limit = 50 })`: Queries `auditLog.query({ limit, order: 'desc' })` and runs `auditLog.verify()`, returning `{ valid, verifiedCount, headHash, tailHash, entries }` in `okEnvelope('deadbolt.validator.audit_trail', ...)`.
-  - `close()`: Closes `auditLog`.
+- `parseReviewerVerdictPayload(rawText)`: Fail-closed JSON/structured verdict parser returning `APPROVE` strictly when parsed `verdict === 'APPROVE'` (or unambiguous `APPROVE` text with zero `REJECT`/`FAIL`/`UNSAFE`/`ESCALATE` tokens), otherwise returning `REJECT`.
+- `estimateReviewerUsageCostUsd(modelId, usage)`: Exact per-1M token cost calculator.
+- `createValidatorEngine({ auditDbPath, hmacSecret, llmConfig = {} })`: Enforces fixed review order (`1A Policy Floor -> 1B Slop + INV-FIN-03 SOX Reconciliation -> 2 Cross-Family Review within 4500ms -> 3 Disagreement Escalation`) and tamper-evident SHA-256 `auditLog`.
 
-Exports of `src/connectors/sponsors.js`:
-- `createSponsorHub({ config, hydraClient = null })`:
-  - **8090 Software Factory Connector (`sofa`)**: Reads/writes `.sw-factory/WO-*.json` + connects to `SOFA_MCP_URL` (`https://api.factory.8090.dev/v2/mcp`) with `X-Sofa-Mcp-Project-Id` and `Bearer sofa-ext-*` via `safeFetch` when `SOFA_API_KEY` & `SOFA_PROJECT_ID` are set; formats PR title `[WO-101] Fix integer basis-point residual allocation in fee-engine` for 8090 automatic PR-to-Work-Order linking + generates Blueprint Drift Bot summary.
-  - **HydraDB v2 Connector (`hydradb`)**: Uses `createHydraDbClient` (`@krusch/toolkit/hydradb`) to report live `API-Version: 2` status and sync `supersedes_id` memory lineage + 2-hop `IMPORTS` graph edges when `HYDRADB_API_KEY` is configured, with clean road-mode SQLite fallback.
-  - **Composio Connector (`composio`)**: Enforces `INV-DB-07` 3-layer Confused-Deputy defense: (1) refuses execution if `validatorVerdict !== 'VERIFIED'` or `auditChainValid !== true`, (2) blocks prompt-injected payloads (`sanitizeAgentMessage` / `delimitUntrustedContent`), (3) dispatches verified GitHub PR creation via `safeFetch` to `COMPOSIO_BASE_URL` when `COMPOSIO_API_KEY` is present or emits a deterministic signed dry-run PR receipt offline.
-  - **ElevenLabs Factory Foreman Voice Connector (`elevenlabs`)**: Calls ElevenLabs streaming TTS (`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}` via `safeFetch` when `ELEVENLABS_API_KEY` is set) and falls back cleanly to `@krusch/toolkit/audio` `encodeWavPcm16` synthesized cockpit breaker alert chime + crisp transcript (`audioBase64`, `mimeType`, `mode: 'elevenlabs_live' | 'pcm16_breaker_synth'`) so audio works 100% reliably on stage with or without venue Wi-Fi!
-  - Methods: `getConnectorStatuses()`, `syncSoftwareFactoryWorkOrder(payload)`, `dispatchVerifiedPullRequest(payload)`, `runConfusedDeputyDrill(payload)`, `synthesizeForemanAlert(payload)`.
+Exports of `src/engines/modernizer-benchmark.js`:
+- `toTargetModernizedPath(relPath)` & `selectModernizationWave({ fileEntries, findings, edges, requestedFile })`.
+- `createModernizerBenchmarkEngine(...)`: Runs Head-to-Head Legacy Modernization (`POST /api/repo/modernize`) comparing Arm A (1 Single Frontier Model with full-repo stuffing) vs. Arm B (HydraDB Dual-Live `v2` + `v0.4.0` OpenCypher 2-hop graph slice + `<25µs` Cascade Router + `<1ms` Golden Brick Slop Breaker + real 2-family `parseReviewerVerdictPayload` consensus + `:SUPERSEDES` writeback gated on `VERIFIED`). Mints fresh per-attempt `AbortSignal.timeout` instances and guards backup failovers so transient LLM errors never throw unhandled `500`s.
+
+Exports of `src/connectors/hydradb-graph.js` & `src/connectors/sponsors.js`:
+- `createHydraGraphClient(...)`: Native HydraDB `v0.4.0` OpenCypher HTTP client over `safeFetch` (`2000ms` timeout, fast-break on unreachable host, and private/Tailscale IP scrubbing on all error envelopes).
+- `createSponsorHub({ config, hydraClient, hydraGraphClient })`: Manages 8090 Software Factory Tri-API (`sofa-admin-*`, `sofa-ext-*`, `sf-rpt-*`), HydraDB Dual-Live (`v2.0.1` + `v0.4.0` OpenCypher with `INV-DB-HYDRA-ISOLATION-01` token separation), Composio Connect MCP (`ck_*`) + v3 Confused-Deputy 3-layer gate (`INV-DB-07` pinned hosts + delimited `diffSummary`), and ElevenLabs TTS (`3500ms` bounded header + body timeout with offline PCM16 WAV fallback).
 
 ### Module D (Agent 4): Deadbolt MCP Server & Live Breaker Panel UI
 Files owned exclusively by Agent 4:
@@ -149,25 +141,29 @@ Exports of `client/src/components/BreakerCockpit.jsx`:
          - Attempt 1 (Naive rounding): Gate trips on `+1¢` delta (`expected: 9750¢`, `actual: 9751¢`, `delta: +1¢`).
          - Attempt 2 (Agent tries sneaky workaround editing `sox-reconciler.js` tolerance): **BREAKER TRIPPED (`WORKAROUND_REJECTED`: policy floor cannot be overridden by supervised AI)** + plays ElevenLabs Foreman alert!
          - Attempt 3 (Legitimate integer largest-remainder fix in `fee-engine.js`): `delta: 0¢` + separate-family review passes -> `VERIFIED` PR (`[WO-101]`) + verified SHA-256 audit receipt + **Measured Cost-Per-Verified-Task** ledger.
-  3. **Live Brownfield Scanner Tab / Drawer ("Paste Any GitHub Repo URL or Local Path")**: Pre-filled quick-select buttons (`acme-legacy-billing`, `https://github.com/OWASP/NodeGoat`) + custom URL input calling `POST /api/repo/scan` via `fetchApiJson`.
-  4. **Resilience Drills Bar**: One-click **"Run Crash-Recovery Drill (`INV-DB-06`)"** (`POST /api/drills/crash-recovery`) and **"Run Confused-Deputy Prompt-Injection Drill (`INV-DB-07`)"** (`POST /api/drills/confused-deputy`) + **8090 MCP Tools Matrix** (`Allow` vs `Confirm`).
+  3. **Tab 2: Head-to-Head GitHub Modernizer & Polyglot Hazard Scanner**: Pre-filled quick-select pills (`https://github.com/taniarascia/pdo`, `acme-legacy-billing`, `pdo-nextjs-governed`) + custom GitHub URL / local directory input calling `POST /api/repo/modernize` (Arm A 1-Frontier vs. Arm B HydraDB Dual-Live + `<25µs` Cascade + Golden Bricks) and `POST /api/repo/scan` (`<1ms` 28-rule scanner across 14 extensions).
+  4. **Tab 3: Safety Drills & 8090 MCP Matrix**: One-click **"Run Crash-Recovery Drill (`INV-DB-06`)"** (`POST /api/drills/crash-recovery`), **"Run Confused-Deputy Prompt-Injection Drill (`INV-DB-07`)"** (`POST /api/drills/confused-deputy`), and **8090 MCP Tools Matrix** (`Allow` vs `Confirm`).
 
 ### Choke-Point Orchestrator (Wired Only by Main Orchestrator)
 Files wired exclusively by the orchestrator after subagents finish:
 - `src/config.js`
 - `src/orchestrator.js`
 - `src/server.js`
+- `src/mcp/deadbolt-mcp.js`
 - `client/src/App.jsx`
-- `tests/deadbolt.test.js`
+- `package.json`, `.env.example`, `config.json`, `Dockerfile`, `.dockerignore`, `.github/workflows/ci.yml`, `README.md`, `AGENTS.md`
+- `tests/deadbolt.test.js`, `tests/smoke.test.js`, `scripts/seed-8090-project.js`
 
-HTTP API Routes exposed by `src/server.js` (`createApiServer` on `:4090`):
+HTTP API Routes exposed by `src/server.js` (`createApiServer` on `127.0.0.1:4090` by default, `HOST=0.0.0.0` in Docker):
 - `GET /health` & `GET /doctor` (automatic via `@krusch/toolkit/http`)
 - `GET /api/status`: Full dashboard state, connector statuses, work orders, audit trail head/tail hash, and MCP tool permission table.
 - `POST /api/run`: Synchronous full head-to-head execution (`Standard Agent` vs `DEADBOLT` 3-attempt self-rejection & remediation loop) returning complete JSON receipt.
-- `POST /api/run/stream`: Live `sseResponse` streaming each stage beat (`refinery`, `planner`, `foundry`, `validator.attempt1`, `validator.workaround_blocked`, `validator.verified`, `pr.dispatched`) + final `done` envelope.
+- `POST /api/run/stream`: Live `sseResponse` streaming each stage beat (`refinery`, `planner`, `foundry`, `validator.attempt1`, `validator.workaround_blocked`, `validator.verified`, `pr.dispatched`) + final `done` envelope, honoring client `AbortSignal`.
 - `POST /api/repo/scan`: Scans any GitHub URL or local path (`scanExternalRepository`).
+- `POST /api/repo/modernize`: Runs Head-to-Head Legacy Modernization (`runModernizationComparison`).
 - `POST /api/drills/crash-recovery`: Runs `runCrashRecoveryDrill`.
 - `POST /api/drills/confused-deputy`: Runs `runConfusedDeputyDrill`.
 - `POST /api/foreman/speak`: Synthesizes Foreman audio alert (`synthesizeForemanAlert`).
 - `GET /api/audit`: Returns cryptographically verified SHA-256 audit chain (`getAuditTrail`).
+- `GET /api/metrics` & `POST /api/stream`: Telemetry event counter & baseline SSE stream.
 - Static UI routes (`GET /`, `GET /index.html`, `GET /assets/app.js`, `GET /assets/app.css`, `GET /favicon.svg`).

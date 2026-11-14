@@ -1,5 +1,6 @@
 node_modules
 client/node_modules
+client/dist
 .env
 .env.*
 !.env.example
@@ -7,6 +8,12 @@ data
 logs
 *.log
 .git
+.agent
+.krusch-stack
+.sw-factory
+.mcp.json
+GEMINI_INFLIGHT.md
+JEAN_SESSION_REVIEW.md
 __pycache__
 *.pyc
 .venv

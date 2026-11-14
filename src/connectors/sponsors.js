@@ -16,7 +16,7 @@ import { createHydraDbClient } from '@krusch/toolkit/hydradb';
 import { encodeWavPcm16, parseWavHeader } from '@krusch/toolkit/audio';
 import { delimitUntrustedContent } from '@krusch/toolkit/harness-engineering';
 import { sanitizeAgentMessage } from '@krusch/toolkit/trajectory-guard';
-import { createHydraGraphClient } from './hydradb-graph.js';
+import { createHydraGraphClient, scrubPrivateNetworkStrings } from './hydradb-graph.js';
 
 const DEFAULT_SOFA_API_BASE_URL = 'https://api.factory.8090.dev';
 const DEFAULT_SOFA_MCP_URL = 'https://api.factory.8090.dev/v2/mcp';
@@ -276,7 +276,7 @@ export function createSponsorHub({
             namespace: safeConfig.hydradbNamespace || 'default',
             allowPrivateLan: Boolean(safeConfig.hydradbAllowLan),
             allowTailscale: Boolean(safeConfig.hydradbAllowLan),
-            timeoutMs: 5000,
+            timeoutMs: 2000,
             ...(typeof fetchImpl === 'function' ? { fetchImpl } : {}),
             ...(typeof lookupFn === 'function' ? { lookupFn } : {})
         });
@@ -475,27 +475,55 @@ export function createSponsorHub({
             sofaApiHost = 'api.factory.8090.dev';
         }
 
-        if (sofaCreds.hasOrgAdmin) {
+        if (sofaCreds.hasOrgAdmin || sofaCreds.hasExternalApi) {
             liveMcpSync.attempted = true;
-            const spendRes = await safeFetch(
-                `${sofaCreds.apiBaseUrl}/v2/organization-api/spend-status`,
-                {
-                    method: 'GET',
-                    headers: {
-                        Accept: 'application/json',
-                        'X-API-Key': sofaCreds.adminKey
-                    }
-                },
-                {
-                    allowedProtocols: ['https:'],
-                    allowedHosts: [sofaApiHost],
-                    timeoutMs: 4000,
-                    maxRedirects: 0,
-                    tool: 'deadbolt.sponsors.sofa_org_admin',
-                    ...extraSafeFetchOpts
-                }
-            );
+        }
 
+        const extHeaders = sofaCreds.hasExternalApi
+            ? {
+                  Accept: 'application/json',
+                  Authorization: `Bearer ${sofaCreds.externalKey}`
+              }
+            : null;
+
+        const [spendRes, healthRes] = await Promise.all([
+            sofaCreds.hasOrgAdmin
+                ? safeFetch(
+                      `${sofaCreds.apiBaseUrl}/v2/organization-api/spend-status`,
+                      {
+                          method: 'GET',
+                          headers: {
+                              Accept: 'application/json',
+                              'X-API-Key': sofaCreds.adminKey
+                          }
+                      },
+                      {
+                          allowedProtocols: ['https:'],
+                          allowedHosts: [sofaApiHost],
+                          timeoutMs: 2500,
+                          maxRedirects: 0,
+                          tool: 'deadbolt.sponsors.sofa_org_admin',
+                          ...extraSafeFetchOpts
+                      }
+                  )
+                : Promise.resolve(null),
+            sofaCreds.hasExternalApi
+                ? safeFetch(
+                      `${sofaCreds.apiBaseUrl}/v2/external-api/health`,
+                      { method: 'GET', headers: extHeaders },
+                      {
+                          allowedProtocols: ['https:'],
+                          allowedHosts: [sofaApiHost],
+                          timeoutMs: 2500,
+                          maxRedirects: 0,
+                          tool: 'deadbolt.sponsors.sofa_external_health',
+                          ...extraSafeFetchOpts
+                      }
+                  )
+                : Promise.resolve(null)
+        ]);
+
+        if (spendRes) {
             if (spendRes.ok && spendRes.data.status >= 200 && spendRes.data.status < 300) {
                 let spendJson = null;
                 try {
@@ -514,25 +542,7 @@ export function createSponsorHub({
             }
         }
 
-        if (sofaCreds.hasExternalApi) {
-            liveMcpSync.attempted = true;
-            const extHeaders = {
-                Accept: 'application/json',
-                Authorization: `Bearer ${sofaCreds.externalKey}`
-            };
-            const healthRes = await safeFetch(
-                `${sofaCreds.apiBaseUrl}/v2/external-api/health`,
-                { method: 'GET', headers: extHeaders },
-                {
-                    allowedProtocols: ['https:'],
-                    allowedHosts: [sofaApiHost],
-                    timeoutMs: 4000,
-                    maxRedirects: 0,
-                    tool: 'deadbolt.sponsors.sofa_external_health',
-                    ...extraSafeFetchOpts
-                }
-            );
-
+        if (healthRes) {
             if (healthRes.ok && healthRes.data.status >= 200 && healthRes.data.status < 300) {
                 let workOrderTotal = null;
                 let matchedLiveWorkOrder = null;
@@ -542,7 +552,7 @@ export function createSponsorHub({
                     {
                         allowedProtocols: ['https:'],
                         allowedHosts: [sofaApiHost],
-                        timeoutMs: 4000,
+                        timeoutMs: 2500,
                         maxRedirects: 0,
                         tool: 'deadbolt.sponsors.sofa_external_work_orders',
                         ...extraSafeFetchOpts
@@ -619,7 +629,7 @@ export function createSponsorHub({
                 {
                     allowedProtocols: ['https:'],
                     allowedHosts: [sofaHost],
-                    timeoutMs: 4000,
+                    timeoutMs: 2500,
                     maxRedirects: 0,
                     tool: 'deadbolt.sponsors.sofa_sync',
                     ...extraSafeFetchOpts
@@ -727,7 +737,7 @@ export function createSponsorHub({
         try {
             let memoryRes = null;
             let graphRes = null;
-            let openCypherRes = null;
+            let rawOpenCypherRes = null;
             let v2Ok = false;
             if (v2Configured) {
                 try {
@@ -747,12 +757,71 @@ export function createSponsorHub({
                 }
             }
             if (openCypherConfigured) {
-                openCypherRes = await resolvedHydraGraph.seedWorkOrderLineageGraph({
+                rawOpenCypherRes = await resolvedHydraGraph.seedWorkOrderLineageGraph({
                     workOrderId,
                     hopFiles
                 });
             }
-            const openCypherOk = Boolean(openCypherRes?.ok && openCypherRes?.data?.liveSynced);
+            const openCypherOk = Boolean(rawOpenCypherRes?.ok && rawOpenCypherRes?.data?.liveSynced);
+            const openCypherRes = rawOpenCypherRes
+                ? {
+                      ok: Boolean(rawOpenCypherRes.ok),
+                      summary: scrubPrivateNetworkStrings(String(rawOpenCypherRes.summary || '')),
+                      data: {
+                          mode:
+                              rawOpenCypherRes.data?.mode ||
+                              (openCypherOk ? 'hydradb_opencypher_live' : 'sqlite_lineage_fallback'),
+                          liveSynced: openCypherOk,
+                          graphId: scrubPrivateNetworkStrings(
+                              String(
+                                  rawOpenCypherRes.data?.graphId ||
+                                      resolvedHydraGraph?.graphId ||
+                                      'deadbolt-factory'
+                              )
+                          ),
+                          cellId: scrubPrivateNetworkStrings(
+                              String(
+                                  rawOpenCypherRes.data?.cellId ||
+                                      resolvedHydraGraph?.cellId ||
+                                      'cell-0'
+                              )
+                          ),
+                          ...(rawOpenCypherRes.data?.lineageRecord
+                              ? {
+                                    lineageRecord: scrubPrivateNetworkStrings(
+                                        rawOpenCypherRes.data.lineageRecord
+                                    )
+                                }
+                              : {}),
+                          ...(rawOpenCypherRes.data?.fallbackReason || rawOpenCypherRes.error?.code
+                              ? {
+                                    fallbackReason: scrubPrivateNetworkStrings(
+                                        String(
+                                            rawOpenCypherRes.data?.fallbackReason ||
+                                                rawOpenCypherRes.error?.code ||
+                                                'HYDRADB_UNREACHABLE'
+                                        )
+                                    )
+                                }
+                              : {})
+                      },
+                      ...(rawOpenCypherRes.error
+                          ? {
+                                error: {
+                                    code: scrubPrivateNetworkStrings(
+                                        String(rawOpenCypherRes.error.code || 'HYDRADB_UNREACHABLE')
+                                    ),
+                                    message: scrubPrivateNetworkStrings(
+                                        String(
+                                            rawOpenCypherRes.error.message ||
+                                                'HydraDB OpenCypher unreachable.'
+                                        )
+                                    )
+                                }
+                            }
+                          : {})
+                  }
+                : null;
             const resolvedMode =
                 v2Ok && openCypherOk
                     ? 'hydradb_dual_v2_opencypher_live'
@@ -771,8 +840,8 @@ export function createSponsorHub({
                     openCypherSynced: openCypherOk,
                     liveSynced: Boolean(v2Ok || openCypherOk),
                     workOrderId,
-                    memoryRes,
-                    graphRes,
+                    memoryRes: scrubPrivateNetworkStrings(memoryRes),
+                    graphRes: scrubPrivateNetworkStrings(graphRes),
                     openCypherRes
                 }
             );
@@ -787,7 +856,9 @@ export function createSponsorHub({
                     openCypherSynced: false,
                     liveSynced: false,
                     workOrderId,
-                    fallbackReason: err instanceof Error ? err.message : 'HYDRADB_SYNC_FAILED'
+                    fallbackReason: scrubPrivateNetworkStrings(
+                        err instanceof Error ? err.message : 'HYDRADB_SYNC_FAILED'
+                    )
                 }
             );
         }
@@ -908,12 +979,12 @@ export function createSponsorHub({
             titleSanitized.isInfected ||
             DEPUTY_BYPASS_DIRECTIVE_RE.test(rawTitle);
 
+        const overrideAttempted = Boolean(forceUntrustedOverride);
         const unauthorizedRepoOverride =
             typeof targetRepo !== 'string' ||
-            !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo) ||
-            (forceUntrustedOverride && hasDeputyDirectiveInContext);
+            !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(targetRepo);
 
-        if (hasInjectionInTitle || unauthorizedRepoOverride || forceUntrustedOverride) {
+        if (hasInjectionInTitle || unauthorizedRepoOverride || overrideAttempted) {
             return errorEnvelope(
                 'COMPOSIO_BLOCKED_INJECTION',
                 'Composio PR dispatch blocked at Layer 2: untrusted prompt-injection attempted to escape delimiters or override protected PR parameters.',
@@ -950,29 +1021,42 @@ export function createSponsorHub({
             }
         };
 
-        // Layer 3: DNS-Pinned Outbound SSRF Guard (safeFetch / validateOutboundUrl)
+        const composioCreds = resolveComposioCredentials();
+        const composioBase = composioCreds.baseUrl;
+
+        let composioHost = 'backend.composio.dev';
+        try {
+            composioHost = new URL(composioBase).hostname;
+        } catch {
+            composioHost = 'backend.composio.dev';
+        }
+
+        let mcpHost = 'connect.composio.dev';
+        try {
+            mcpHost = new URL(composioCreds.mcpUrl).hostname;
+        } catch {
+            mcpHost = 'connect.composio.dev';
+        }
+
+        // Layer 3: DNS-Pinned Outbound SSRF & Host-Allowlist Guard (validateOutboundUrl / safeFetch)
         if (outboundUrlOverride) {
-            const overrideCheck = await safeFetch(
-                outboundUrlOverride,
-                { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
-                {
-                    allowedProtocols: ['https:', 'http:'],
-                    allowPrivateLan: false,
-                    allowTailscale: false,
-                    maxRedirects: 0,
-                    timeoutMs: 3000,
-                    tool: 'deadbolt.sponsors.composio_pr'
-                }
-            );
+            const overrideCheck = await validateOutboundUrl(outboundUrlOverride, {
+                allowedProtocols: ['https:'],
+                allowedHosts: [composioHost, mcpHost].filter(Boolean),
+                allowPrivateLan: false,
+                allowTailscale: false,
+                lookupFn,
+                tool: 'deadbolt.sponsors.composio_pr'
+            });
             if (!overrideCheck.ok) {
                 return errorEnvelope(
                     'COMPOSIO_BLOCKED_SSRF',
-                    `Composio PR dispatch blocked at Layer 3 by safeFetch: ${overrideCheck.error.message}`,
+                    `Composio PR dispatch blocked at Layer 3 by validateOutboundUrl: ${scrubPrivateNetworkStrings(overrideCheck.error.message)}`,
                     {
                         layer: 3,
                         layerName: 'ssrf_safe_fetch',
                         upstreamCode: overrideCheck.error.code,
-                        details: overrideCheck.error.details ?? null
+                        details: scrubPrivateNetworkStrings(overrideCheck.error.details ?? null)
                     },
                     'deadbolt.sponsors.composio_pr'
                 );
@@ -984,17 +1068,14 @@ export function createSponsorHub({
             .update(`${safeWorkOrderId}:${prTitle}:${auditReceipt.entryHash}`, 'utf8')
             .digest('hex');
 
-        const composioCreds = resolveComposioCredentials();
-        const composioBase = composioCreds.baseUrl;
+        const delimitedDiff = delimitUntrustedContent(
+            String(diffSummary || '').replace(/<<</g, '< < <').slice(0, 1200),
+            { source: 'staged_git_diff' }
+        );
+
+        let liveFallbackReason = null;
 
         if (composioCreds.isConsumerMcp) {
-            let mcpHost = 'connect.composio.dev';
-            try {
-                mcpHost = new URL(composioCreds.mcpUrl).hostname;
-            } catch {
-                mcpHost = 'connect.composio.dev';
-            }
-
             const mcpRes = await safeFetch(
                 composioCreds.mcpUrl,
                 {
@@ -1026,7 +1107,7 @@ export function createSponsorHub({
             if (!mcpRes.ok && String(mcpRes.error?.code || '').startsWith('SSRF_')) {
                 return errorEnvelope(
                     'COMPOSIO_BLOCKED_SSRF',
-                    mcpRes.error.message,
+                    scrubPrivateNetworkStrings(mcpRes.error.message),
                     { layer: 3, upstreamCode: mcpRes.error.code },
                     'deadbolt.sponsors.composio_pr'
                 );
@@ -1061,17 +1142,15 @@ export function createSponsorHub({
                         }
                     );
                 }
+                liveFallbackReason = 'COMPOSIO_MCP_INVALID_PAYLOAD';
+            } else {
+                liveFallbackReason = !mcpRes.ok
+                    ? mcpRes.error?.message || mcpRes.error?.code || 'COMPOSIO_MCP_UNREACHABLE'
+                    : `HTTP_${mcpRes.data.status}`;
             }
         } else if (composioCreds.hasDeveloperKey) {
-            let composioHost = 'backend.composio.dev';
-            try {
-                composioHost = new URL(composioBase).hostname;
-            } catch {
-                composioHost = 'backend.composio.dev';
-            }
-
             const endpointUrl = `${composioBase}/tools/execute/GITHUB_CREATE_A_PULL_REQUEST`;
-            const liveRes = await safeFetch(
+            const prRes = await safeFetch(
                 endpointUrl,
                 {
                     method: 'POST',
@@ -1086,7 +1165,7 @@ export function createSponsorHub({
                             title: prTitle,
                             base: 'main',
                             head: `deadbolt/${safeWorkOrderId.toLowerCase()}-verified`,
-                            body: `Verified by DEADBOLT Stage 4.\nAudit Entry Hash: ${auditReceipt.entryHash}\n\n${diffSummary}`
+                            body: `Verified by DEADBOLT Stage 4.\nAudit Entry Hash: ${auditReceipt.entryHash}\n\n${delimitedDiff.delimited}`
                         }
                     })
                 },
@@ -1102,16 +1181,16 @@ export function createSponsorHub({
                 }
             );
 
-            if (!liveRes.ok && String(liveRes.error?.code || '').startsWith('SSRF_')) {
+            if (!prRes.ok && String(prRes.error?.code || '').startsWith('SSRF_')) {
                 return errorEnvelope(
                     'COMPOSIO_BLOCKED_SSRF',
-                    liveRes.error.message,
-                    { layer: 3, upstreamCode: liveRes.error.code },
+                    scrubPrivateNetworkStrings(prRes.error.message),
+                    { layer: 3, upstreamCode: prRes.error.code },
                     'deadbolt.sponsors.composio_pr'
                 );
             }
 
-            if (liveRes.ok && liveRes.data.status >= 200 && liveRes.data.status < 300) {
+            if (prRes.ok && prRes.data.status >= 200 && prRes.data.status < 300) {
                 return okEnvelope(
                     'deadbolt.sponsors.composio_pr',
                     `Dispatched verified pull request "${prTitle}" via Composio v3.`,
@@ -1128,18 +1207,21 @@ export function createSponsorHub({
                     }
                 );
             }
+            liveFallbackReason = !prRes.ok
+                ? prRes.error?.message || prRes.error?.code || 'COMPOSIO_V3_UNREACHABLE'
+                : `HTTP_${prRes.data.status}`;
         } else {
             const urlCheck = await validateOutboundUrl(composioBase, {
                 allowedProtocols: ['https:'],
                 allowPrivateLan: false,
                 allowTailscale: false,
-                lookupFn: async () => [{ address: '104.18.32.47', family: 4 }],
+                lookupFn: lookupFn || (async () => [{ address: '104.18.32.47', family: 4 }]),
                 tool: 'deadbolt.sponsors.composio_pr'
             });
             if (!urlCheck.ok) {
                 return errorEnvelope(
                     'COMPOSIO_BLOCKED_SSRF',
-                    urlCheck.error.message,
+                    scrubPrivateNetworkStrings(urlCheck.error.message),
                     { layer: 3, upstreamCode: urlCheck.error.code },
                     'deadbolt.sponsors.composio_pr'
                 );
@@ -1158,7 +1240,15 @@ export function createSponsorHub({
                 auditEntryHash: auditReceipt.entryHash,
                 receiptSignature,
                 diffSummary,
-                untrustedGuard
+                untrustedGuard,
+                ...(composioCreds.liveConfigured
+                    ? {
+                          liveDispatched: false,
+                          fallbackReason: scrubPrivateNetworkStrings(
+                              String(liveFallbackReason || 'COMPOSIO_UNREACHABLE')
+                          )
+                      }
+                    : {})
             }
         );
     }
@@ -1321,14 +1411,25 @@ export function createSponsorHub({
                     allowPrivateLan: false,
                     allowTailscale: false,
                     maxRedirects: 0,
-                    timeoutMs: 6000,
-                    tool: 'deadbolt.sponsors.foreman_tts'
+                    timeoutMs: 3500,
+                    tool: 'deadbolt.sponsors.foreman_tts',
+                    ...extraSafeFetchOpts
                 }
             );
 
             if (ttsRes.ok && ttsRes.data.status >= 200 && ttsRes.data.status < 300) {
+                let bodyTimer = null;
                 try {
-                    const mp3ArrayBuffer = await ttsRes.data.response.arrayBuffer();
+                    const bodyTimeoutPromise = new Promise((_, reject) => {
+                        bodyTimer = setTimeout(() => {
+                            reject(new Error('ELEVENLABS_BODY_TIMEOUT'));
+                        }, 3500);
+                        bodyTimer.unref?.();
+                    });
+                    const mp3ArrayBuffer = await Promise.race([
+                        ttsRes.data.response.arrayBuffer(),
+                        bodyTimeoutPromise
+                    ]);
                     if (mp3ArrayBuffer.byteLength > 0 && mp3ArrayBuffer.byteLength <= 5 * 1024 * 1024) {
                         const mp3Buffer = Buffer.from(mp3ArrayBuffer);
                         return okEnvelope(
@@ -1345,7 +1446,12 @@ export function createSponsorHub({
                         );
                     }
                 } catch {
+                    ttsRes.data.response.body?.cancel?.().catch?.(() => {});
                     /* fall through to deterministic PCM16 breaker chime */
+                } finally {
+                    if (bodyTimer !== null) {
+                        clearTimeout(bodyTimer);
+                    }
                 }
             }
         }
@@ -1432,7 +1538,7 @@ export function createSponsorHub({
                 allowPrivateLan: false,
                 allowTailscale: false,
                 maxRedirects: 0,
-                timeoutMs: 5000,
+                timeoutMs: 2500,
                 tool: 'deadbolt.sponsors.sofa_feedback',
                 ...extraSafeFetchOpts
             }

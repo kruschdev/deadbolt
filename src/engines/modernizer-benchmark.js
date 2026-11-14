@@ -6,16 +6,20 @@
  *   + <1ms Golden Brick Slop Breaker + Isolated Unified Diff Staging + 2-Family Cross-Model Verification + HydraDB SUPERSEDES writeback.
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { selectCascadeTier, DEFAULT_FLEET_CASCADE_TIERS } from '@krusch/toolkit/cascade';
 import { scoreLegoBrickCoverage } from '@krusch/toolkit/catalog';
 import { validateOutboundUrl } from '@krusch/toolkit/security';
 import { chat } from '@krusch/toolkit/llm';
 import { normalizeGitHubRepoInput } from './planner-graph.js';
+import { parseReviewerVerdictPayload } from './validator-gate.js';
+
+const execFileAsync = promisify(execFile);
 
 const SENSITIVE_LOCAL_PREFIXES = [
     '/etc',
@@ -450,7 +454,7 @@ export function createModernizerBenchmarkEngine({
             const { repoSlug, cleanHttpsUrl, displayTarget, hintedFile } = normalizedInput;
             const cloneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-mod-clone-'));
             try {
-                execFileSync(
+                await execFileAsync(
                     'git',
                     [
                         'clone',
@@ -463,8 +467,9 @@ export function createModernizerBenchmarkEngine({
                         cloneDir
                     ],
                     {
-                        timeout: 22_000,
-                        stdio: 'pipe',
+                        timeout: 12_000,
+                        killSignal: 'SIGKILL',
+                        maxBuffer: 4 * 1024 * 1024,
                         env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }
                     }
                 );
@@ -497,15 +502,25 @@ export function createModernizerBenchmarkEngine({
                 'deadbolt.modernizer'
             );
         }
-        if (!fs.existsSync(resolvedLocal) || !fs.statSync(resolvedLocal).isDirectory()) {
+        let realLocal = '';
+        try {
+            if (!fs.existsSync(resolvedLocal) || !fs.statSync(resolvedLocal).isDirectory()) {
+                return errorEnvelope(
+                    'DIRECTORY_NOT_FOUND',
+                    'Local repository path does not exist or is not a directory',
+                    { target: rawTrimmed },
+                    'deadbolt.modernizer'
+                );
+            }
+            realLocal = fs.realpathSync(resolvedLocal);
+        } catch {
             return errorEnvelope(
                 'DIRECTORY_NOT_FOUND',
-                'Local repository path does not exist or is not a directory',
+                'Local repository path does not exist or could not be resolved',
                 { target: rawTrimmed },
                 'deadbolt.modernizer'
             );
         }
-        const realLocal = fs.realpathSync(resolvedLocal);
         if (isSensitiveLocalPath(realLocal)) {
             return errorEnvelope(
                 'PATH_BLOCKED',
@@ -533,12 +548,17 @@ export function createModernizerBenchmarkEngine({
         const hydraStartedNs = process.hrtime.bigint();
         let openCypherEdgesSynced = 0;
         let openCypherLive = false;
+        let openCypherReachable = false;
         let cloudIngested = false;
         let cloudRequestId = null;
 
-        if (hydraGraphClient?.isConfigured?.() && typeof hydraGraphClient.queryOpenCypher === 'function') {
+        const canQueryOpenCypher =
+            Boolean(hydraGraphClient?.isConfigured?.()) &&
+            typeof hydraGraphClient.queryOpenCypher === 'function';
+
+        if (canQueryOpenCypher) {
             const boundedEdges = edges.slice(0, 14);
-            const mergePromises = boundedEdges.map((edge) => {
+            const mergeOneEdge = (edge) => {
                 // In our graph model: `edge.from` imports/requires `edge.to`, so `edge.to` is DEPENDED_ON_BY `edge.from`.
                 const srcId = deriveRepoVertexId(repoSlug, edge.to);
                 const dstId = deriveRepoVertexId(repoSlug, edge.from);
@@ -555,10 +575,25 @@ export function createModernizerBenchmarkEngine({
                     )
                     .then((res) => (res?.ok ? 1 : 0))
                     .catch(() => 0);
-            });
-            const counts = await Promise.all(mergePromises);
-            openCypherEdgesSynced = counts.reduce((a, b) => a + b, 0);
-            openCypherLive = openCypherEdgesSynced > 0 || boundedEdges.length === 0;
+            };
+
+            if (boundedEdges.length > 0) {
+                const firstSync = await mergeOneEdge(boundedEdges[0]);
+                if (firstSync === 1) {
+                    const restCounts =
+                        boundedEdges.length > 1
+                            ? await Promise.all(boundedEdges.slice(1).map(mergeOneEdge))
+                            : [];
+                    openCypherEdgesSynced = 1 + restCounts.reduce((a, b) => a + b, 0);
+                    openCypherLive = true;
+                    openCypherReachable = true;
+                } else {
+                    openCypherLive = false;
+                    openCypherReachable = false;
+                }
+            } else {
+                openCypherReachable = true;
+            }
         }
 
         const schemaFiles = fileEntries
@@ -612,11 +647,11 @@ export function createModernizerBenchmarkEngine({
 
         const fileMap = new Map(fileEntries.map((f) => [f.filePath, f.content]));
         const slicesByFile = new Map();
+        const dependentsByFile = new Map();
 
-        for (const item of wave) {
-            let openCypherDependents = [];
-            if (hydraGraphClient?.isConfigured?.() && typeof hydraGraphClient.queryOpenCypher === 'function') {
-                const startId = deriveRepoVertexId(repoSlug, item.filePath);
+        if (canQueryOpenCypher && openCypherReachable && wave.length > 0) {
+            const queryTwoHopForFile = async (filePath) => {
+                const startId = deriveRepoVertexId(repoSlug, filePath);
                 const blastRes = await hydraGraphClient
                     .queryOpenCypher(
                         [
@@ -627,13 +662,52 @@ export function createModernizerBenchmarkEngine({
                         { start: startId }
                     )
                     .catch(() => null);
-                if (blastRes?.ok && Array.isArray(blastRes.data?.records)) {
-                    openCypherDependents = blastRes.data.records
-                        .map((r) => String(r.filePath || '').trim())
-                        .filter(Boolean);
+                if (!blastRes?.ok) {
+                    return { ok: false, dependents: [] };
+                }
+                const dependents = Array.isArray(blastRes.data?.records)
+                    ? blastRes.data.records
+                          .map((r) => String(r.filePath || '').trim())
+                          .filter(Boolean)
+                    : [];
+                return { ok: true, dependents };
+            };
+
+            if (openCypherLive) {
+                const sliceResults = await Promise.all(
+                    wave.map(async (item) => [item.filePath, await queryTwoHopForFile(item.filePath)])
+                );
+                for (const [fp, res] of sliceResults) {
+                    dependentsByFile.set(fp, res.dependents);
+                }
+            } else {
+                // Zero-edge repo: probe first file once before fanning out remaining wave
+                const firstSlice = await queryTwoHopForFile(wave[0].filePath);
+                if (firstSlice.ok) {
+                    openCypherLive = true;
+                    dependentsByFile.set(wave[0].filePath, firstSlice.dependents);
+                    const restResults =
+                        wave.length > 1
+                            ? await Promise.all(
+                                  wave
+                                      .slice(1)
+                                      .map(async (item) => [
+                                          item.filePath,
+                                          await queryTwoHopForFile(item.filePath)
+                                      ])
+                              )
+                            : [];
+                    for (const [fp, res] of restResults) {
+                        dependentsByFile.set(fp, res.dependents);
+                    }
+                } else {
+                    openCypherLive = false;
                 }
             }
+        }
 
+        for (const item of wave) {
+            const openCypherDependents = dependentsByFile.get(item.filePath) || [];
             const neighborPaths = [
                 ...new Set([
                     ...item.outboundDeps,
@@ -760,15 +834,22 @@ export function createModernizerBenchmarkEngine({
                 if (edge.to) topPaths.add(edge.to);
             }
 
+            const resolvedRepoRoot = path.resolve(repoDir);
             const fileEntries = [];
             for (const relPath of topPaths) {
-                const abs = path.resolve(repoDir, relPath);
-                if (!abs.startsWith(path.resolve(repoDir) + path.sep)) continue;
-                if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+                const abs = path.resolve(resolvedRepoRoot, relPath);
+                if (!abs.startsWith(resolvedRepoRoot + path.sep)) continue;
+                try {
+                    const st = fs.lstatSync(abs);
+                    if (st.isSymbolicLink() || !st.isFile() || st.size > 262_144) continue;
+                    const buf = fs.readFileSync(abs);
+                    if (buf.subarray(0, 4096).includes(0)) continue;
                     fileEntries.push({
                         filePath: relPath,
-                        content: fs.readFileSync(abs, 'utf8')
+                        content: buf.toString('utf8')
                     });
+                } catch {
+                    // Skip vanished or unreadable files safely
                 }
             }
 
@@ -839,12 +920,34 @@ export function createModernizerBenchmarkEngine({
                       };
 
             async function callFrontierWithFailover(sysPrompt, usrPrompt, opts = {}) {
+                const { timeoutMs = 14_000, signal: externalSignal, ...restOpts } = opts;
+                if (externalSignal?.aborted) {
+                    return { res: null, usedCfg: frontierBackupConfig, failed: true };
+                }
+                const buildSignal = () =>
+                    externalSignal && !externalSignal.aborted
+                        ? AbortSignal.any([AbortSignal.timeout(timeoutMs), externalSignal])
+                        : AbortSignal.timeout(timeoutMs);
+
                 try {
-                    const primaryRes = await callImpl(sysPrompt, usrPrompt, frontierConfig, opts);
-                    return { res: primaryRes, usedCfg: frontierConfig };
+                    const primaryRes = await callImpl(sysPrompt, usrPrompt, frontierConfig, {
+                        ...restOpts,
+                        signal: buildSignal()
+                    });
+                    return { res: primaryRes, usedCfg: frontierConfig, failed: false };
                 } catch {
-                    const backupRes = await callImpl(sysPrompt, usrPrompt, frontierBackupConfig, opts);
-                    return { res: backupRes, usedCfg: frontierBackupConfig };
+                    if (externalSignal?.aborted) {
+                        return { res: null, usedCfg: frontierBackupConfig, failed: true };
+                    }
+                    try {
+                        const backupRes = await callImpl(sysPrompt, usrPrompt, frontierBackupConfig, {
+                            ...restOpts,
+                            signal: buildSignal()
+                        });
+                        return { res: backupRes, usedCfg: frontierBackupConfig, failed: false };
+                    } catch {
+                        return { res: null, usedCfg: frontierBackupConfig, failed: true };
+                    }
                 }
             }
 
@@ -937,7 +1040,7 @@ export function createModernizerBenchmarkEngine({
                             bypassCascade: true,
                             maxTokens: 900,
                             temperature: 0.1,
-                            signal: AbortSignal.timeout(16_000)
+                            timeoutMs: 14_000
                         });
                         const code =
                             extractCleanCodeBlock(res?.text) ||
@@ -979,7 +1082,7 @@ export function createModernizerBenchmarkEngine({
                         bypassCascade: true,
                         maxTokens: 250,
                         temperature: 0.0,
-                        signal: AbortSignal.timeout(14_000)
+                        timeoutMs: 12_000
                     });
                     reviewInTok = Number(revRes?.usage?.inputTokens || estimateTokenCount(revSys + revUsr));
                     reviewOutTok = Number(revRes?.usage?.outputTokens || 45);
@@ -1122,27 +1225,26 @@ export function createModernizerBenchmarkEngine({
                                 bypassCascade: true,
                                 maxTokens: 850,
                                 temperature: 0.0,
-                                signal: AbortSignal.timeout(isDomain ? 16_000 : 7_500)
+                                signal: AbortSignal.timeout(isDomain ? 14_000 : 7_500)
                             });
                         } catch {
                             // Automatic Cascade Circuit-Breaker failover (local GPU -> fast cloud, or primary frontier -> backup frontier)
                             usedCfg = isDomain ? frontierBackupConfig : cloudFastConfig;
-                            res = await callImpl(sysPrompt, usrPrompt, usedCfg, {
-                                returnFullResponse: true,
-                                bypassCascade: true,
-                                maxTokens: 850,
-                                temperature: 0.0,
-                                signal: AbortSignal.timeout(14_000)
-                            });
+                            try {
+                                res = await callImpl(sysPrompt, usrPrompt, usedCfg, {
+                                    returnFullResponse: true,
+                                    bypassCascade: true,
+                                    maxTokens: 850,
+                                    temperature: 0.0,
+                                    signal: AbortSignal.timeout(12_000)
+                                });
+                            } catch {
+                                res = null;
+                            }
                         }
 
                         let code = extractCleanCodeBlock(res?.text);
-                        let inTok = Number(res?.usage?.inputTokens || estimateTokenCount(sysPrompt + usrPrompt));
-                        let outTok = Number(res?.usage?.outputTokens || estimateTokenCount(code));
-                        let callCost = computeExactCallCostUsd(usedCfg.model, usedCfg.provider, {
-                            inputTokens: inTok,
-                            outputTokens: outTok
-                        });
+                        const inTok = Number(res?.usage?.inputTokens || estimateTokenCount(sysPrompt + usrPrompt));
 
                         // <1ms Deterministic Slop-Breaker Gate on generated module
                         const fileSlop = scoreLegoBrickCoverage([{ filePath: item.targetPath, content: code }]);
@@ -1155,6 +1257,12 @@ export function createModernizerBenchmarkEngine({
                                 neighborPaths: slice.neighborPaths
                             });
                         }
+
+                        const outTok = Number(res?.usage?.outputTokens || estimateTokenCount(code));
+                        const callCost = computeExactCallCostUsd(usedCfg.model, usedCfg.provider, {
+                            inputTokens: inTok,
+                            outputTokens: outTok
+                        });
 
                         return {
                             sourceFile: item.filePath,
@@ -1184,16 +1292,47 @@ export function createModernizerBenchmarkEngine({
                     repoDir,
                     edits
                 });
+                const stagedTaskId = stageEnv?.ok ? stageEnv.data?.taskId ?? null : null;
+                const stagedUnifiedDiff = stageEnv?.ok ? stageEnv.data?.unifiedDiff ?? '' : '';
+                if (stageEnv?.ok && stageEnv.data?.taskId) {
+                    try {
+                        foundry.releaseStage?.(stageEnv.data.taskId);
+                    } catch {
+                        // Best-effort cleanup of ephemeral stage scratch workspace
+                    }
+                }
 
                 const slopVerify = scoreLegoBrickCoverage(
                     fileReceipts.map((r) => ({ filePath: r.targetPath, content: r.code }))
                 );
 
                 // Stage 4: Separate-family 2-model cross-verification (DeepSeek + Gemini Flash-Lite)
+                const deterministicVerdict =
+                    slopVerify.data.slopFindingCount === 0 ? 'APPROVE' : 'REJECT';
+                const deterministicRationale =
+                    slopVerify.data.slopFindingCount === 0
+                        ? 'Deterministic Golden Brick verification passed with 0 slop findings.'
+                        : 'Slop Breaker tripped on generated candidate.';
+
                 let reviewData = {
+                    mode: 'offline_deterministic',
                     reviewers: [
-                        { family: 'deepseek', model: 'deepseek/deepseek-v4.1-flash', verdict: 'APPROVE' },
-                        { family: 'google-gemini', model: 'google/gemini-3.5-flash-lite', verdict: 'APPROVE' }
+                        {
+                            family: 'deepseek',
+                            model: 'deepseek/deepseek-v4.1-flash',
+                            mode: 'offline_deterministic',
+                            verdict: deterministicVerdict,
+                            rationale: deterministicRationale,
+                            costUsd: 0
+                        },
+                        {
+                            family: 'google-gemini',
+                            model: 'google/gemini-3.5-flash-lite',
+                            mode: 'offline_deterministic',
+                            verdict: deterministicVerdict,
+                            rationale: deterministicRationale,
+                            costUsd: 0
+                        }
                     ],
                     inputTokens: 0,
                     outputTokens: 0,
@@ -1223,16 +1362,18 @@ export function createModernizerBenchmarkEngine({
                                 bypassCascade: true,
                                 maxTokens: 220,
                                 temperature: 0.0,
-                                signal: AbortSignal.timeout(10_000)
+                                signal: AbortSignal.timeout(6_000)
                             }),
                             callImpl(revSys, revUsr, cfgB, {
                                 returnFullResponse: true,
                                 bypassCascade: true,
                                 maxTokens: 220,
                                 temperature: 0.0,
-                                signal: AbortSignal.timeout(10_000)
+                                signal: AbortSignal.timeout(6_000)
                             })
                         ]);
+                        const parsedA = parseReviewerVerdictPayload(rA?.text);
+                        const parsedB = parseReviewerVerdictPayload(rB?.text);
                         const inA = Number(rA?.usage?.inputTokens || 0);
                         const outA = Number(rA?.usage?.outputTokens || 0);
                         const inB = Number(rB?.usage?.inputTokens || 0);
@@ -1240,25 +1381,64 @@ export function createModernizerBenchmarkEngine({
                         const cA = computeExactCallCostUsd(cfgA.model, 'openrouter', rA?.usage);
                         const cB = computeExactCallCostUsd(cfgB.model, 'openrouter', rB?.usage);
                         reviewData = {
+                            mode: 'live_api',
                             reviewers: [
-                                { family: 'deepseek', model: cfgA.model, verdict: 'APPROVE', costUsd: cA },
-                                { family: 'google-gemini', model: cfgB.model, verdict: 'APPROVE', costUsd: cB }
+                                {
+                                    family: 'deepseek',
+                                    model: cfgA.model,
+                                    mode: 'live_api',
+                                    verdict: parsedA.verdict,
+                                    rationale: parsedA.rationale,
+                                    costUsd: cA
+                                },
+                                {
+                                    family: 'google-gemini',
+                                    model: cfgB.model,
+                                    mode: 'live_api',
+                                    verdict: parsedB.verdict,
+                                    rationale: parsedB.rationale,
+                                    costUsd: cB
+                                }
                             ],
                             inputTokens: inA + inB,
                             outputTokens: outA + outB,
                             costUsd: cA + cB
                         };
                     } catch {
-                        // Keep deterministic approval if reviewer call times out
+                        reviewData = {
+                            mode: 'deterministic_fallback_after_timeout',
+                            reviewers: reviewData.reviewers.map((r) => ({
+                                ...r,
+                                mode: 'deterministic_fallback_after_timeout'
+                            })),
+                            inputTokens: 0,
+                            outputTokens: 0,
+                            costUsd: 0
+                        };
                     }
                 }
 
-                // Write `:SUPERSEDES` migration edges back into HydraDB OpenCypher + Cloud feedback
-                const lineageWrite = await recordHydraSupersedesLineage({
-                    repoSlug,
-                    verifiedFiles: fileReceipts,
-                    cloudRequestId: hydraSlice.cloudRequestId
-                });
+                const allApprove = reviewData.reviewers.every((r) => r.verdict === 'APPROVE');
+                const hasDisagreement =
+                    new Set(reviewData.reviewers.map((r) => r.verdict)).size > 1;
+                const armBVerdict =
+                    slopVerify.data.slopFindingCount > 0
+                        ? 'REJECTED'
+                        : hasDisagreement
+                          ? 'ESCALATE_TO_HUMAN'
+                          : allApprove
+                            ? 'VERIFIED'
+                            : 'GATE_REJECTED';
+
+                // Write `:SUPERSEDES` migration edges back into HydraDB OpenCypher + Cloud feedback ONLY when VERIFIED
+                const lineageWrite =
+                    armBVerdict === 'VERIFIED'
+                        ? await recordHydraSupersedesLineage({
+                              repoSlug,
+                              verifiedFiles: fileReceipts,
+                              cloudRequestId: hydraSlice.cloudRequestId
+                          })
+                        : { lineageEdgesWritten: 0, skippedReason: armBVerdict };
 
                 const elapsedMs = Number((Number(process.hrtime.bigint() - armStartNs) / 1e6).toFixed(2));
                 const totalInputTokens =
@@ -1268,12 +1448,18 @@ export function createModernizerBenchmarkEngine({
                 const totalCostUsd = Number(
                     (fileReceipts.reduce((acc, r) => acc + r.costUsd, 0) + reviewData.costUsd).toFixed(6)
                 );
+                const costMeasurementMode = hasLiveApi
+                    ? 'live_measured'
+                    : 'offline_rate_sheet_estimate';
+                const costPerVerifiedTaskUsd =
+                    hasLiveApi && armBVerdict === 'VERIFIED' ? totalCostUsd : null;
 
                 return {
                     strategy: 'DEADBOLT (HydraDB 2-Hop Graph + <25us Cascade + Golden Bricks)',
                     modelSummary: `${fileReceipts.filter((r) => r.role === 'leaf_plumbing').length}x L1_FAST + ${fileReceipts.filter((r) => r.role === 'domain_seam').length}x L3_FRONTIER + 2-Family Review`,
                     contextMode: 'hydradb_2hop_sliced',
                     executionMode: hasLiveApi ? 'live_api' : 'offline_deterministic',
+                    reviewMode: reviewData.mode,
                     avgRoutingLatencyUs,
                     circuitBreakerEscalations,
                     filesProcessed: fileReceipts.length,
@@ -1281,14 +1467,17 @@ export function createModernizerBenchmarkEngine({
                     outputTokens: totalOutputTokens,
                     totalTokens: totalInputTokens + totalOutputTokens,
                     totalCostUsd,
+                    costPerVerifiedTaskUsd,
+                    costMeasurementMode,
                     elapsedMs,
                     slopFindingCount: slopVerify.data.slopFindingCount,
                     sealedCoveragePct: Math.round((slopVerify.data.sealedCoverageRatio ?? 1) * 100),
-                    verdict: slopVerify.data.slopFindingCount === 0 ? 'VERIFIED' : 'REJECTED',
-                    stagedTaskId: stageEnv.ok ? stageEnv.data.taskId : null,
-                    unifiedDiff: stageEnv.ok ? stageEnv.data.unifiedDiff : '',
+                    verdict: armBVerdict,
+                    stagedTaskId,
+                    unifiedDiff: stagedUnifiedDiff,
                     reviewers: reviewData.reviewers,
                     hydraSupersedesWritten: lineageWrite.lineageEdgesWritten,
+                    hydraSupersedesSkippedReason: lineageWrite.skippedReason || null,
                     fileReceipts: fileReceipts.map((r) => ({
                         sourceFile: r.sourceFile,
                         targetPath: r.targetPath,
@@ -1336,23 +1525,38 @@ export function createModernizerBenchmarkEngine({
                       ? 99.9
                       : 1.0;
 
+            const costMeasurementMode = hasLiveApi
+                ? 'live_measured'
+                : 'offline_rate_sheet_estimate';
+            const costPerVerifiedTaskUsd =
+                hasLiveApi && deadboltCascade.verdict === 'VERIFIED'
+                    ? deadboltCascade.totalCostUsd
+                    : null;
+
             let auditEntryHash = null;
             if (validator?.auditLog?.append) {
                 const appendRes = validator.auditLog.append({
                     tenantId: 'software-factory-8090',
                     actor: 'deadbolt-modernizer-benchmark',
-                    action: 'modernizer.verified',
+                    action:
+                        deadboltCascade.verdict === 'VERIFIED'
+                            ? 'modernizer.verified'
+                            : 'modernizer.rejected',
                     resource: String(repoSlug),
-                    outcome: 'SUCCESS',
+                    outcome: deadboltCascade.verdict === 'VERIFIED' ? 'SUCCESS' : 'DENIED',
                     metadata: {
+                        verdict: deadboltCascade.verdict,
                         filesModernized: routedWave.length,
                         hydraMode: hydraSlice.mode,
                         supersedesEdgesWritten: deadboltCascade.hydraSupersedesWritten,
                         inputTokenReductionPct: tokenSavingsPct,
                         costReductionPct: costSavingsPct,
+                        costSavingsPct,
                         costMultiplier,
                         singleFrontierCostUsd: singleFrontier.totalCostUsd,
                         deadboltCascadeCostUsd: deadboltCascade.totalCostUsd,
+                        costPerVerifiedTaskUsd,
+                        costMeasurementMode,
                         executionMode: deadboltCascade.executionMode
                     }
                 });
@@ -1363,10 +1567,14 @@ export function createModernizerBenchmarkEngine({
             const totalElapsedMs = Number(
                 (Number(process.hrtime.bigint() - totalStartNs) / 1e6).toFixed(2)
             );
+            const summaryText =
+                deadboltCascade.verdict === 'VERIFIED'
+                    ? `Modernized ${routedWave.length} file(s) from ${displayTarget}: DEADBOLT Cascade + HydraDB used ${tokenSavingsPct}% fewer prompt tokens and ${costSavingsPct}% lower cost (${costMultiplier}x cheaper) at 100% Golden Brick coverage.`
+                    : `Evaluated ${routedWave.length} file(s) from ${displayTarget}: Stage 4 Validator halted promotion with verdict ${deadboltCascade.verdict} (0 :SUPERSEDES lineage edges written).`;
 
             return okEnvelope(
                 'deadbolt.modernizer.compare',
-                `Modernized ${routedWave.length} file(s) from ${displayTarget}: DEADBOLT Cascade + HydraDB used ${tokenSavingsPct}% fewer prompt tokens and ${costSavingsPct}% lower cost (${costMultiplier}x cheaper) at 100% Golden Brick coverage.`,
+                summaryText,
                 {
                     target: displayTarget,
                     repoSlug,
@@ -1383,9 +1591,12 @@ export function createModernizerBenchmarkEngine({
                         filesModernized: routedWave.length,
                         inputTokenReductionPct: tokenSavingsPct,
                         costReductionPct: costSavingsPct,
+                        costSavingsPct,
                         costMultiplier,
                         singleFrontierCostUsd: singleFrontier.totalCostUsd,
                         deadboltCascadeCostUsd: deadboltCascade.totalCostUsd,
+                        costPerVerifiedTaskUsd,
+                        costMeasurementMode,
                         auditEntryHash,
                         auditChainValid: auditTrail?.ok ? Boolean(auditTrail.data?.valid) : true
                     },

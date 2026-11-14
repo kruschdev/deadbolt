@@ -28,9 +28,18 @@ function hydrateExternalEnvFile(filePath) {
 }
 
 hydrateExternalEnvFile(path.join(projectRoot, '.env'));
-hydrateExternalEnvFile(path.join(os.homedir(), '.evolve.env'));
+if (process.env.DEADBOLT_LOAD_HOME_ENV !== 'false' && process.env.NODE_ENV !== 'test') {
+    hydrateExternalEnvFile(path.join(os.homedir(), '.evolve.env'));
+}
+
+const PLACEHOLDER_HMAC_SECRETS = new Set([
+    'deadbolt-local-dev-hmac-change-in-prod',
+    'changeme',
+    'replace-me'
+]);
 
 const baseConfig = await loadProjectConfig(projectRoot, {
+    host: '127.0.0.1',
     port: 4090,
     serviceName: 'deadbolt',
     dbPath: path.join(projectRoot, 'data', 'deadbolt.db'),
@@ -46,7 +55,9 @@ const resolvedAuditDbPath = path.resolve(
 
 function resolvePersistentAuditHmacSecret(auditDbPath, explicitSecret) {
     const cleanExplicit = String(explicitSecret || '').trim();
-    if (cleanExplicit) return cleanExplicit;
+    if (cleanExplicit && !PLACEHOLDER_HMAC_SECRETS.has(cleanExplicit)) {
+        return cleanExplicit;
+    }
     if (!auditDbPath || auditDbPath === ':memory:') {
         return crypto.randomBytes(32).toString('hex');
     }
@@ -73,6 +84,7 @@ const defaultEnableLiveReviewers = Boolean(resolvedOpenRouterApiKey || resolvedG
 
 export const config = Object.freeze({
     projectRoot,
+    host: envOr('HOST', baseConfig.host, '127.0.0.1'),
     port: envInt('PORT', baseConfig.port, 4090),
     serviceName: envOr('SERVICE_NAME', baseConfig.serviceName, 'deadbolt'),
     dbPath: path.resolve(projectRoot, envOr('DB_PATH', baseConfig.dbPath, './data/deadbolt.db')),
@@ -81,13 +93,23 @@ export const config = Object.freeze({
     logDir: path.resolve(projectRoot, envOr('LOG_DIR', baseConfig.logDir, './logs')),
     kruschGitUrl: envOr('KRUSCH_GIT_URL', baseConfig.kruschGitUrl, 'http://127.0.0.1:4890'),
     ollamaUrl: envOr('OLLAMA_URL', baseConfig.ollamaUrl, 'http://127.0.0.1:11434'),
+    ollamaFastModel: envOr('OLLAMA_FAST_MODEL', baseConfig.ollamaFastModel, 'qwen2.5-coder:7b'),
+    frontierBenchmarkModel: envOr(
+        'FRONTIER_BENCHMARK_MODEL',
+        baseConfig.frontierBenchmarkModel,
+        'anthropic/claude-sonnet-5.5'
+    ),
+    preferCloudFastTier: envBool(
+        'PREFER_CLOUD_FAST_TIER',
+        baseConfig.preferCloudFastTier,
+        false
+    ),
     sofaApiBaseUrl: envOr('SOFA_API_BASE_URL', baseConfig.sofaApiBaseUrl, 'https://api.factory.8090.dev'),
     sofaMcpUrl: envOr('SOFA_MCP_URL', baseConfig.sofaMcpUrl, 'https://api.factory.8090.dev/v2/mcp'),
     sofaProjectId: envOr('SOFA_PROJECT_ID', baseConfig.sofaProjectId, ''),
     sofaApiKey: envOr('SOFA_API_KEY', baseConfig.sofaApiKey, ''),
     sofaAdminApiKey: envOr('SOFA_ADMIN_API_KEY', baseConfig.sofaAdminApiKey, ''),
     sofaReportingApiKey: envOr('SOFA_REPORTING_API_KEY', baseConfig.sofaReportingApiKey, ''),
-    vercelAiGatewayApiKey: envOr('AI_GATEWAY_API_KEY', baseConfig.vercelAiGatewayApiKey, ''),
     hydradbApiKey: envOr('HYDRADB_API_KEY', baseConfig.hydradbApiKey, ''),
     hydradbBaseUrl: envOr('HYDRADB_BASE_URL', baseConfig.hydradbBaseUrl, 'https://api.hydradb.com'),
     hydradbDatabase: envOr('HYDRADB_DATABASE', baseConfig.hydradbDatabase, 'default-tenant'),

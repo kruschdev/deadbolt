@@ -7,9 +7,11 @@ import { scoreLegoBrickCoverage } from '@krusch/toolkit/catalog';
 import {
     decodeHydraCell,
     decodeHydraQueryResult,
-    createHydraGraphClient
+    createHydraGraphClient,
+    scrubPrivateNetworkStrings
 } from '../src/connectors/hydradb-graph.js';
 import { createSponsorHub } from '../src/connectors/sponsors.js';
+import { parseReviewerVerdictPayload } from '../src/engines/validator-gate.js';
 import { createDeadboltOrchestrator } from '../src/orchestrator.js';
 import {
     DEADBOLT_MCP_TOOLS,
@@ -1289,4 +1291,192 @@ test('Judge surprise-repo edge cases: messy GitHub URLs, polyglot Java/Python/Go
         microMod.data.comparison.costMultiplier > 2,
         `Expected 1-file micro-repo costMultiplier > 2, got ${microMod.data.comparison.costMultiplier}`
     );
+});
+
+test('PE+CSO audit remediation regressions: private-IP scrubbing, fail-closed reviewer verdicts, aborted-signal failover, live reviewer disagreement gating, and MCP path/mode guards', async (t) => {
+    const osMod = await import('node:os');
+
+    // 1. SEC-01: Private/Tailscale IP redaction across HydraDB errors, /api/status, and /api/run/stream
+    const synthTailscale = ['100', '96', '42', '99'].join('.');
+    const synthLan = ['192', '168', '42', '99'].join('.');
+    const synthTen = ['10', '42', '42', '99'].join('.');
+    const scrubbedSample = scrubPrivateNetworkStrings({
+        msg: `Blocked connect to http://${synthTailscale}:8443 and ${synthLan} / ${synthTen}`,
+        nested: [`fd7a:115c:a1e0::dead:beef`]
+    });
+    const serializedScrubbed = JSON.stringify(scrubbedSample);
+    assert.equal(serializedScrubbed.includes(synthTailscale), false);
+    assert.equal(serializedScrubbed.includes(synthLan), false);
+    assert.equal(serializedScrubbed.includes(synthTen), false);
+    assert.equal(serializedScrubbed.includes('fd7a:115c:a1e0'), false);
+    assert.equal(serializedScrubbed.includes('[redacted-private-host]'), true);
+
+    const blockedHydra = createHydraGraphClient({
+        baseUrl: `http://${synthTailscale}:8443`,
+        allowTailscale: false,
+        timeoutMs: 800
+    });
+    const healthRes = await blockedHydra.healthz();
+    assert.equal(healthRes.ok, false);
+    assert.equal(JSON.stringify(healthRes).includes(synthTailscale), false);
+
+    const cypherRes = await blockedHydra.queryOpenCypher('MATCH (n) RETURN n LIMIT 1');
+    assert.equal(cypherRes.ok, false);
+    assert.equal(JSON.stringify(cypherRes).includes(synthTailscale), false);
+
+    // 2. SEC-02: parseReviewerVerdictPayload fails closed on empty, missing, unknown, and conflicting verdicts
+    const emptyVerdict = parseReviewerVerdictPayload('');
+    assert.equal(emptyVerdict.verdict, 'REJECT');
+    assert.equal(emptyVerdict.ambiguous, true);
+
+    const missingKeyVerdict = parseReviewerVerdictPayload('{}');
+    assert.equal(missingKeyVerdict.verdict, 'REJECT');
+    assert.equal(missingKeyVerdict.ambiguous, true);
+
+    const escalateJsonVerdict = parseReviewerVerdictPayload('{"verdict":"ESCALATE","rationale":"Unsure"}');
+    assert.equal(escalateJsonVerdict.verdict, 'REJECT');
+    assert.equal(escalateJsonVerdict.ambiguous, true);
+
+    const conflictingProse = parseReviewerVerdictPayload('Should I APPROVE or REJECT this patch?');
+    assert.equal(conflictingProse.verdict, 'REJECT');
+    assert.equal(conflictingProse.ambiguous, true);
+
+    const fencedApprove = parseReviewerVerdictPayload(
+        'Analysis complete:\n```json\n{"verdict":"APPROVE","rationale":"Integer cents verified; would REJECT if tolerance widened."}\n```'
+    );
+    assert.equal(fencedApprove.verdict, 'APPROVE');
+    assert.equal(fencedApprove.ambiguous, false);
+
+    // 3. SEC-02 & SEC-03: MCP path traversal & invalid validation mode guards + unpinned outbound URL guard
+    const guardOrch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        config: {
+            hydraDbGraphUrl: `http://${synthTailscale}:8443`,
+            hydraDbAllowTailscale: false,
+            enableLiveReviewers: false
+        }
+    });
+    t.after(() => guardOrch.close());
+
+    const statusPayload = JSON.stringify(await guardOrch.getStatus());
+    assert.equal(statusPayload.includes(synthTailscale), false);
+
+    const invalidModeOrch = await guardOrch.validateModeOrEdits({
+        workOrderId: 'WO-101',
+        mode: 'unexpected_mode'
+    });
+    assert.equal(invalidModeOrch.ok, false);
+    assert.equal(invalidModeOrch.error.code, 'INVALID_VALIDATION_MODE');
+
+    const mcp = await createDeadboltMcp({ orchestrator: guardOrch, connect: false });
+    const blockedPathRes = await mcp.callTool({
+        params: {
+            name: 'deadbolt_map_blast_radius',
+            arguments: { repoDir: '/etc', changedFile: 'passwd' }
+        }
+    });
+    const blockedPathEnv = JSON.parse(blockedPathRes.content[0].text);
+    assert.equal(blockedPathEnv.ok, false);
+    assert.equal(blockedPathEnv.error.code, 'PATH_BLOCKED');
+
+    const invalidMcpModeRes = await mcp.callTool({
+        params: {
+            name: 'deadbolt_validate_reconciliation',
+            arguments: { workOrderId: 'WO-101', mode: 'bogus_mode' }
+        }
+    });
+    assert.equal(invalidMcpModeRes.isError, true);
+    const invalidMcpModeEnv = JSON.parse(invalidMcpModeRes.content[0].text);
+    assert.equal(invalidMcpModeEnv.ok, false);
+    assert.equal(invalidMcpModeEnv.error.code, 'INVALID_ARGUMENTS');
+
+    const sponsorHub = createSponsorHub({
+        config: {
+            composioApiKey: 'ck_test_dummy_key',
+            composioBaseUrl: 'https://backend.composio.dev/api/v3',
+            composioMcpUrl: 'https://connect.composio.dev/mcp'
+        }
+    });
+    const unpinnedRes = await sponsorHub.dispatchVerifiedPullRequest({
+        workOrderId: 'WO-101',
+        validatorVerdict: 'VERIFIED',
+        auditChainValid: true,
+        auditReceipt: { entryHash: 'a'.repeat(64) },
+        title: '[WO-101] Safe patch',
+        diffSummary: '+ const carry = 1;',
+        outboundUrlOverride: 'https://evil-collector.example.com/hook'
+    });
+    assert.equal(unpinnedRes.ok, false);
+    assert.equal(unpinnedRes.error.code, 'COMPOSIO_BLOCKED_SSRF');
+    assert.equal(unpinnedRes.error.details.layer, 3);
+
+    // 4. BUG-01 & GOV-01: Modernizer survives dual AbortError failover AND halts :SUPERSEDES on live reviewer disagreement
+    const sampleRepoDir = fs.mkdtempSync(path.join(osMod.default.tmpdir(), 'deadbolt-audit-reg-'));
+    t.after(() => fs.rmSync(sampleRepoDir, { recursive: true, force: true }));
+    fs.writeFileSync(
+        path.join(sampleRepoDir, 'billing.js'),
+        'export function computeTotal(items) { return items.reduce((s, x) => s + Number(x.cents || 0), 0); }\n',
+        'utf8'
+    );
+
+    const abortingOrch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        config: {
+            enableLiveReviewers: true,
+            openRouterApiKey: 'sk-or-mock-abort-test'
+        },
+        chatImpl: async () => {
+            const abortErr = new Error('Simulated primary/backup AbortSignal timeout');
+            abortErr.name = 'AbortError';
+            throw abortErr;
+        }
+    });
+    t.after(() => abortingOrch.close());
+
+    const abortModRes = await abortingOrch.modernizeRepository({ repoUrlOrPath: sampleRepoDir });
+    assert.equal(abortModRes.ok, true, 'Modernizer must degrade cleanly when both primary and backup LLMs abort');
+    assert.equal(abortModRes.data.deadboltCascade.sealedCoveragePct, 100);
+    assert.ok(abortModRes.data.deadboltCascade.circuitBreakerEscalations >= 1);
+
+    const disagreeOrch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        config: {
+            enableLiveReviewers: true,
+            openRouterApiKey: 'sk-or-mock-disagree-test'
+        },
+        chatImpl: async (_sys, _usr, cfg) => {
+            if (cfg?.model === 'deepseek/deepseek-v4.1-flash') {
+                return {
+                    text: '{"verdict":"REJECT","rationale":"Detected rounding drift risk in fee path."}',
+                    usage: { inputTokens: 120, outputTokens: 28 }
+                };
+            }
+            if (cfg?.model === 'google/gemini-3.5-flash-lite') {
+                return {
+                    text: '{"verdict":"APPROVE","rationale":"Sealed envelope looks structurally valid."}',
+                    usage: { inputTokens: 120, outputTokens: 24 }
+                };
+            }
+            return {
+                text: "import { okEnvelope } from '@krusch/toolkit/http';\nexport function computeTotal(items = []) {\n  const cents = items.reduce((s, x) => s + Math.trunc(Number(x?.cents || 0)), 0);\n  return okEnvelope('billing.computeTotal', 'Computed integer cents.', { cents });\n}\n",
+                usage: { inputTokens: 200, outputTokens: 65 }
+            };
+        }
+    });
+    t.after(() => disagreeOrch.close());
+
+    const disagreeModRes = await disagreeOrch.modernizeRepository({ repoUrlOrPath: sampleRepoDir });
+    assert.equal(disagreeModRes.ok, true);
+    assert.equal(disagreeModRes.data.deadboltCascade.reviewMode, 'live_api');
+    assert.equal(disagreeModRes.data.deadboltCascade.verdict, 'ESCALATE_TO_HUMAN');
+    assert.equal(disagreeModRes.data.deadboltCascade.hydraSupersedesWritten, 0);
+    assert.equal(disagreeModRes.data.deadboltCascade.costPerVerifiedTaskUsd, null);
+    assert.equal(disagreeModRes.data.comparison.costPerVerifiedTaskUsd, null);
+
+    const disagreeAudit = disagreeOrch.getAuditStatus({ limit: 5 });
+    assert.equal(disagreeAudit.ok, true);
+    assert.equal(disagreeAudit.data.valid, true);
+    const latestEntry = disagreeAudit.data.entries[0];
+    assert.equal(latestEntry.action, 'modernizer.rejected');
+    assert.equal(latestEntry.outcome, 'DENIED');
 });

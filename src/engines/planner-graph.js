@@ -7,16 +7,20 @@
  * - SSRF-guarded external GitHub & local repository brownfield scanner
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { maskCodePreservingNewlines } from 'krusch-stack';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { selectCascadeTier, createTierCircuitBreaker } from '@krusch/toolkit/cascade';
 import { scoreLegoBrickCoverage, auditBoilerplateText } from '@krusch/toolkit/catalog';
 import { validateOutboundUrl, isPrivateOrReservedIp } from '@krusch/toolkit/security';
+
+const execFileAsync = promisify(execFile);
 
 const SCANNABLE_EXTENSIONS = new Set([
   '.js',
@@ -66,12 +70,14 @@ const SKIPPED_SCAN_DIRS = new Set([
 
 const SENSITIVE_LOCAL_PREFIXES = [
   '/etc',
+  '/private/etc',
   '/root',
   '/proc',
   '/sys',
   '/dev',
   '/boot',
   '/var/run',
+  '/private/var/run',
   '/run'
 ];
 
@@ -100,7 +106,7 @@ const RESERVED_GITHUB_ROOTS = new Set([
   'about',
   'codespaces',
   'collections',
-  ' customer-stories',
+  'customer-stories',
   'enterprise',
   'events',
   'explore',
@@ -120,7 +126,7 @@ const RESERVED_GITHUB_ROOTS = new Set([
   'settings',
   'signup',
   'sponsors',
-  ' team',
+  'team',
   'topics',
   'trending'
 ]);
@@ -363,6 +369,87 @@ function redactEndpointUrl(rawUrl) {
   } catch {
     return '[redacted-endpoint]';
   }
+}
+
+/**
+ * Redact RFC1918 LAN, CGNAT/Tailscale IPv4, and Tailscale/ULA IPv6 literals from error messages (`INV-DB-08`).
+ * @param {string} text
+ * @returns {string}
+ */
+export function scrubPrivateIpLiterals(text) {
+  return String(text ?? '')
+    .replace(/\[?fd7a:115c:a1e0:[0-9a-f:]*\]?/gi, '[redacted-private-host]')
+    .replace(/\[?f[cd][0-9a-f]{2}:(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4}\]?/gi, '[redacted-private-host]')
+    .replace(
+      /(?<![\d.])(?:::ffff:)?(?:10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+)(?!\d)/gi,
+      '[redacted-private-host]'
+    );
+}
+
+/**
+ * Query all indexed AST symbols for `repoName` in a single pass and group by normalized file path (`O(N)`),
+ * eliminating per-file `stack.git.fileSymbols` synchronous re-indexing storms on polyglot/empty files.
+ * @param {object} stack
+ * @param {string} repoName
+ * @returns {Map<string, Array<object>>}
+ */
+function loadAllRepoSymbolsByFile(stack, repoName) {
+  const byFile = new Map();
+  let rows = null;
+
+  if (stack?.db?.prepare) {
+    try {
+      rows = stack.db
+        .prepare(
+          'SELECT file_path, symbol_name, symbol_type, start_line, end_line, signature FROM git_symbols WHERE repo_name = ? ORDER BY start_line ASC'
+        )
+        .all(repoName);
+    } catch {
+      try {
+        rows = stack.db
+          .prepare(
+            'SELECT file_path, symbol_name, symbol_kind, start_line, end_line, signature, exported FROM git_symbols WHERE repo_name = ? ORDER BY start_line ASC'
+          )
+          .all(repoName);
+      } catch {
+        rows = null;
+      }
+    }
+  }
+
+  if (!Array.isArray(rows)) {
+    try {
+      const searchRes = stack?.git?.searchSymbols?.({ repo: repoName, query: '*', limit: 1000 });
+      rows = Array.isArray(searchRes?.data?.symbols) ? searchRes.data.symbols : [];
+    } catch {
+      rows = [];
+    }
+  }
+
+  for (const row of rows) {
+    if (!row) continue;
+    const normFile = normalizeRelPath(row.file_path);
+    if (!normFile) continue;
+    const symType = row.symbol_type ?? row.symbol_kind ?? 'symbol';
+    const normalizedSym = {
+      ...row,
+      file_path: normFile,
+      symbol_name: row.symbol_name,
+      symbol_type: symType,
+      symbol_kind: row.symbol_kind ?? symType,
+      start_line: row.start_line,
+      end_line: row.end_line,
+      signature: row.signature ?? ''
+    };
+    let list = byFile.get(normFile);
+    if (!list) {
+      list = [];
+      byFile.set(normFile, list);
+    }
+    list.push(normalizedSym);
+  }
+
+  return byFile;
 }
 
 /**
@@ -1121,17 +1208,28 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
    * @param {string} repoName
    */
   function buildRepositoryDependencyModel(resolvedRepoDir, repoName) {
-    const indexRes = stack.git.indexRepo({
-      path: resolvedRepoDir,
-      repoPath: resolvedRepoDir,
-      name: repoName,
-      repoName
-    });
-
-    const treeRes = stack.git.readTree({ repo: repoName, path: '' });
-    const rootTreeEntries = Array.isArray(treeRes?.data?.entries) ? treeRes.data.entries : [];
+    let indexRes = null;
+    try {
+      indexRes = stack.git.indexRepo({
+        path: resolvedRepoDir,
+        repoPath: resolvedRepoDir,
+        name: repoName,
+        repoName
+      });
+    } catch {
+      indexRes = null;
+    }
 
     const allFiles = collectRepoCodeFiles(resolvedRepoDir, 250);
+    let rootTreeEntries = [];
+    try {
+      const treeRes = stack.git.readTree({ repo: repoName, path: '' });
+      rootTreeEntries = Array.isArray(treeRes?.data?.entries) ? treeRes.data.entries : [];
+    } catch {
+      const topSegments = new Set(allFiles.map((rel) => rel.split('/')[0]).filter(Boolean));
+      rootTreeEntries = [...topSegments].map((name) => ({ name, path: name }));
+    }
+
     const repoFileSet = new Set(allFiles);
 
     // Map each file -> its declared symbols, and build inbound/outbound file dependency maps
@@ -1170,9 +1268,14 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
     for (const relFile of allFiles) {
       const ext = path.extname(relFile).toLowerCase();
       if (ext === '.py') continue;
+      const abs = path.join(resolvedRepoDir, relFile);
       let content = '';
       try {
-        content = fs.readFileSync(path.join(resolvedRepoDir, relFile), 'utf8');
+        const st = fs.lstatSync(abs);
+        if (st.isSymbolicLink() || !st.isFile() || st.size > 262_144) continue;
+        const buf = fs.readFileSync(abs);
+        if (buf.subarray(0, 4096).includes(0)) continue;
+        content = buf.toString('utf8');
       } catch {
         continue;
       }
@@ -1197,9 +1300,10 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       }
     }
 
-    // 2. Walk AST symbols (`stack.git` for JS/TS/PY + PHP symbol/call extractor for `.php`)
+    // 2. Walk AST symbols (`stack.git` one-shot map for JS/TS/PY + PHP symbol/call extractor for `.php`)
     let totalSymbols = 0;
     const phpDeclaredSymbolOwner = new Map();
+    const indexedSymbolsByFile = loadAllRepoSymbolsByFile(stack, repoName);
 
     for (const relFile of allFiles) {
       const ext = path.extname(relFile).toLowerCase();
@@ -1219,8 +1323,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         continue;
       }
 
-      const fileSymRes = stack.git.fileSymbols({ repo: repoName, file_path: relFile });
-      const syms = Array.isArray(fileSymRes?.data?.symbols) ? fileSymRes.data.symbols : [];
+      const syms = indexedSymbolsByFile.get(normalizeRelPath(relFile)) || [];
       symbolsByFile.set(relFile, syms);
       totalSymbols += syms.length;
 
@@ -1322,13 +1425,15 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         ...(remoteRepoCount !== null ? { remoteRepoCount } : {})
       };
     } catch (err) {
+      const scrubbedError = scrubPrivateIpLiterals(String(err?.message || 'unreachable'));
       return {
         configured: true,
         connected: false,
         healthy: false,
         mode: 'embedded_sqlite_ast_fallback',
         baseUrl: safeBaseUrl,
-        reason: String(err?.message || 'Remote KruschGit unreachable')
+        error: scrubbedError,
+        reason: scrubbedError
       };
     }
   }
@@ -1357,17 +1462,53 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
     }
 
     const resolvedRepoDir = path.resolve(repoDir);
-    if (!fs.existsSync(resolvedRepoDir) || !fs.statSync(resolvedRepoDir).isDirectory()) {
+    if (isSensitiveLocalPath(resolvedRepoDir)) {
       return errorEnvelope(
-        'REPO_DIR_NOT_FOUND',
+        'PATH_BLOCKED',
+        'Blast-radius indexing of sensitive system or credential directories is forbidden',
+        null,
+        'deadbolt.planner.blast_radius'
+      );
+    }
+
+    let realRepoDir;
+    try {
+      realRepoDir = fs.realpathSync(resolvedRepoDir);
+    } catch {
+      return errorEnvelope(
+        'DIRECTORY_NOT_FOUND',
         'Target repository directory does not exist',
         { repoName },
         'deadbolt.planner.blast_radius'
       );
     }
 
+    if (isSensitiveLocalPath(realRepoDir)) {
+      return errorEnvelope(
+        'PATH_BLOCKED',
+        'Blast-radius indexing of sensitive system or credential directories is forbidden',
+        null,
+        'deadbolt.planner.blast_radius'
+      );
+    }
+
+    let realRepoStat = null;
+    try {
+      realRepoStat = fs.statSync(realRepoDir);
+    } catch {
+      realRepoStat = null;
+    }
+    if (!realRepoStat || !realRepoStat.isDirectory()) {
+      return errorEnvelope(
+        'DIRECTORY_NOT_FOUND',
+        'Target repository directory does not exist or is not a directory',
+        { repoName },
+        'deadbolt.planner.blast_radius'
+      );
+    }
+
     const normalizedEntry = normalizeRelPath(entryFile || 'src/fee-engine.js');
-    const model = buildRepositoryDependencyModel(resolvedRepoDir, repoName);
+    const model = buildRepositoryDependencyModel(realRepoDir, repoName);
     const {
       indexRes,
       rootTreeEntries,
@@ -1711,7 +1852,9 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
     let tempCloneDir = null;
     let scanRoot = '';
-    let scanRepoName = 'scanned-repo';
+    const scanRepoName = `scan-${crypto.randomUUID().slice(0, 8)}`;
+    let localDisplayName = 'scanned-repo';
+    let didIndexScanRepo = false;
 
     try {
       if (normalizedInput.isRemoteCandidate) {
@@ -1744,11 +1887,10 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         }
 
         const { repoSlug, cleanHttpsUrl } = normalizedInput;
-        scanRepoName = repoSlug.replace(/\//g, '__');
 
         tempCloneDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-scan-'));
         try {
-          execFileSync(
+          await execFileAsync(
             'git',
             [
               'clone',
@@ -1761,8 +1903,9 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
               tempCloneDir
             ],
             {
-              timeout: 20_000,
-              stdio: 'pipe',
+              timeout: 12_000,
+              killSignal: 'SIGKILL',
+              maxBuffer: 8 * 1024 * 1024,
               env: {
                 ...process.env,
                 GIT_TERMINAL_PROMPT: '0'
@@ -1772,7 +1915,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         } catch (cloneErr) {
           return errorEnvelope(
             'GIT_CLONE_FAILED',
-            `Shallow git clone failed for ${repoSlug}: ${cloneErr?.message || 'clone error'}`,
+            `Shallow git clone failed for ${repoSlug}: ${scrubPrivateIpLiterals(String(cloneErr?.message || 'clone error'))}`,
             { repo: repoSlug },
             'deadbolt.planner.repo_scan'
           );
@@ -1789,7 +1932,18 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           );
         }
 
-        if (!fs.existsSync(resolvedCandidate) || !fs.statSync(resolvedCandidate).isDirectory()) {
+        let realDir = '';
+        try {
+          realDir = fs.realpathSync(resolvedCandidate);
+          if (!fs.statSync(realDir).isDirectory()) {
+            return errorEnvelope(
+              'DIRECTORY_NOT_FOUND',
+              'Local repository path does not exist or is not a directory',
+              null,
+              'deadbolt.planner.repo_scan'
+            );
+          }
+        } catch {
           return errorEnvelope(
             'DIRECTORY_NOT_FOUND',
             'Local repository path does not exist or is not a directory',
@@ -1798,7 +1952,6 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           );
         }
 
-        const realDir = fs.realpathSync(resolvedCandidate);
         if (isSensitiveLocalPath(realDir)) {
           return errorEnvelope(
             'PATH_BLOCKED',
@@ -1809,7 +1962,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         }
 
         scanRoot = realDir;
-        scanRepoName = path.basename(realDir) || 'local-scan';
+        localDisplayName = path.basename(realDir) || 'local-scan';
       }
 
       const scanStartNs = process.hrtime.bigint();
@@ -1834,9 +1987,14 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       };
 
       for (const relFile of relFiles) {
+        const abs = path.join(scanRoot, relFile);
         let content = '';
         try {
-          content = fs.readFileSync(path.join(scanRoot, relFile), 'utf8');
+          const st = fs.lstatSync(abs);
+          if (st.isSymbolicLink() || !st.isFile() || st.size > 262_144) continue;
+          const buf = fs.readFileSync(abs);
+          if (buf.subarray(0, 4096).includes(0)) continue;
+          content = buf.toString('utf8');
         } catch {
           continue;
         }
@@ -1874,7 +2032,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
       let boundedIndexDir = null;
       let indexTargetRoot = scanRoot;
-      if (fileEntries.length >= safeMaxFiles) {
+      if (fileEntries.length >= safeMaxFiles || fileEntries.length < relFiles.length) {
         boundedIndexDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-bounded-idx-'));
         for (const entry of fileEntries) {
           const destAbs = path.resolve(boundedIndexDir, entry.filePath);
@@ -1888,6 +2046,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
       let indexRes = null;
       try {
+        didIndexScanRepo = true;
         indexRes = stack.git.indexRepo({
           path: indexTargetRoot,
           repoPath: indexTargetRoot,
@@ -1904,13 +2063,11 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         }
       }
 
+      const indexedSymbolsByFile = loadAllRepoSymbolsByFile(stack, scanRepoName);
+
       let fallbackPolyglotSymbols = 0;
       for (const [relFile, polySyms] of polyglotSymbolsByFile.entries()) {
-        const symRes = stack.git.fileSymbols({
-          repo: scanRepoName,
-          file_path: relFile
-        });
-        const indexedSyms = Array.isArray(symRes?.data?.symbols) ? symRes.data.symbols : [];
+        const indexedSyms = indexedSymbolsByFile.get(normalizeRelPath(relFile)) || [];
         if (indexedSyms.length === 0) {
           fallbackPolyglotSymbols += polySyms.length;
         }
@@ -1922,11 +2079,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           ext === '.php'
             ? phpSymbolsByFile.get(entry.filePath) || []
             : (() => {
-                const symRes = stack.git.fileSymbols({
-                  repo: scanRepoName,
-                  file_path: entry.filePath
-                });
-                const indexed = Array.isArray(symRes?.data?.symbols) ? symRes.data.symbols : [];
+                const indexed = indexedSymbolsByFile.get(normalizeRelPath(entry.filePath)) || [];
                 if (indexed.length > 0) return indexed;
                 return polyglotSymbolsByFile.get(entry.filePath) || [];
               })();
@@ -1975,7 +2128,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       const elapsedMs = Number((Number(process.hrtime.bigint() - scanStartNs) / 1e6).toFixed(3));
       const displayTarget = normalizedInput.isRemoteCandidate
         ? normalizedInput.displayTarget
-        : scanRepoName;
+        : localDisplayName;
 
       const summary = `Scanned ${fileEntries.length} file(s) and ${symbolCount} AST symbol(s) in ${displayTarget} (${mergedSlopAudit.slopFindingCount} slop finding(s), ${elapsedMs}ms).`;
 
@@ -1992,6 +2145,15 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         cloneElapsedMs
       });
     } finally {
+      if (didIndexScanRepo && stack?.db?.prepare) {
+        try {
+          stack.db.prepare('DELETE FROM git_symbols WHERE repo_name = ?').run(scanRepoName);
+          stack.db.prepare('DELETE FROM git_edges WHERE repo_name = ?').run(scanRepoName);
+          stack.db.prepare('DELETE FROM git_repositories WHERE name = ?').run(scanRepoName);
+        } catch {
+          // Best-effort cleanup of ephemeral SQLite scan rows
+        }
+      }
       if (tempCloneDir) {
         try {
           fs.rmSync(tempCloneDir, { recursive: true, force: true });

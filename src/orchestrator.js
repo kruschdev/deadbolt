@@ -34,7 +34,14 @@ import { createSponsorHub } from './connectors/sponsors.js';
 import { DEADBOLT_MCP_PERMISSION_TABLE } from './mcp/deadbolt-mcp.js';
 
 function resolvePresetEdits(mode = 'remediated') {
-    const normalized = String(mode || 'remediated').trim().toLowerCase();
+    const normalized = String(mode ?? 'remediated').trim().toLowerCase();
+    if (!normalized || normalized === 'remediated' || normalized === 'attempt3') {
+        return {
+            resolvedMode: 'remediated',
+            attemptLabel: 'attempt_3_verified_remediation',
+            edits: CANDIDATE_PATCHES.verifiedRemediationPatch
+        };
+    }
     if (normalized === 'naive' || normalized === 'attempt1') {
         return {
             resolvedMode: 'naive',
@@ -49,11 +56,7 @@ function resolvePresetEdits(mode = 'remediated') {
             edits: CANDIDATE_PATCHES.sneakyWorkaroundPatch
         };
     }
-    return {
-        resolvedMode: 'remediated',
-        attemptLabel: 'attempt_3_verified_remediation',
-        edits: CANDIDATE_PATCHES.verifiedRemediationPatch
-    };
+    return null;
 }
 
 function resolveUntrustedTicketSnippet() {
@@ -162,8 +165,8 @@ export async function createDeadboltOrchestrator(options = {}) {
             baseUrl: activeConfig.hydradbBaseUrl || 'https://api.hydradb.com',
             database: activeConfig.hydradbDatabase || 'default-tenant',
             collection: activeConfig.hydradbCollection || 'work_orders',
-            timeoutMs: 8000,
-            maxRetries: 1
+            timeoutMs: 2500,
+            maxRetries: 0
         });
 
     const hydraGraphClient =
@@ -176,7 +179,7 @@ export async function createDeadboltOrchestrator(options = {}) {
             namespace: activeConfig.hydradbNamespace || 'default',
             allowPrivateLan: Boolean(activeConfig.hydradbAllowLan),
             allowTailscale: Boolean(activeConfig.hydradbAllowLan),
-            timeoutMs: 5000
+            timeoutMs: 2000
         });
 
     const kruschGitClient =
@@ -185,6 +188,7 @@ export async function createDeadboltOrchestrator(options = {}) {
             : activeConfig.kruschGitUrl
               ? createKruschGitClient({
                     baseUrl: activeConfig.kruschGitUrl,
+                    apiKey: '',
                     timeoutMs: 1200
                 })
               : null;
@@ -240,17 +244,41 @@ export async function createDeadboltOrchestrator(options = {}) {
         }
     });
 
-    // Seed organizational context once at startup so GET /api/status and MCP tools are warm immediately
+    // Seed organizational context once at startup (cap startup network wait at 1500ms so listen/MCP never hangs)
     let seededOnce = false;
+    let seedInFlight = null;
     async function ensureSeeded() {
         if (seededOnce) return;
-        await refinery.seedOrganizationalContext({ repoDir: billingRepoDir });
-        seededOnce = true;
+        if (!seedInFlight) {
+            seedInFlight = refinery
+                .seedOrganizationalContext({ repoDir: billingRepoDir })
+                .then(() => {
+                    seededOnce = true;
+                })
+                .finally(() => {
+                    seedInFlight = null;
+                });
+        }
+        return seedInFlight;
     }
-    await ensureSeeded();
+    await Promise.race([ensureSeeded(), waitAbortable(1500)]);
 
+    const MAX_VERIFIED_TASKS = 64;
     /** @type {Map<string, { workOrderId: string, validationData: object, unifiedDiff: string }>} */
     const verifiedTasks = new Map();
+    function rememberVerifiedTask(taskId, entry) {
+        while (verifiedTasks.size >= MAX_VERIFIED_TASKS) {
+            const oldestId = verifiedTasks.keys().next().value;
+            if (!oldestId) break;
+            verifiedTasks.delete(oldestId);
+            try {
+                foundry.releaseStage?.(oldestId);
+            } catch {
+                /* ignore stage cleanup error */
+            }
+        }
+        verifiedTasks.set(taskId, entry);
+    }
     let lastRunReceipt = null;
     let closed = false;
 
@@ -370,6 +398,14 @@ export async function createDeadboltOrchestrator(options = {}) {
     } = {}) {
         const hasCustomEdits = Array.isArray(edits) && edits.length > 0;
         const preset = resolvePresetEdits(mode);
+        if (!hasCustomEdits && !preset) {
+            return errorEnvelope(
+                'INVALID_VALIDATION_MODE',
+                `Unsupported validation mode "${String(mode)}". Expected naive, workaround, or remediated.`,
+                { mode },
+                'deadbolt.validator.validate'
+            );
+        }
         const candidateEdits = hasCustomEdits ? edits : preset.edits;
         const attemptLabel = hasCustomEdits ? 'custom_candidate_edits' : preset.attemptLabel;
 
@@ -395,7 +431,7 @@ export async function createDeadboltOrchestrator(options = {}) {
             });
             if (stageEnv.ok) {
                 stagedTaskId = stageEnv.data.taskId;
-                verifiedTasks.set(stagedTaskId, {
+                rememberVerifiedTask(stagedTaskId, {
                     workOrderId,
                     validationData: valEnv.data,
                     unifiedDiff: stageEnv.data.unifiedDiff || ''
@@ -453,6 +489,12 @@ export async function createDeadboltOrchestrator(options = {}) {
             taskId: cleanTaskId,
             applyToRepoDir: false
         });
+        verifiedTasks.delete(cleanTaskId);
+        try {
+            foundry.releaseStage?.(cleanTaskId);
+        } catch {
+            /* ignore cleanup error */
+        }
         if (!applyEnv.ok) {
             return applyEnv;
         }
@@ -519,7 +561,16 @@ export async function createDeadboltOrchestrator(options = {}) {
 
         // Isolated clean target copy per head-to-head run so concurrent or repeated stage runs stay idempotent
         const runScratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-run-'));
+        let stagedHeadToHeadTaskId = null;
+        const makeAbortResult = () =>
+            errorEnvelope(
+                'RUN_ABORTED',
+                `Head-to-head governance stream for ${targetWo.id} was aborted by caller.`,
+                { workOrderId: targetWo.id },
+                'deadbolt.orchestrator.run'
+            );
         try {
+            if (signal?.aborted) return makeAbortResult();
             materializeBillingRepo(runScratchDir);
 
             // Baseline column: Standard Single-Model Agent (modifies fee-engine.js with naive per-line Math.round)
@@ -543,6 +594,8 @@ export async function createDeadboltOrchestrator(options = {}) {
                 costPerVerifiedTaskUsd: null
             };
 
+            if (signal?.aborted) return makeAbortResult();
+
             // Stage 1: REFINERY
             const refineryEnv = await hydrateWorkOrder({
                 workOrderId: targetWo.id,
@@ -553,6 +606,7 @@ export async function createDeadboltOrchestrator(options = {}) {
                 ...refineryEnv.data
             });
             await emitBeat('refinery', refineryBeat);
+            if (signal?.aborted) return makeAbortResult();
 
             // Stage 2: PLANNER (2-hop AST + <25us Cascade + parallel leases + HydraDB OpenCypher sync)
             const plannerEnv = await mapBlastRadius({
@@ -560,6 +614,7 @@ export async function createDeadboltOrchestrator(options = {}) {
                 entryFile: targetWo.targetFiles?.[0] || 'src/fee-engine.js',
                 repoDir: runScratchDir
             });
+            if (signal?.aborted) return makeAbortResult();
             const hydraSyncEnv = await sponsors.syncHydraLineage({
                 workOrderId: targetWo.id,
                 hopFiles: plannerEnv.data?.hopPath || [
@@ -574,6 +629,7 @@ export async function createDeadboltOrchestrator(options = {}) {
                 hydraLineageSync: hydraSyncEnv.data
             });
             await emitBeat('planner', plannerBeat);
+            if (signal?.aborted) return makeAbortResult();
 
             // Stage 3: FOUNDRY (<1ms Slop Breaker on candidate + brownfield comparison + isolated staging)
             const candidateSlopEnv = foundry.auditWithSlopBreaker({
@@ -590,6 +646,9 @@ export async function createDeadboltOrchestrator(options = {}) {
                 repoDir: runScratchDir,
                 edits: CANDIDATE_PATCHES.verifiedRemediationPatch
             });
+            if (stageEnv.ok) {
+                stagedHeadToHeadTaskId = stageEnv.data.taskId;
+            }
 
             const foundryBeat = okEnvelope(
                 'deadbolt.run.foundry',
@@ -610,6 +669,7 @@ export async function createDeadboltOrchestrator(options = {}) {
                 }
             );
             await emitBeat('foundry', foundryBeat);
+            if (signal?.aborted) return makeAbortResult();
 
             // Stage 4: VALIDATOR (3-Attempt Self-Rejection & Remediation Loop)
             // Attempt 1: Naive per-line Math.round -> GATE_REJECTED (+1 cent batch discrepancy)
@@ -618,7 +678,8 @@ export async function createDeadboltOrchestrator(options = {}) {
                 attemptLabel: 'attempt_1_naive_rounding',
                 repoDir: runScratchDir,
                 edits: CANDIDATE_PATCHES.naiveAgentPatch,
-                runCrossModel: false
+                runCrossModel: false,
+                signal
             });
             const attempt1Beat = okEnvelope('deadbolt.run.attempt1', attempt1Env.summary, {
                 stage: 'validator',
@@ -626,6 +687,7 @@ export async function createDeadboltOrchestrator(options = {}) {
                 ...attempt1Env.data
             });
             await emitBeat('validator.attempt1', attempt1Beat);
+            if (signal?.aborted) return makeAbortResult();
 
             // Attempt 2: Supervised agent attempts sneaky workaround editing src/sox-reconciler.js -> WORKAROUND_REJECTED!
             const attempt2Env = await validator.validateCandidate({
@@ -633,7 +695,8 @@ export async function createDeadboltOrchestrator(options = {}) {
                 attemptLabel: 'attempt_2_sneaky_workaround',
                 repoDir: runScratchDir,
                 edits: CANDIDATE_PATCHES.sneakyWorkaroundPatch,
-                runCrossModel: false
+                runCrossModel: false,
+                signal
             });
             const attempt2Beat = okEnvelope(
                 'deadbolt.run.workaround_blocked',
@@ -645,6 +708,7 @@ export async function createDeadboltOrchestrator(options = {}) {
                 }
             );
             await emitBeat('validator.workaround_blocked', attempt2Beat);
+            if (signal?.aborted) return makeAbortResult();
 
             // Attempt 3: Legitimate integer basis-point largest-remainder fix in src/fee-engine.js -> VERIFIED
             const attempt3Env = await validator.validateCandidate({
@@ -652,7 +716,8 @@ export async function createDeadboltOrchestrator(options = {}) {
                 attemptLabel: 'attempt_3_verified_remediation',
                 repoDir: runScratchDir,
                 edits: CANDIDATE_PATCHES.verifiedRemediationPatch,
-                runCrossModel: true
+                runCrossModel: true,
+                signal
             });
             const attempt3Beat = okEnvelope('deadbolt.run.verified', attempt3Env.summary, {
                 stage: 'validator',
@@ -660,15 +725,11 @@ export async function createDeadboltOrchestrator(options = {}) {
                 ...attempt3Env.data
             });
             await emitBeat('validator.verified', attempt3Beat);
+            if (signal?.aborted) return makeAbortResult();
 
             // Apply verified stage to isolated run target + sync 8090 Work Order + Composio PR receipt
             let appliedStage = null;
             if (stageEnv.ok && attempt3Env.data?.verdict === 'VERIFIED') {
-                verifiedTasks.set(stageEnv.data.taskId, {
-                    workOrderId: targetWo.id,
-                    validationData: attempt3Env.data,
-                    unifiedDiff: stageEnv.data.unifiedDiff || ''
-                });
                 const applyRes = foundry.applyVerifiedStage({
                     taskId: stageEnv.data.taskId,
                     applyToRepoDir: true
@@ -711,11 +772,22 @@ export async function createDeadboltOrchestrator(options = {}) {
             await emitBeat('pr.dispatched', prBeat);
 
             const isVerified = attempt3Env.data?.verdict === 'VERIFIED';
-            const hydraFeedbackEnv = await sponsors.submitHydraTaskFeedback({
-                requestId: refineryEnv.data?.hydraSync?.requestId || '',
-                workOrderId: targetWo.id,
-                rating: isVerified ? 'positive' : 'neutral'
-            });
+            const [hydraFeedbackEnv] = await Promise.race([
+                Promise.all([
+                    sponsors.submitHydraTaskFeedback({
+                        requestId: refineryEnv.data?.hydraSync?.requestId || '',
+                        workOrderId: targetWo.id,
+                        rating: isVerified ? 'positive' : 'neutral'
+                    }),
+                    typeof sponsors.reportValidatorFeedback === 'function'
+                        ? sponsors.reportValidatorFeedback({
+                              workOrderId: targetWo.id,
+                              verdict: attempt3Env.data?.verdict || 'VERIFIED'
+                          })
+                        : Promise.resolve(null)
+                ]),
+                waitAbortable(1800, signal).then(() => [{ data: { submitted: false, reason: 'timeout' } }, null])
+            ]);
 
             const totalElapsedMs = Number(
                 (Number(process.hrtime.bigint() - startedNs) / 1e6).toFixed(2)
@@ -772,6 +844,14 @@ export async function createDeadboltOrchestrator(options = {}) {
                 receiptData
             );
         } finally {
+            if (stagedHeadToHeadTaskId) {
+                verifiedTasks.delete(stagedHeadToHeadTaskId);
+                try {
+                    foundry.releaseStage?.(stagedHeadToHeadTaskId);
+                } catch {
+                    /* ignore stage cleanup error */
+                }
+            }
             try {
                 fs.rmSync(runScratchDir, { recursive: true, force: true });
             } catch {

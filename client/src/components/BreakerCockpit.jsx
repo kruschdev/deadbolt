@@ -31,13 +31,48 @@ const DEFAULT_WORK_ORDERS = Object.freeze([
   }
 ]);
 
+const MODALITY_LABELS = Object.freeze({
+  tickets: 'Tickets',
+  codebasespans: 'Codebase Spans',
+  codebase_spans: 'Codebase Spans',
+  pastsessions: 'Past Sessions',
+  past_sessions: 'Past Sessions',
+  architecturedocs: 'Architecture Docs',
+  architecture_docs: 'Architecture Docs',
+  domainrules: 'Domain Rules',
+  domain_rules: 'Domain Rules',
+  githistory: 'Git History',
+  git_history: 'Git History',
+  emails: 'Audit Emails',
+  chats: 'Slack Threads',
+  transcripts: 'Meeting Transcripts'
+});
+
 const DEFAULT_MODALITIES = Object.freeze([
   'Tickets',
   'Codebase Spans',
   'Past Sessions',
-  'Emails',
-  'Chats',
-  'Transcripts'
+  'Audit Emails',
+  'Slack Threads',
+  'Meeting Transcripts'
+]);
+
+const DEPUTY_VECTOR_ROWS = Object.freeze([
+  {
+    id: 'delimiter_prompt_injection',
+    stepKey: 'delimiterInjection',
+    label: '1. Prompt-Injection Sanitizer'
+  },
+  {
+    id: 'unverified_pr_dispatch',
+    stepKey: 'unverifiedPrGate',
+    label: '2. Unverified PR Dispatch Gate'
+  },
+  {
+    id: 'cloud_metadata_ssrf',
+    stepKey: 'metadataSsrf',
+    label: '3. Private-Network SSRF Guard'
+  }
 ]);
 
 const DEFAULT_PARALLEL_LEASES = Object.freeze([
@@ -129,6 +164,13 @@ function formatSignedCents(cents) {
   return `${numeric}c`;
 }
 
+function formatSignedUsdFromCents(cents) {
+  const numeric = Number(cents);
+  if (!Number.isFinite(numeric) || numeric === 0) return '$0.00';
+  const absDollars = (Math.abs(numeric) / 100).toFixed(2);
+  return numeric > 0 ? `+$${absDollars}` : `-$${absDollars}`;
+}
+
 function formatCostUsd(costValue) {
   if (costValue === null || costValue === undefined) {
     return 'Run to measure';
@@ -168,10 +210,16 @@ function normalizeConnectorBar(rawConnectors) {
   const pick = (keys, label) => {
     for (const k of keys) {
       if (byKey[k]) {
-        return { id: k, label, pill: mapConnectorStatusToPill(byKey[k]) };
+        const raw = byKey[k];
+        return {
+          id: k,
+          label,
+          pill: mapConnectorStatusToPill(raw),
+          liveConfigured: Boolean(raw.liveConfigured)
+        };
       }
     }
-    return { id: keys[0], label, pill: 'healthy' };
+    return { id: keys[0], label, pill: 'healthy', liveConfigured: false };
   };
 
   return [
@@ -184,18 +232,29 @@ function normalizeConnectorBar(rawConnectors) {
   ];
 }
 
+function formatModalityLabel(raw) {
+  const str = String(raw || '').trim();
+  if (!str) return 'Modality';
+  const direct = MODALITY_LABELS[str] || MODALITY_LABELS[str.toLowerCase()];
+  if (direct) return direct;
+  return str
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
 function normalizeModalityNames(rawModalities) {
   if (!rawModalities) return DEFAULT_MODALITIES;
   if (Array.isArray(rawModalities) && rawModalities.length > 0) {
     return rawModalities.map((item) =>
       typeof item === 'string'
-        ? item
-        : String(item?.label || item?.name || item?.modality || 'Modality')
+        ? formatModalityLabel(item)
+        : formatModalityLabel(item?.label || item?.name || item?.modality || 'Modality')
     );
   }
   if (typeof rawModalities === 'object') {
     const keys = Object.keys(rawModalities);
-    if (keys.length > 0) return keys;
+    if (keys.length > 0) return keys.map((k) => formatModalityLabel(k));
   }
   return DEFAULT_MODALITIES;
 }
@@ -235,15 +294,21 @@ export function BreakerCockpit() {
   const [liveAudit, setLiveAudit] = useState(null);
 
   const activeAudioRef = useRef(null);
+  const foremanAbortRef = useRef(null);
+  const audioMutedRef = useRef(false);
   const runIdRef = useRef(0);
-  const autoChimedRunIdRef = useRef(-1);
+  const spokenAlertKeysRef = useRef(new Set());
+
+  audioMutedRef.current = audioMuted;
+
+  const statusError = statusQuery.error;
 
   const statusPayload = useMemo(
     () => unwrapEnvelopeData(statusQuery.data) || statusQuery.data || {},
     [statusQuery.data]
   );
 
-  const connectors = useMemo(
+  const connectorBar = useMemo(
     () =>
       normalizeConnectorBar(
         statusPayload?.connectors ||
@@ -253,10 +318,13 @@ export function BreakerCockpit() {
     [statusPayload, statusQuery.data]
   );
 
-  const healthyConnectorCount = useMemo(
-    () => connectors.filter((c) => c.pill === 'healthy' || c.pill === 'streaming').length,
-    [connectors]
-  );
+  const liveConfiguredCount = useMemo(() => {
+    const rawCount = Number(statusPayload?.liveConfiguredCount);
+    if (Number.isFinite(rawCount) && rawCount >= 0) {
+      return rawCount;
+    }
+    return connectorBar.filter((c) => c.liveConfigured).length;
+  }, [statusPayload, connectorBar]);
 
   const workOrders = useMemo(() => {
     const list = statusPayload?.workOrders;
@@ -334,10 +402,16 @@ export function BreakerCockpit() {
       }
     }
 
-    return stages;
+    return {
+      ...stages,
+      done: Boolean(stages.donePayload)
+    };
   }, [runStream.events]);
 
   const activeRun = useMemo(() => {
+    if (runStream.status === 'streaming' || syncRunning) {
+      return null;
+    }
     return (
       syncRunResult ||
       streamState.donePayload ||
@@ -345,14 +419,52 @@ export function BreakerCockpit() {
       statusPayload?.lastRun ||
       null
     );
-  }, [syncRunResult, streamState.donePayload, statusPayload]);
+  }, [runStream.status, syncRunning, syncRunResult, streamState.donePayload, statusPayload]);
+
+  const stopActiveForemanAudio = useCallback(() => {
+    if (foremanAbortRef.current) {
+      foremanAbortRef.current.abort();
+      foremanAbortRef.current = null;
+    }
+    if (activeAudioRef.current) {
+      try {
+        activeAudioRef.current.pause?.();
+        activeAudioRef.current.src = '';
+      } catch {
+        // Ignore audio element teardown errors
+      }
+      activeAudioRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopActiveForemanAudio();
+    };
+  }, [stopActiveForemanAudio]);
+
+  const streamBlockKey = useMemo(() => {
+    if (!streamState.workaroundBlocked) return null;
+    const receiptKey =
+      streamState.workaroundBlocked?.auditReceipt?.seq ??
+      streamState.workaroundBlocked?.auditReceipt?.entryHash ??
+      streamState.workaroundBlocked?.attemptLabel ??
+      'attempt2';
+    return `run-${runIdRef.current}-${receiptKey}`;
+  }, [streamState.workaroundBlocked]);
 
   const triggerForemanVoiceAlert = useCallback(
     async ({ isAuto = false } = {}) => {
+      if (foremanAbortRef.current) {
+        foremanAbortRef.current.abort();
+      }
+      const controller = new AbortController();
+      foremanAbortRef.current = controller;
       setForemanBusy(true);
       try {
         const raw = await fetchApiJson('/api/foreman/speak', {
           method: 'POST',
+          signal: controller.signal,
           body: {
             workOrderId: selectedWo,
             event: 'WORKAROUND_REJECTED',
@@ -360,6 +472,8 @@ export function BreakerCockpit() {
               'Breaker tripped on WO-101. Supervised AI attempted to weaken src/sox-reconciler.js tolerance. Policy floor blocked the workaround.'
           }
         });
+        if (controller.signal.aborted) return;
+
         const payload = unwrapEnvelopeData(raw) || raw || {};
         const audioBase64 = payload.audioBase64 || payload.audio || null;
         const mimeType = payload.mimeType || 'audio/wav';
@@ -378,7 +492,7 @@ export function BreakerCockpit() {
           triggeredBy: isAuto ? 'auto-breaker' : 'manual'
         });
 
-        if (audioBase64 && !audioMuted && typeof Audio !== 'undefined') {
+        if (audioBase64 && !audioMutedRef.current && typeof Audio !== 'undefined') {
           try {
             if (activeAudioRef.current) {
               activeAudioRef.current.pause?.();
@@ -394,6 +508,9 @@ export function BreakerCockpit() {
           }
         }
       } catch (err) {
+        if (controller.signal.aborted || err?.name === 'AbortError') {
+          return;
+        }
         setForemanAlert({
           mode: 'stage_caption_fallback',
           mimeType: 'audio/wav',
@@ -402,22 +519,50 @@ export function BreakerCockpit() {
           triggeredBy: isAuto ? 'auto-breaker' : 'manual'
         });
       } finally {
+        if (foremanAbortRef.current === controller) {
+          foremanAbortRef.current = null;
+        }
         setForemanBusy(false);
       }
     },
-    [selectedWo, audioMuted]
+    [selectedWo]
+  );
+
+  const handleToggleMute = useCallback(() => {
+    setAudioMuted((prev) => {
+      const nextMuted = !prev;
+      audioMutedRef.current = nextMuted;
+      if (nextMuted) {
+        stopActiveForemanAudio();
+        setForemanBusy(false);
+      } else if (streamBlockKey) {
+        spokenAlertKeysRef.current.add(streamBlockKey);
+      }
+      return nextMuted;
+    });
+  }, [stopActiveForemanAudio, streamBlockKey]);
+
+  const handleSelectTab = useCallback(
+    (nextTab) => {
+      if (nextTab !== activeTab) {
+        stopActiveForemanAudio();
+        setForemanBusy(false);
+      }
+      setActiveTab(nextTab);
+    },
+    [activeTab, stopActiveForemanAudio]
   );
 
   useEffect(() => {
     if (
-      streamState.workaroundBlocked &&
+      streamBlockKey &&
       !audioMuted &&
-      autoChimedRunIdRef.current !== runIdRef.current
+      !spokenAlertKeysRef.current.has(streamBlockKey)
     ) {
-      autoChimedRunIdRef.current = runIdRef.current;
+      spokenAlertKeysRef.current.add(streamBlockKey);
       triggerForemanVoiceAlert({ isAuto: true });
     }
-  }, [streamState.workaroundBlocked, audioMuted, triggerForemanVoiceAlert]);
+  }, [streamBlockKey, audioMuted, triggerForemanVoiceAlert]);
 
   useEffect(() => {
     if (runStream.status === 'done') {
@@ -426,6 +571,8 @@ export function BreakerCockpit() {
   }, [runStream.status, statusQuery.reload]);
 
   const handleRunLiveStream = async () => {
+    setForemanAlert(null);
+    stopActiveForemanAudio();
     setRunError(null);
     setSyncRunResult(null);
     runIdRef.current += 1;
@@ -433,7 +580,10 @@ export function BreakerCockpit() {
   };
 
   const handleRunSyncFallback = async () => {
+    setForemanAlert(null);
+    stopActiveForemanAudio();
     setRunError(null);
+    setSyncRunResult(null);
     runStream.reset();
     setSyncRunning(true);
     runIdRef.current += 1;
@@ -445,8 +595,8 @@ export function BreakerCockpit() {
       });
       const unwrapped = unwrapEnvelopeData(raw) || raw;
       setSyncRunResult(unwrapped);
-      if (!audioMuted) {
-        autoChimedRunIdRef.current = runIdRef.current;
+      if (!audioMutedRef.current) {
+        spokenAlertKeysRef.current.add(`sync-${runIdRef.current}`);
         triggerForemanVoiceAlert({ isAuto: true });
       }
       statusQuery.reload();
@@ -466,11 +616,12 @@ export function BreakerCockpit() {
     }
   };
 
-  const handleScanRepo = async (overrideTarget) => {
-    const targetToScan = typeof overrideTarget === 'string' ? overrideTarget : scanInput.trim();
+  const handleScanRepo = async (overrideTarget = '') => {
+    const explicitTarget = typeof overrideTarget === 'string' ? overrideTarget.trim() : '';
+    const targetToScan = explicitTarget || scanInput.trim();
     if (!targetToScan) return;
-    if (typeof overrideTarget === 'string') {
-      setScanInput(overrideTarget);
+    if (explicitTarget) {
+      setScanInput(explicitTarget);
     }
     setScanError(null);
     setModernizeError(null);
@@ -497,12 +648,15 @@ export function BreakerCockpit() {
   };
 
   const handleModernizeCompare = async (overrideTarget, specificFile = '') => {
-    const targetToUse = String(
-      typeof overrideTarget === 'string' ? overrideTarget : scanInput
-    ).trim();
+    const explicitTarget = typeof overrideTarget === 'string' ? overrideTarget.trim() : '';
+    const targetToUse = explicitTarget || scanInput.trim();
     if (!targetToUse) return;
-    if (typeof overrideTarget === 'string') {
-      setScanInput(overrideTarget);
+    if (targetToUse.toLowerCase() === 'pdo-nextjs-governed') {
+      await handleScanRepo('pdo-nextjs-governed');
+      return;
+    }
+    if (explicitTarget) {
+      setScanInput(explicitTarget);
     }
     setModernizeError(null);
     setScanError(null);
@@ -688,11 +842,12 @@ export function BreakerCockpit() {
       ? Number(foundry?.elapsedMs ?? foundry?.slopAudit?.elapsedMs).toFixed(2)
       : '0.38';
 
+    const runFinished = Boolean(activeRun || streamState.done || hasCompletedRun);
     const rawCost =
       gov?.telemetry?.costPerVerifiedTaskUsd ??
       activeRun?.telemetry?.costPerVerifiedTaskUsd ??
       att3?.telemetry?.costPerVerifiedTaskUsd ??
-      (hasCompletedRun ? 0 : null);
+      (runFinished ? 0 : null);
 
     return {
       modalities: normalizeModalityNames(refinery?.modalitiesHydrated),
@@ -709,10 +864,13 @@ export function BreakerCockpit() {
       attempt2: {
         verdict: att2?.verdict || 'WORKAROUND_REJECTED',
         ruleId:
+          att2?.policyCheck?.violations?.[0]?.ruleId ||
           att2?.policyCheck?.ruleId ||
           att2?.policyCheck?.violatedRule ||
-          'FLOOR-SOX-TOLERANCE-BYPASS',
-        blockedFile: 'src/sox-reconciler.js'
+          'FLOOR-PATH-PROTECTED',
+        blockedFile:
+          att2?.policyCheck?.violations?.[0]?.filePath ||
+          'src/sox-reconciler.js'
       },
       attempt3: {
         verdict: att3?.verdict || 'VERIFIED',
@@ -731,6 +889,7 @@ export function BreakerCockpit() {
         auditSummary?.tailHash ||
         auditSummary?.headHash ||
         'sha256:verified',
+      costUsd: rawCost,
       costPerVerifiedTaskUsd: rawCost
     };
   }, [activeRun, streamState, liveAudit, statusPayload, selectedWo, hasCompletedRun]);
@@ -758,7 +917,69 @@ export function BreakerCockpit() {
     };
   }, [scanResult, scanInput]);
 
-  const showAlertBanner = Boolean(streamState.workaroundBlocked || foremanAlert);
+  const showAlertBanner = Boolean(
+    streamState.workaroundBlocked ||
+      foremanAlert ||
+      activeRun?.deadbolt?.attempts?.[1]?.verdict === 'WORKAROUND_REJECTED'
+  );
+
+  const rightCardHeaderBadge = useMemo(() => {
+    if (runStream.status === 'streaming') {
+      if (streamState.verified || streamState.done) {
+        return { label: 'VERIFIED', badgeClass: 'db-badge-ok' };
+      }
+      if (streamState.workaroundBlocked) {
+        return { label: 'BREAKER TRIPPED', badgeClass: 'db-badge-danger' };
+      }
+      return { label: 'RUNNING GATE...', badgeClass: 'db-badge-cyan' };
+    }
+    if (syncRunning) {
+      return { label: 'RUNNING GATE...', badgeClass: 'db-badge-cyan' };
+    }
+    if (activeRun || streamState.done || streamState.verified || runStream.status === 'done') {
+      return {
+        label: governedData.attempt3.verdict || 'VERIFIED',
+        badgeClass: 'db-badge-ok'
+      };
+    }
+    return { label: 'GATE ARMED', badgeClass: 'db-badge-cyan' };
+  }, [
+    runStream.status,
+    syncRunning,
+    streamState.verified,
+    streamState.done,
+    streamState.workaroundBlocked,
+    activeRun,
+    governedData.attempt3.verdict
+  ]);
+
+  const trimmedScanInput = scanInput.trim();
+  const isPdoGovernedPreset = trimmedScanInput.toLowerCase() === 'pdo-nextjs-governed';
+  const isScanMatchingCleanGoverned = Boolean(
+    normalizedScan &&
+      trimmedScanInput &&
+      String(normalizedScan.target || '').trim().toLowerCase() ===
+        trimmedScanInput.toLowerCase() &&
+      normalizedScan.scannedFiles > 0 &&
+      normalizedScan.slopFindingCount === 0 &&
+      normalizedScan.coveragePct === 100
+  );
+  const isAlreadyGovernedTarget = isPdoGovernedPreset || isScanMatchingCleanGoverned;
+
+  const modernizerComparison = modernizeResult?.comparison || {};
+  const armA = modernizeResult?.singleFrontier || {};
+  const armABadgeClass =
+    (armA.slopFindingCount ?? armA.slopViolationCount ?? 1) > 0
+      ? 'db-badge-danger'
+      : 'db-badge-warn';
+
+  const att1Pending = isStreaming && !streamState.attempt1 && !hasCompletedRun;
+  const att2Pending = isStreaming && !streamState.workaroundBlocked && !hasCompletedRun;
+  const att3Pending = isStreaming && !streamState.verified && !hasCompletedRun;
+  const verifiedCostLabel =
+    Boolean(activeRun || streamState.done) && governedData.costUsd === 0
+      ? '$0.0000 (deterministic)'
+      : formatCostUsd(governedData.costUsd);
 
   return (
     <div className="db-cockpit">
@@ -789,13 +1010,13 @@ export function BreakerCockpit() {
             <span className="db-brand-sub">8090 Factory</span>
           </div>
 
-          <nav className="db-nav" role="tablist" aria-label="Workspace Mode">
+          <nav className="db-nav db-tabs" role="tablist" aria-label="Workspace Mode">
             <button
               type="button"
               role="tab"
               aria-selected={activeTab === 'breaker'}
               className={cn('db-nav-tab', activeTab === 'breaker' && 'is-active')}
-              onClick={() => setActiveTab('breaker')}
+              onClick={() => handleSelectTab('breaker')}
             >
               1. Work Order Gate
             </button>
@@ -804,7 +1025,7 @@ export function BreakerCockpit() {
               role="tab"
               aria-selected={activeTab === 'scanner'}
               className={cn('db-nav-tab', activeTab === 'scanner' && 'is-active')}
-              onClick={() => setActiveTab('scanner')}
+              onClick={() => handleSelectTab('scanner')}
             >
               2. GitHub Modernizer
             </button>
@@ -813,7 +1034,7 @@ export function BreakerCockpit() {
               role="tab"
               aria-selected={activeTab === 'resilience'}
               className={cn('db-nav-tab', activeTab === 'resilience' && 'is-active')}
-              onClick={() => setActiveTab('resilience')}
+              onClick={() => handleSelectTab('resilience')}
             >
               3. Safety Drills &amp; MCP
             </button>
@@ -822,25 +1043,33 @@ export function BreakerCockpit() {
           <div className="db-topbar-right">
             <button
               type="button"
-              className="db-btn db-btn-sm"
+              className={cn('db-btn db-btn-sm', statusError && 'db-btn-crimson')}
               onClick={() => setShowConnectors((prev) => !prev)}
-              title="Toggle 6 ecosystem connector statuses"
+              title={
+                statusError
+                  ? `Status endpoint unreachable: ${statusError?.message || 'offline'}`
+                  : 'Toggle 6 ecosystem connector statuses'
+              }
             >
               <span
                 style={{
                   width: '7px',
                   height: '7px',
                   borderRadius: '999px',
-                  background: '#34d399',
+                  background: statusError ? '#f87171' : '#34d399',
                   display: 'inline-block'
                 }}
               />
-              {healthyConnectorCount}/{connectors.length} Live
+              {statusError
+                ? 'API Offline'
+                : liveConfiguredCount === connectorBar.length
+                  ? '6/6 Live'
+                  : `${connectorBar.length}/6 Armed`}
             </button>
             <button
               type="button"
               className="db-btn db-btn-sm"
-              onClick={() => setAudioMuted((prev) => !prev)}
+              onClick={handleToggleMute}
             >
               {audioMuted ? 'Voice: Muted' : 'Voice: On'}
             </button>
@@ -849,8 +1078,12 @@ export function BreakerCockpit() {
 
         {showConnectors && (
           <div className="db-connectors-popover" aria-label="Connected Ecosystem Services">
-            {connectors.map((conn) => (
-              <StatusPill key={conn.id} status={conn.pill} label={conn.label} />
+            {connectorBar.map((conn) => (
+              <StatusPill
+                key={conn.id}
+                status={statusError ? 'offline' : conn.pill}
+                label={conn.label}
+              />
             ))}
           </div>
         )}
@@ -867,14 +1100,26 @@ export function BreakerCockpit() {
                   aria-label="Select 8090 Work Order"
                   className="db-select"
                   value={selectedWo}
-                  onChange={(e) => setSelectedWo(e.target.value)}
+                  onChange={(e) => {
+                    if (e.target.value === 'WO-101') {
+                      setSelectedWo(e.target.value);
+                    }
+                  }}
                   disabled={isStreaming}
                 >
-                  {workOrders.map((wo) => (
-                    <option key={wo.id} value={wo.id}>
-                      {wo.id}: {wo.title}
-                    </option>
-                  ))}
+                  {workOrders.map((wo) => {
+                    const isFixtureOnly = wo.id !== 'WO-101';
+                    return (
+                      <option
+                        key={wo.id}
+                        value={wo.id}
+                        disabled={isFixtureOnly}
+                      >
+                        {wo.id}: {wo.title}
+                        {isFixtureOnly ? ' (Parallel Lease Fixture - Tab 3)' : ''}
+                      </option>
+                    );
+                  })}
                 </select>
 
                 <button
@@ -944,7 +1189,7 @@ export function BreakerCockpit() {
 
             {/* FOCUSED BREAKER ALERT BAR (Shown when Attempt 2 trips or Foreman speaks) */}
             {showAlertBanner && (
-              <div className="db-alert-bar" role="status">
+              <div className="db-alert-bar" role="alert">
                 <div className="db-alert-text">
                   <strong>Workaround Blocked ({governedData.attempt2.ruleId}):</strong>{' '}
                   Supervised agent tried to weaken protected{' '}
@@ -982,7 +1227,8 @@ export function BreakerCockpit() {
                   <div>
                     <div className="db-kicker">Split-Invoice Batch Variance</div>
                     <div className="db-hero-number is-crimson tabular-nums">
-                      {formatSignedCents(standardData.deltaCents)} (+$0.01)
+                      {formatSignedCents(standardData.deltaCents)} (
+                      {formatSignedUsdFromCents(standardData.deltaCents)})
                     </div>
                   </div>
                   <div className="db-hero-caption tabular-nums">
@@ -1018,55 +1264,90 @@ export function BreakerCockpit() {
                     <div className="db-kicker">4-Stage Deterministic Governance</div>
                     <h2 className="db-card-title">DEADBOLT Governed Pipeline</h2>
                   </div>
-                  <span className="db-badge db-badge-emerald">VERIFIED</span>
+                  <span className={cn('db-badge', rightCardHeaderBadge.badgeClass)}>
+                    {rightCardHeaderBadge.label}
+                  </span>
                 </div>
 
                 <div className="db-hero-stat">
                   <div>
                     <div className="db-kicker">SOX-Style Batch Variance</div>
-                    <div className="db-hero-number is-emerald tabular-nums">
-                      {formatSignedCents(governedData.attempt3.deltaCents)} ($0.00)
+                    <div
+                      className={cn(
+                        'db-hero-number tabular-nums',
+                        att3Pending ? 'is-cyan' : 'is-emerald'
+                      )}
+                    >
+                      {att3Pending
+                        ? 'Evaluating...'
+                        : `${formatSignedCents(governedData.attempt3.deltaCents)} (${formatSignedUsdFromCents(governedData.attempt3.deltaCents)})`}
                     </div>
                   </div>
                   <div className="db-hero-caption tabular-nums">
-                    Verified cost: <strong>{formatCostUsd(governedData.costPerVerifiedTaskUsd)}</strong>
+                    Verified cost: <strong>{verifiedCostLabel}</strong>
                   </div>
                 </div>
 
                 <div className="db-attempt-list">
-                  <div className="db-attempt-item is-amber">
+                  <div className={cn('db-attempt-item', !att1Pending && 'is-amber')}>
                     <div className="db-attempt-top">
                       <span>Attempt 1: Naive per-line rounding</span>
-                      <span className="db-badge db-badge-amber">
-                        {governedData.attempt1.verdict}
+                      <span
+                        className={cn(
+                          'db-badge',
+                          att1Pending ? 'db-badge-cyan' : 'db-badge-amber'
+                        )}
+                      >
+                        {att1Pending ? 'PENDING' : governedData.attempt1.verdict}
                       </span>
                     </div>
                     <div className="db-attempt-desc">
-                      INV-FIN-03 caught {formatSignedCents(governedData.attempt1.deltaCents)} split-invoice drift missed by unit tests.
+                      {att1Pending
+                        ? 'Running Stage 4 deterministic SOX batch reconciliation...'
+                        : `INV-FIN-03 caught ${formatSignedCents(governedData.attempt1.deltaCents)} split-invoice drift missed by unit tests.`}
                     </div>
                   </div>
 
-                  <div className="db-attempt-item is-crimson">
+                  <div className={cn('db-attempt-item', !att2Pending && 'is-crimson')}>
                     <div className="db-attempt-top">
                       <span>Attempt 2: Agent edits protected reconciler</span>
-                      <span className="db-badge db-badge-crimson">
-                        {governedData.attempt2.verdict}
+                      <span
+                        className={cn(
+                          'db-badge',
+                          att2Pending ? 'db-badge-cyan' : 'db-badge-crimson'
+                        )}
+                      >
+                        {att2Pending ? 'PENDING' : governedData.attempt2.verdict}
                       </span>
                     </div>
                     <div className="db-attempt-desc">
-                      Policy floor blocked mutation on <code>{governedData.attempt2.blockedFile}</code> and fired ElevenLabs Foreman alert.
+                      {att2Pending ? (
+                        'Guarding protected policy-floor verifiers...'
+                      ) : (
+                        <>
+                          Policy floor ({governedData.attempt2.ruleId}) blocked mutation on{' '}
+                          <code>{governedData.attempt2.blockedFile}</code> and fired ElevenLabs Foreman alert.
+                        </>
+                      )}
                     </div>
                   </div>
 
-                  <div className="db-attempt-item is-emerald">
+                  <div className={cn('db-attempt-item', !att3Pending && 'is-emerald')}>
                     <div className="db-attempt-top">
                       <span>Attempt 3: Integer largest-remainder carry</span>
-                      <span className="db-badge db-badge-emerald">
-                        {governedData.attempt3.verdict}
+                      <span
+                        className={cn(
+                          'db-badge',
+                          att3Pending ? 'db-badge-cyan' : 'db-badge-emerald'
+                        )}
+                      >
+                        {att3Pending ? 'PENDING' : governedData.attempt3.verdict}
                       </span>
                     </div>
                     <div className="db-attempt-desc">
-                      Exact {formatCentsUsd(governedData.attempt3.actualNetCents)} parity + Gemini and DeepSeek cross-family approval.
+                      {att3Pending
+                        ? 'Awaiting largest-remainder remediation + cross-family consensus...'
+                        : `Exact ${formatCentsUsd(governedData.attempt3.actualNetCents)} parity + Gemini and DeepSeek cross-family approval.`}
                     </div>
                   </div>
                 </div>
@@ -1121,6 +1402,7 @@ export function BreakerCockpit() {
                         const cone = Array.isArray(lease.coneFiles)
                           ? lease.coneFiles.join(' -> ')
                           : lease.entryFile;
+                        const canParallel = lease.canRunInParallel !== false;
                         return (
                           <tr key={woId}>
                             <td className="db-mono" style={{ color: '#ffffff', fontWeight: 600 }}>
@@ -1129,7 +1411,14 @@ export function BreakerCockpit() {
                             <td className="db-mono">{cone}</td>
                             <td className="db-mono">{lease.cascadeTier || lease.tier}</td>
                             <td>
-                              <span className="db-badge db-badge-emerald">Disjoint Safe</span>
+                              <span
+                                className={cn(
+                                  'db-badge',
+                                  canParallel ? 'db-badge-ok' : 'db-badge-warn'
+                                )}
+                              >
+                                {canParallel ? 'Disjoint Safe' : 'Serialized Cone'}
+                              </span>
                             </td>
                           </tr>
                         );
@@ -1169,6 +1458,12 @@ export function BreakerCockpit() {
                 className="db-toolbar-group"
                 onSubmit={(e) => {
                   e.preventDefault();
+                  if (isAlreadyGovernedTarget) {
+                    handleScanRepo(
+                      isPdoGovernedPreset ? 'pdo-nextjs-governed' : trimmedScanInput
+                    );
+                    return;
+                  }
                   handleModernizeCompare();
                 }}
               >
@@ -1183,7 +1478,17 @@ export function BreakerCockpit() {
                 <button
                   type="submit"
                   className="db-btn db-btn-emerald"
-                  disabled={modernizeLoading || scanLoading || !scanInput.trim()}
+                  disabled={
+                    modernizeLoading ||
+                    scanLoading ||
+                    !trimmedScanInput ||
+                    isAlreadyGovernedTarget
+                  }
+                  title={
+                    isAlreadyGovernedTarget
+                      ? 'Target is already 100% Golden-Brick governed; click Scan Hazards (<1ms) to verify'
+                      : undefined
+                  }
                 >
                   {modernizeLoading
                     ? 'Comparing Live Models...'
@@ -1192,7 +1497,7 @@ export function BreakerCockpit() {
                 <button
                   type="button"
                   className="db-btn"
-                  disabled={scanLoading || modernizeLoading || !scanInput.trim()}
+                  disabled={scanLoading || modernizeLoading || !trimmedScanInput}
                   onClick={() => handleScanRepo()}
                 >
                   {scanLoading ? 'Scanning...' : 'Scan Hazards (<1ms)'}
@@ -1223,9 +1528,12 @@ export function BreakerCockpit() {
                   type="button"
                   className="db-preset-pill"
                   disabled={modernizeLoading || scanLoading}
-                  onClick={() => setScanInput('pdo-nextjs-governed')}
+                  onClick={() => {
+                    setScanInput('pdo-nextjs-governed');
+                    handleScanRepo('pdo-nextjs-governed');
+                  }}
                 >
-                  Next.js Governed Port
+                  Verify Port (pdo-nextjs-governed)
                 </button>
               </div>
 
@@ -1266,9 +1574,9 @@ export function BreakerCockpit() {
                   <div className="db-kpi-box">
                     <div className="db-kicker">Prompt Token Reduction</div>
                     <div className="db-kpi-val tabular-nums" style={{ color: '#38bdf8' }}>
-                      {Number(modernizeResult.comparison?.inputTokenReductionPct ?? 0) >= 0
-                        ? `-${modernizeResult.comparison?.inputTokenReductionPct ?? 0}%`
-                        : 'Bounded 1-File'}
+                      {Number(modernizerComparison.inputTokenReductionPct ?? 0) >= 0
+                        ? `-${modernizerComparison.inputTokenReductionPct ?? 0}%`
+                        : `Bounded ${modernizerComparison.filesModernized || 1}-File Slice`}
                     </div>
                     <div className="db-hero-caption">
                       HydraDB 2-hop slice vs. full-repo stuffing
@@ -1308,8 +1616,8 @@ export function BreakerCockpit() {
                         <div className="db-kicker">Arm A: No Dependency Graph</div>
                         <h3 className="db-card-title">1 Single Frontier Model</h3>
                       </div>
-                      <span className="db-badge db-badge-crimson">
-                        {modernizeResult.singleFrontier?.verdict || 'UNSEALED'}
+                      <span className={cn('db-badge', armABadgeClass)}>
+                        {armA.verdict || 'UNSEALED'}
                       </span>
                     </div>
 
@@ -1629,38 +1937,60 @@ export function BreakerCockpit() {
                     <div className="db-kicker">INV-DB-07 Outbound Security</div>
                     <h2 className="db-card-title">Confused-Deputy Gate</h2>
                   </div>
-                  <button
-                    type="button"
-                    className="db-btn db-btn-sm db-btn-crimson"
-                    disabled={deputyDrillLoading}
-                    onClick={handleRunConfusedDeputyDrill}
-                  >
-                    {deputyDrillLoading ? 'Testing...' : 'Run Security Drill'}
-                  </button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                    {deputyDrillResult && (
+                      <span
+                        className={cn(
+                          'db-badge',
+                          deputyDrillResult.passed ? 'db-badge-ok' : 'db-badge-danger'
+                        )}
+                      >
+                        {deputyDrillResult.passed ? 'All 3 Blocked' : 'Vector Failed'}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="db-btn db-btn-sm db-btn-crimson"
+                      disabled={deputyDrillLoading}
+                      onClick={handleRunConfusedDeputyDrill}
+                    >
+                      {deputyDrillLoading ? 'Testing...' : 'Run Security Drill'}
+                    </button>
+                  </div>
                 </div>
                 <p style={{ margin: 0, fontSize: '0.9rem', color: '#cbd5e1' }}>
                   Tests prompt-injection sanitization, unverified PR dispatch blocking, and DNS-pinned SSRF protection in front of Composio.
                 </p>
 
                 <div className="db-list">
-                  <div className="db-list-row">
-                    <span>1. Prompt-Injection Sanitizer</span>
-                    <span className="db-badge db-badge-emerald">
-                      {deputyDrillResult ? 'Blocked' : 'Armed'}
-                    </span>
-                  </div>
-                  <div className="db-list-row">
-                    <span>2. Unverified PR Dispatch Gate</span>
-                    <span className="db-badge db-badge-emerald">
-                      {deputyDrillResult ? 'Blocked' : 'Armed'}
-                    </span>
-                  </div>
-                  <div className="db-list-row">
-                    <span>3. Private-Network SSRF Guard</span>
-                    <span className="db-badge db-badge-emerald">
-                      {deputyDrillResult ? 'Blocked' : 'Armed'}
-                    </span>
-                  </div>
+                  {DEPUTY_VECTOR_ROWS.map((row, idx) => {
+                    const vec =
+                      deputyDrillResult?.vectors?.find((v) => v.id === row.id) ||
+                      deputyDrillResult?.vectors?.[idx] ||
+                      deputyDrillResult?.steps?.[row.stepKey] ||
+                      null;
+                    const hasResult = Boolean(deputyDrillResult);
+                    const isBlocked = vec
+                      ? Boolean(vec.blocked)
+                      : Boolean(deputyDrillResult?.passed);
+                    return (
+                      <div key={row.id} className="db-list-row">
+                        <span>{row.label}</span>
+                        <span
+                          className={cn(
+                            'db-badge',
+                            !hasResult
+                              ? 'db-badge-cyan'
+                              : isBlocked
+                                ? 'db-badge-ok'
+                                : 'db-badge-danger'
+                          )}
+                        >
+                          {!hasResult ? 'Armed' : isBlocked ? 'Blocked' : 'Unblocked'}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
 
                 {deputyDrillResult && (
