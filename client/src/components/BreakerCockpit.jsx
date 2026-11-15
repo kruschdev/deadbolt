@@ -2648,7 +2648,7 @@ export function BreakerCockpit() {
                   </button>
                 </div>
                 <p style={{ margin: 0, fontSize: '0.9rem', color: '#cbd5e1' }}>
-                  Injects a mid-apply crash in Stage 3 Foundry and runs write-ahead journal recovery so target repositories never see half-written files.
+                  Spawns an apply worker, kills it with SIGKILL right after the first file rename, and recovers the persisted SQLite WAL journal in a fresh process so target repositories roll back cleanly.
                 </p>
 
                 <div className="db-list">
@@ -2656,8 +2656,8 @@ export function BreakerCockpit() {
                     <span>Journal Transition</span>
                     <span className="db-badge db-badge-emerald">
                       {crashDrillResult
-                        ? `${crashDrillResult.initialState || 'RECOVERY_PENDING'} -> ${crashDrillResult.finalState || 'ROLLED_BACK'}`
-                        : 'RECOVERY_PENDING -> ROLLED_BACK'}
+                        ? `${crashDrillResult.initialState || 'APPLYING'} -> ${crashDrillResult.finalState || 'ROLLED_BACK'}`
+                        : 'APPLYING -> ROLLED_BACK'}
                     </span>
                   </div>
                   <div className="db-list-row">

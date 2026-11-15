@@ -21,6 +21,13 @@ import {
     extractPolyglotDependencyEdges
 } from '../src/engines/planner-graph.js';
 import { isStructurallyCompleteGoldenBrickModule } from '../src/engines/modernizer-benchmark.js';
+import { createFoundryEngine } from '../src/engines/foundry-staging.js';
+import {
+    TREE_SITTER_GRAMMAR_BY_EXTENSION,
+    initTreeSitterRuntime,
+    isTreeSitterReady,
+    analyzeFileWithTreeSitter
+} from '../src/engines/treesitter-ast.js';
 import { createDeadboltOrchestrator } from '../src/orchestrator.js';
 import {
     DEADBOLT_MCP_TOOLS,
@@ -276,6 +283,12 @@ test('Orchestrator end-to-end invariants (INV-DB-01..08, INV-FIN-03) and 5-tool 
     const crashEnv = await orchestrator.runCrashDrill();
     assert.equal(crashEnv.ok, true);
     assert.equal(crashEnv.data.converged, true);
+    assert.equal(crashEnv.data.workerKilledSignal, 'SIGKILL');
+    assert.equal(crashEnv.data.recoveredInFreshProcess, true);
+    assert.notEqual(crashEnv.data.workerPid, crashEnv.data.recoveryPid);
+    assert.equal(crashEnv.data.journalStateBefore, 'APPLYING');
+    assert.equal(crashEnv.data.journalStateAfter, 'ROLLED_BACK');
+    assert.ok(crashEnv.data.orphanedTempsBeforeRecovery >= 1);
     assert.equal(crashEnv.data.halfWrittenFiles, 0);
     assert.equal(crashEnv.data.orphanedTempCleaned, true);
 
@@ -2194,4 +2207,250 @@ test('L0 deep audit hardening: Node 22 --permission SOX subprocess sandbox, rege
         statuses.push(r.status);
     }
     assert.equal(statuses.includes(429), true, `Expected HTTP 429 in burst responses: ${statuses}`);
+});
+
+test('INV-DB-06 Multi-Process Worker SIGKILL + Fresh-Process WAL Journal Recovery & Persisted Repo Promotion', async (t) => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-journal-promote-'));
+    t.after(() => fs.rmSync(tmpRoot, { recursive: true, force: true }));
+
+    const repoDir = path.join(tmpRoot, 'target-repo');
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src', 'alpha.js'), 'export const alpha = 1;\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'src', 'beta.js'), 'export const beta = 1;\n', 'utf8');
+
+    const orch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        stackDbPath: ':memory:',
+        auditDbPath: ':memory:',
+        kruschGitClient: null
+    });
+    t.after(() => orch.close());
+
+    const foundry = createFoundryEngine({ stack: orch.stack });
+    t.after(() => foundry.close());
+    const stageRes = foundry.stageWorkOrderEdits({
+        workOrderId: 'WO-JOURNAL-1',
+        repoDir,
+        edits: [
+            { file_path: 'src/alpha.js', content: 'export const alpha = 42;\n' },
+            { file_path: 'src/beta.js', content: 'export const beta = 99;\n' }
+        ]
+    });
+    assert.equal(stageRes.ok, true);
+
+    const promoteRes = foundry.applyVerifiedStage({
+        taskId: stageRes.data.taskId,
+        applyToRepoDir: true
+    });
+    assert.equal(promoteRes.ok, true);
+    assert.equal(promoteRes.data.syncedToRepoDir, true);
+    assert.equal(promoteRes.data.repoSyncJournalBacked, true);
+    assert.equal(fs.existsSync(path.join(repoDir, '.krusch-stack', 'repo-apply.db')), true);
+    assert.equal(fs.readFileSync(path.join(repoDir, 'src', 'alpha.js'), 'utf8'), 'export const alpha = 42;\n');
+    assert.equal(fs.readFileSync(path.join(repoDir, 'src', 'beta.js'), 'utf8'), 'export const beta = 99;\n');
+
+    const drillRes = await foundry.runCrashRecoveryDrill({ repoDir });
+    assert.equal(drillRes.ok, true);
+    assert.equal(drillRes.data.workerKilledSignal, 'SIGKILL');
+    assert.equal(drillRes.data.recoveredInFreshProcess, true);
+    assert.notEqual(drillRes.data.workerPid, drillRes.data.recoveryPid);
+    assert.equal(drillRes.data.halfWrittenFilesBeforeRecovery, 1);
+    assert.ok(drillRes.data.orphanedTempsBeforeRecovery >= 1);
+    assert.equal(drillRes.data.journalStateBefore, 'APPLYING');
+    assert.equal(drillRes.data.journalStateAfter, 'ROLLED_BACK');
+    assert.equal(drillRes.data.halfWrittenFiles, 0);
+    assert.equal(drillRes.data.orphanedTempCleaned, true);
+});
+
+test('INV-DB-TS-01 & INV-DB-05: Portable WASM Tree-sitter across 11 grammars, docstring/raw-string immunity, syntax diagnostics, and obfuscated CST SOX bypass rejection', async (t) => {
+    const initEnv = await initTreeSitterRuntime();
+    assert.equal(initEnv.ok, true);
+    assert.equal(isTreeSitterReady(), true);
+    assert.equal(initEnv.data.astEngine, 'web-tree-sitter-wasm');
+    assert.equal(initEnv.data.grammars.length, 11);
+    assert.equal(Object.keys(TREE_SITTER_GRAMMAR_BY_EXTENSION).length, 14);
+
+    // 1. Polyglot workspace spanning all 11 WASM grammars + phantom imports/symbols inside docstrings & raw strings
+    const polyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-ts-polyglot-'));
+    t.after(() => fs.rmSync(polyDir, { recursive: true, force: true }));
+
+    const filesToWrite = {
+        'src/js/util.js': 'export function calcBaseCents(x) { return x * 100; }\n',
+        'src/js/phantom.js': 'export function neverImportedJs() { return 0; }\n',
+        'src/js/service.js': [
+            "import { calcBaseCents } from './util.js';",
+            "const docTemplate = `import { neverImportedJs } from './phantom.js'; function phantomJsSymbol() {}`;",
+            'export function settleJsOrder(v) { return calcBaseCents(v) + docTemplate.length * 0; }'
+        ].join('\n'),
+        'src/ts/types.ts': 'export interface LedgerEntry { cents: number; }\nexport function normalizeCents(v: number): number { return Math.trunc(v); }\n',
+        'src/ts/View.tsx': "import { normalizeCents } from './types';\nexport function LedgerBadge() { return <span>{normalizeCents(10)}</span>; }\n",
+        'pkg/py/helper.py': 'def compute_tax(cents: int) -> int:\n    return cents // 10\n',
+        'pkg/py/phantom_mod.py': 'def never_called_py() -> int:\n    return 0\n',
+        'pkg/py/runner.py': [
+            'from .helper import compute_tax',
+            '"""',
+            'from .phantom_mod import never_called_py',
+            'def phantom_docstring_symbol():',
+            '    return 999',
+            '"""',
+            'def run_batch(amount: int) -> int:',
+            '    return compute_tax(amount)'
+        ].join('\n'),
+        'web/config.php': '<?php\nfunction db_dsn() { return "sqlite::memory:"; }\n',
+        'web/page.php': '<?php\nrequire "config.php";\n$note = "require \\"phantom.php\\";";\n?>\n<a href="config.php">Cfg</a>\n',
+        'internal/ledger/store.go': 'package ledger\ntype Store struct{}\nfunc PostEntry() int { return 1 }\n',
+        'internal/phantom/ghost.go': 'package phantom\nfunc GhostGo() int { return 0 }\n',
+        'cmd/app/main.go': [
+            'package main',
+            'import "github.com/acme/demo/internal/ledger"',
+            'const rawDoc = `',
+            'import "github.com/acme/demo/internal/phantom"',
+            'func PhantomGoRawSymbol() {}',
+            '`',
+            'func RunMain() int { _ = rawDoc; return ledger.PostEntry() }'
+        ].join('\n'),
+        'src/rs/lib.rs': [
+            'pub mod engine;',
+            'const RAW_RS: &str = r#"mod phantom_rs; use crate::phantom_rs::Ghost; fn phantom_rs_fn() {}"#;',
+            'pub fn boot() -> usize { RAW_RS.len() + engine::tick() }'
+        ].join('\n'),
+        'src/rs/engine.rs': 'pub fn tick() -> usize { 1 }\n',
+        'src/rs/phantom_rs.rs': 'pub struct Ghost;\n',
+        'jvm/com/acme/TaxCalc.java': 'package com.acme;\npublic class TaxCalc {\n  public static int fee() { return 5; }\n}\n',
+        'jvm/com/acme/BillingKt.kt': [
+            'package com.acme',
+            'class BillingKt {',
+            '  fun total(): Int {',
+            '    return TaxCalc.fee()',
+            '  }',
+            '}'
+        ].join('\n'),
+        'dotnet/Domain/LedgerRepo.cs': 'namespace Acme.Domain;\npublic class LedgerRepo { public int Count() { return 1; } }\n',
+        'dotnet/Api/LedgerController.cs': 'using Acme.Domain;\nnamespace Acme.Api;\npublic class LedgerController { public int Get(LedgerRepo repo) { return repo.Count(); } }\n',
+        'ruby/lib/money.rb': 'module Money\n  def self.zero\n    0\n  end\nend\n',
+        'ruby/app/worker.rb': "require_relative '../lib/money'\nclass SettlementWorker\n  def perform\n    Money.zero\n  end\nend\n",
+        'broken/syntax_err.py': 'def broken_syntax(\n    return 1\n'
+    };
+
+    for (const [rel, content] of Object.entries(filesToWrite)) {
+        const full = path.join(polyDir, rel);
+        fs.mkdirSync(path.dirname(full), { recursive: true });
+        fs.writeFileSync(full, content, 'utf8');
+    }
+
+    const orch = await createDeadboltOrchestrator({
+        ephemeral: true,
+        stackDbPath: ':memory:',
+        auditDbPath: ':memory:',
+        kruschGitClient: null
+    });
+    t.after(() => orch.close());
+
+    const scanRes = await orch.scanRepository({ repoUrlOrPath: polyDir, maxFiles: 80 });
+    assert.equal(scanRes.ok, true);
+    assert.equal(scanRes.data.astEngine, 'web-tree-sitter-wasm');
+
+    // Syntax error file is pinpointed accurately
+    assert.ok(
+        scanRes.data.syntaxErrorFiles.some(
+            (f) => f.filePath === 'broken/syntax_err.py' && f.language === 'python' && f.errors.length >= 1
+        )
+    );
+
+    // Zero phantom symbols from Python docstrings, Go raw backticks, Rust raw strings, or JS template strings
+    const allTopSymbols = new Set(scanRes.data.topFiles.flatMap((f) => f.symbols));
+    assert.equal(allTopSymbols.has('phantomJsSymbol'), false);
+    assert.equal(allTopSymbols.has('phantom_docstring_symbol'), false);
+    assert.equal(allTopSymbols.has('PhantomGoRawSymbol'), false);
+    assert.equal(allTopSymbols.has('phantom_rs_fn'), false);
+
+    // Direct CST check on those 4 files confirms zero phantom symbols at AST level too
+    for (const [rel, forbiddenSym] of [
+        ['src/js/service.js', 'phantomJsSymbol'],
+        ['pkg/py/runner.py', 'phantom_docstring_symbol'],
+        ['cmd/app/main.go', 'PhantomGoRawSymbol'],
+        ['src/rs/lib.rs', 'phantom_rs_fn']
+    ]) {
+        const parsed = analyzeFileWithTreeSitter(filesToWrite[rel], rel);
+        assert.equal(parsed.ok, true);
+        assert.equal(
+            parsed.data.symbols.some((s) => s.symbol_name === forbiddenSym),
+            false,
+            `Expected ${forbiddenSym} inside string/docstring in ${rel} to be excluded from CST symbols`
+        );
+    }
+
+    // Zero phantom dependency edges, while all real cross-file edges across languages are present
+    const edgeKeys = new Set(scanRes.data.dependencyEdges.map((e) => `${e.from}->${e.to}`));
+    assert.equal(edgeKeys.has('src/js/service.js->src/js/phantom.js'), false);
+    assert.equal(edgeKeys.has('pkg/py/runner.py->pkg/py/phantom_mod.py'), false);
+    assert.equal(edgeKeys.has('cmd/app/main.go->internal/phantom/ghost.go'), false);
+    assert.equal(edgeKeys.has('src/rs/lib.rs->src/rs/phantom_rs.rs'), false);
+
+    assert.equal(edgeKeys.has('src/js/service.js->src/js/util.js'), true);
+    assert.equal(edgeKeys.has('src/ts/View.tsx->src/ts/types.ts'), true);
+    assert.equal(edgeKeys.has('pkg/py/runner.py->pkg/py/helper.py'), true);
+    assert.equal(edgeKeys.has('web/page.php->web/config.php'), true);
+    assert.equal(edgeKeys.has('cmd/app/main.go->internal/ledger/store.go'), true);
+    assert.equal(edgeKeys.has('src/rs/lib.rs->src/rs/engine.rs'), true);
+    assert.equal(edgeKeys.has('jvm/com/acme/BillingKt.kt->jvm/com/acme/TaxCalc.java'), true);
+    assert.equal(edgeKeys.has('dotnet/Api/LedgerController.cs->dotnet/Domain/LedgerRepo.cs'), true);
+    assert.equal(edgeKeys.has('ruby/app/worker.rb->ruby/lib/money.rb'), true);
+
+    const { createPlannerEngine } = await import('../src/engines/planner-graph.js');
+    const planner = createPlannerEngine({ stack: orch.stack, kruschGitClient: null });
+    const blastRes = await planner.analyzeBlastRadius({
+        repoDir: polyDir,
+        repoName: 'polyglot-ts-blast',
+        entryFile: 'internal/ledger/store.go',
+        workOrders: [{ id: 'WO-GO-1', title: 'Update ledger store', targetFiles: ['internal/ledger/store.go'] }]
+    });
+    assert.equal(blastRes.ok, true);
+    assert.equal(blastRes.data.symbolGraph.astEngine, 'web-tree-sitter-wasm');
+    assert.equal(blastRes.data.hop1Files.includes('cmd/app/main.go'), true);
+
+    // 2. Obfuscated AST-level SOX bypasses caught at Step 1A by Tree-sitter CST
+    const obfuscatedStrictSox = await orch.validateModeOrEdits({
+        workOrderId: 'WO-101',
+        runCrossModel: false,
+        edits: [
+            {
+                file_path: 'src/fee-engine.js',
+                content: "export const opts = { ['strictSox']: !true };\nexport function allocateLineFeesCents() { return []; }\n"
+            }
+        ]
+    });
+    assert.equal(obfuscatedStrictSox.ok, true);
+    assert.equal(obfuscatedStrictSox.data.verdict, 'WORKAROUND_REJECTED');
+    assert.equal(obfuscatedStrictSox.data.policyCheck.astEngine, 'web-tree-sitter-wasm');
+    assert.equal(obfuscatedStrictSox.data.policyCheck.violations[0].ruleId, 'FLOOR-SOX-TOLERANCE-BYPASS');
+
+    const obfuscatedToleranceExpr = await orch.validateModeOrEdits({
+        workOrderId: 'WO-101',
+        runCrossModel: false,
+        edits: [
+            {
+                file_path: 'src/fee-engine.js',
+                content: 'const toleranceCents =\n  /* hidden expr */ 1 + 1;\nexport function allocateLineFeesCents() { return [toleranceCents]; }\n'
+            }
+        ]
+    });
+    assert.equal(obfuscatedToleranceExpr.ok, true);
+    assert.equal(obfuscatedToleranceExpr.data.verdict, 'WORKAROUND_REJECTED');
+    assert.equal(obfuscatedToleranceExpr.data.policyCheck.violations[0].ruleId, 'FLOOR-SOX-TOLERANCE-BYPASS');
+
+    // Syntax-broken edit reports syntaxCheck.hasSyntaxErrors === true
+    const brokenEditCheck = await orch.validateModeOrEdits({
+        workOrderId: 'WO-101',
+        runCrossModel: false,
+        edits: [
+            {
+                file_path: 'src/fee-engine.js',
+                content: 'export function allocateLineFeesCents( {{{ return ;\n'
+            }
+        ]
+    });
+    assert.equal(brokenEditCheck.ok, true);
+    assert.equal(brokenEditCheck.data.syntaxCheck.astEngine, 'web-tree-sitter-wasm');
+    assert.equal(brokenEditCheck.data.syntaxCheck.hasSyntaxErrors, true);
 });

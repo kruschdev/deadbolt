@@ -21,6 +21,11 @@ import {
     delimitUntrustedContent
 } from '@krusch/toolkit/harness-engineering';
 import { chat } from '@krusch/toolkit/llm';
+import {
+    initTreeSitterRuntime,
+    isTreeSitterReady,
+    analyzeFileWithTreeSitter
+} from './treesitter-ast.js';
 
 const execFileAsync = promisify(execFile);
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -2110,19 +2115,43 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
         }
 
         try {
+            await initTreeSitterRuntime();
+            if (signal?.aborted) {
+                return makeAbortedEnvelope();
+            }
             const startedNs = process.hrtime.bigint();
             const rawEditList = resolveCandidateEditsArray(edits);
             const inspectedEdits = rawEditList.map((item) => {
                 const rawFilePath = item?.file_path ?? item?.filePath ?? item?.path ?? '';
                 const pathInfo = inspectCandidateRepoPath(rawFilePath);
+                const content = String(item?.content ?? item?.code ?? '');
+                const tsEnv =
+                    !pathInfo.blockedReason && pathInfo.normalized && isTreeSitterReady()
+                        ? analyzeFileWithTreeSitter(content, pathInfo.normalized)
+                        : null;
                 return {
                     raw_path: pathInfo.raw,
                     file_path: pathInfo.normalized,
                     display_path: pathInfo.candidateLabel || pathInfo.raw,
                     blocked_reason: pathInfo.blockedReason,
-                    content: String(item?.content ?? item?.code ?? '')
+                    content,
+                    tsData: tsEnv?.ok && tsEnv.data?.supported ? tsEnv.data : null
                 };
             });
+
+            const activeAstEngine = isTreeSitterReady() ? 'web-tree-sitter-wasm' : 'lexer';
+            const filesWithSyntaxErrors = inspectedEdits
+                .filter((e) => Boolean(e.file_path && e.tsData?.hasSyntaxError))
+                .map((e) => ({
+                    filePath: e.file_path,
+                    language: e.tsData.language,
+                    errors: e.tsData.syntaxErrors || []
+                }));
+            const syntaxCheck = {
+                astEngine: activeAstEngine,
+                hasSyntaxErrors: filesWithSyntaxErrors.length > 0,
+                filesWithSyntaxErrors
+            };
 
             const normalizedLeaseSet =
                 Array.isArray(allowedTargetFiles) && allowedTargetFiles.length > 0
@@ -2208,6 +2237,15 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
                         reason: 'Tolerance widening or disabling strictSox is forbidden by policy floor.'
                     });
                 } else if (
+                    edit.tsData?.soxViolations?.length > 0 &&
+                    !policyViolations.some((v) => v.filePath === edit.file_path)
+                ) {
+                    policyViolations.push({
+                        filePath: edit.file_path,
+                        ruleId: edit.tsData.soxViolations[0].ruleId || 'FLOOR-SOX-TOLERANCE-BYPASS',
+                        reason: edit.tsData.soxViolations[0].reason
+                    });
+                } else if (
                     normalizedLeaseSet &&
                     !normalizedLeaseSet.has(edit.file_path) &&
                     !policyViolations.some((v) => v.filePath === edit.file_path)
@@ -2264,8 +2302,10 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
                         policyCheck: {
                             passed: false,
                             status: 'FORBIDDEN',
+                            astEngine: activeAstEngine,
                             violations: policyViolations
                         },
+                        syntaxCheck,
                         slopCheck: null,
                         reconciliation: null,
                         crossModelReview: {
@@ -2285,6 +2325,7 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
             const policyCheck = {
                 passed: true,
                 status: 'ALLOWED',
+                astEngine: activeAstEngine,
                 violations: []
             };
 
@@ -2376,6 +2417,7 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
                         remediationHint,
                         reviewOrder: FIXED_REVIEW_ORDER,
                         policyCheck,
+                        syntaxCheck,
                         slopCheck,
                         reconciliation: reconRes.ok
                             ? reconRes.data
@@ -2473,6 +2515,7 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
                             'Separate-family reviewers disagreed or failed closed on candidate patch safety. Human architectural review is required before stage apply.',
                         reviewOrder: FIXED_REVIEW_ORDER,
                         policyCheck,
+                        syntaxCheck,
                         slopCheck,
                         reconciliation: reconRes.data,
                         crossModelReview,
@@ -2523,6 +2566,7 @@ export function createValidatorEngine({ auditDbPath = '', hmacSecret, llmConfig 
                     remediationHint: null,
                     reviewOrder: FIXED_REVIEW_ORDER,
                     policyCheck,
+                    syntaxCheck,
                     slopCheck,
                     reconciliation: reconRes.data,
                     crossModelReview,

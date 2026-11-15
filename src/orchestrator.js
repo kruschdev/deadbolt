@@ -25,6 +25,7 @@ import {
     getLegacySlopSamples
 } from './fixtures/billing-scenario.js';
 import { createRefineryEngine } from './engines/refinery-context.js';
+import { initTreeSitterRuntime } from './engines/treesitter-ast.js';
 import { createPlannerEngine } from './engines/planner-graph.js';
 import { createFoundryEngine } from './engines/foundry-staging.js';
 import { createValidatorEngine } from './engines/validator-gate.js';
@@ -225,6 +226,7 @@ export async function createDeadboltOrchestrator(options = {}) {
     }
 
     try {
+        await initTreeSitterRuntime();
         materializeBillingRepo(billingRepoDir);
 
         stack = createKruschStack({
@@ -1297,14 +1299,14 @@ export async function createDeadboltOrchestrator(options = {}) {
     }
 
     /**
-     * Execute Stage 3 Foundry mid-apply crash simulation & journal recovery drill (`INV-DB-06`).
+     * Execute Stage 3 Foundry multi-process worker SIGKILL & cold fresh-process journal recovery drill (`INV-DB-06`).
      */
     async function runCrashDrill() {
-        const drillEnv = foundry.runCrashRecoveryDrill({ repoDir: billingRepoDir });
+        const drillEnv = await foundry.runCrashRecoveryDrill({ repoDir: billingRepoDir });
         if (!drillEnv.ok) return drillEnv;
         return okEnvelope(drillEnv.tool, drillEnv.summary, {
             ...drillEnv.data,
-            initialState: drillEnv.data?.journalStateBefore || 'RECOVERY_PENDING',
+            initialState: drillEnv.data?.journalStateBefore || 'APPLYING',
             finalState: drillEnv.data?.journalStateAfter || 'ROLLED_BACK'
         });
     }

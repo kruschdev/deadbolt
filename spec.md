@@ -26,7 +26,8 @@ DEADBOLT is the deterministic governance control plane, 2-hop blast-radius plann
   3. Disagreement detection (`consensus` vs `ESCALATE_TO_HUMAN`).
   No model vote can override a failed deterministic gate or authorize mutating protected verification or intermediary files (`sox-reconciler.js`, `settlement-service.js`, `node_modules/`).
 - **`INV-DB-05` (Self-Rejection of Agent Workarounds)**: When an agent attempts to pass `INV-FIN-03` by weakening `sox-reconciler.js`, mutating `settlement-service.js`, widening tolerance (`toleranceCents > 0`), or toggling `strictSox = false`, DEADBOLT deterministically blocks the workaround (`WORKAROUND_REJECTED`), records the violation in the SHA-256 hash-chained audit log (`@krusch/toolkit/audit-log`), and requires a legitimate fix in `fee-engine.js` (largest-remainder / integer cent allocation) that passes revalidation.
-- **`INV-DB-06` (Isolated Staging & Crash-Recoverable Apply Journal)**: Proposed edits are staged in an isolated workspace via `krusch-stack` `harness` (`harness_tasks` + `harness_apply_journal`) before touching target files, with symlink-guarded atomic rollback sync and deterministic crash simulation and recovery (`recoverInFlight`).
+- **`INV-DB-06` (Isolated Staging & Multi-Process Crash-Recoverable Apply Journal)**: Proposed edits are staged in an isolated workspace via `krusch-stack` `harness` (`harness_tasks` + `harness_apply_journal`) before touching target files, promoted into `repoDir` via a symlink-guarded persisted SQLite apply journal (`.krusch-stack/repo-apply.db`), and verified with a real two-process OS `SIGKILL` crash drill (`runCrashRecoveryDrill` kills an active apply worker after the first rename and recovers preimages in a cold fresh process via `recoverInFlight`).
+- **`INV-DB-TS-01` (Portable WASM Tree-sitter Polyglot CST Engine)**: Stage 2 (`planner-graph.js`) and Stage 4 (`validator-gate.js`) parse all 10 supported languages and 14 source extensions via portable WebAssembly Tree-sitter grammars (`web-tree-sitter` + `tree-sitter-wasms` in `src/engines/treesitter-ast.js`, zero native C++ addons), releasing WASM trees deterministically (`tree.delete()`) and preventing fake imports, declarations, or policy-floor workarounds hidden inside comments, strings, or obfuscated AST assignments.
 - **`INV-DB-07` (Confused-Deputy & Outbound Action Gate)**: External ticket/chat/PR text is sanitized with `sanitizeAgentMessage` (`@krusch/toolkit/trajectory-guard`) and wrapped with `delimitUntrustedContent` (`@krusch/toolkit/harness-engineering`). Shallow `git clone` operations run with host credential helpers, symlinks, and LFS disabled. Composio outbound PR actions are blocked until Stage 4 (`Validator`) returns `VERIFIED` and all outbound URLs pass `safeFetch` / `validateOutboundUrl` (`@krusch/toolkit/security`).
 - **`INV-DB-08` (Measured Cost-Per-Verified-Task & Zero Leaks)**: Only live non-estimated token counts, latency, retries, and USD cost are reported (`costPerVerifiedTaskUsd` is `null` for unverified, degraded-fallback, or estimated runs). Zero API keys, private IPs, or local workstation paths may appear in tracked files or API/MCP responses.
 - **`INV-DB-09` (8090 Governance Receipt Stage-4 Gate)**: `POST /api/sofa/sync-receipt` (`syncSofaGovernanceReceipt`) is strictly gated on a real Stage 4 `validator.verified` (`actor === 'deadbolt-validator-gate'`, `outcome === 'SUCCESS'`) audit entry matching `workOrderId` via `findLatestVerifiedEntry` with a 64-hex `entryHash` (`409 UNVERIFIED_STAGE_BLOCKED` before Stage 4 runs or on `modernizer.verified` collisions, `404 WORK_ORDER_NOT_FOUND` when `workOrderId` does not match any live 8090 Work Order; never fabricates `'sha256:verified'` or synthetic USD costs).
@@ -65,10 +66,16 @@ Exports of `src/engines/refinery-context.js`:
   - `seedOrganizationalContext({ repoDir })`: Seeds `stack.context` (`krusch-context-mcp` SQLite `FTS5/BM25` + `INV-12` span provenance + `revise` superseding lineage from `INV-FIN-02` to `INV-FIN-03`), indexes `emails`, `chats`, and `transcripts` into `@krusch/toolkit/raw-rag` (`createRawRagIndex({ offline: true })` + `chunkConversationWindows` + `rerankCandidateWindows`), and optionally syncs lineage to `hydraClient.ingestMemories` when `hydraClient?.isConfigured()` is true. Returns `okEnvelope('deadbolt.refinery.seed', ...)`.
   - `hydrateWorkOrderContext({ workOrderId = 'WO-101', query = 'INV-FIN-03 fee rounding batch settlement reconciliation', tokenBudget = 4000 })`: Retrieves bounded context (`< 4000` tokens) from `stack.context.retrieve`, `rawRag.retrieve`, `stack.context.health` (`INV-12` span lock verification: `VALID` vs `STALE_DRIFT`), sanitizes untrusted external inputs via `delimitUntrustedContent` + `sanitizeAgentMessage`, and optionally enriches from `hydraClient.queryContext`. Returns `okEnvelope('deadbolt.refinery.hydrate', summary, { workOrder, contextBriefing, tokensUsed, tokenBudget, spanIntegrity, lineageChain, modalitiesHydrated, untrustedGuard, hydraSync })`.
 
-### Module B (Agent 2): Stage 2 Planner & Stage 3 Foundry
+### Module B (Agent 2): Stage 2 Planner, Portable WASM Tree-sitter & Stage 3 Foundry
 Files owned exclusively by Agent 2:
+- `src/engines/treesitter-ast.js`
 - `src/engines/planner-graph.js`
 - `src/engines/foundry-staging.js`
+
+Exports of `src/engines/treesitter-ast.js`:
+- `TREE_SITTER_GRAMMAR_BY_EXTENSION`: Frozen map of all 14 enterprise extensions to their 11 WebAssembly Tree-sitter grammars.
+- `initTreeSitterRuntime()` & `isTreeSitterReady()`: Idempotent WASM parser and grammar preloader (`web-tree-sitter` + `tree-sitter-wasms`).
+- `analyzeFileWithTreeSitter(sourceText, filePath)`: Deterministic CST symbol, import, call, syntax-error, and SOX policy-floor AST analyzer returning `okEnvelope('deadbolt.treesitter.analyze', ...)`.
 
 Exports of `src/engines/planner-graph.js`:
 - `normalizeGitHubRepoInput(rawInput)`: Normalizes browser-copied GitHub URLs (`/tree/<ref>/...`, `/blob/<ref>/<file>`, `github.com/owner/repo`, `owner/repo`, `git@github.com:owner/repo.git`) while rejecting path-traversal segments and preserving SSRF checks.
@@ -86,9 +93,9 @@ Exports of `src/engines/foundry-staging.js`:
 - `createFoundryEngine({ stack })`:
   - `auditWithSlopBreaker({ files, label = 'candidate' })`: Runs `<1ms` `scoreLegoBrickCoverage` and `auditBoilerplateText` (`@krusch/toolkit/catalog`).
   - `stageWorkOrderEdits({ workOrderId, goal, repoDir, edits })`: Stages `edits` in an isolated staging workspace copy with an isolated per-stage journal (`stage.db`) and bounded `MAX_STAGED_TASKS = 64` LRU eviction aligned with `MAX_VERIFIED_TASKS = 64`.
-  - `applyVerifiedStage({ taskId, applyToRepoDir = false })`: Applies verified staged diffs only after Validator approval.
+  - `applyVerifiedStage({ taskId, applyToRepoDir = false })`: Applies verified staged diffs only after Validator approval, using a symlink-guarded persisted SQLite apply journal (`.krusch-stack/repo-apply.db`) when `applyToRepoDir === true`.
   - `releaseStage(taskId)`: Deterministically removes staged scratch directories from `os.tmpdir()` and evicts `stagedTasks` state.
-  - `runCrashRecoveryDrill({ repoDir })`: Simulates a mid-apply crash (`RECOVERY_PENDING`) on an isolated `drill-stack.db` and verifies `recoverInFlight()` convergence (`halfWrittenFiles === 0`).
+  - `runCrashRecoveryDrill({ repoDir })`: Spawns a child apply worker on an isolated `drill-stack.db`, terminates the worker with `SIGKILL` immediately after the first file rename (`APPLYING`), and spawns a fresh recovery process (`recoverInFlight`) proving deterministic rollback (`halfWrittenFiles === 0`).
 
 ### Module C (Agent 3): Stage 4 Validator, Modernizer Benchmark & Sponsor Connectors
 Files owned by Agent 3 / Modernizer & Connector layer:

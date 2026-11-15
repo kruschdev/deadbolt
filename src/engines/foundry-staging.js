@@ -7,18 +7,23 @@
  * - Deterministic crash-recovery journal drill (`runCrashRecoveryDrill`)
  */
 
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   createKruschStack,
   createHarnessEngine,
-  openStackDatabase,
-  fsyncDirectory
+  openStackDatabase
 } from 'krusch-stack';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { scoreLegoBrickCoverage, auditBoilerplateText } from '@krusch/toolkit/catalog';
+
+const require = createRequire(import.meta.url);
+const KRUSCH_STACK_ENTRY_URL = pathToFileURL(require.resolve('krusch-stack')).href;
 
 const MAX_STAGED_TASKS = 64;
 
@@ -187,59 +192,19 @@ function resolveContainedRepoTarget(rootDir, relFilePath) {
   return { resolvedRoot, realRoot, normalizedRel, targetAbs };
 }
 
-/**
- * Atomically write a verified staged file into a target directory with fsync + rename.
- * @param {string} rootDir
- * @param {string} relFilePath
- * @param {string|Buffer} content
- */
-function atomicSyncVerifiedFile(rootDir, relFilePath, content) {
-  const { realRoot, normalizedRel, targetAbs } = resolveContainedRepoTarget(rootDir, relFilePath);
-
-  const parentDir = path.dirname(targetAbs);
-  fs.mkdirSync(parentDir, { recursive: true });
-  const realParent = fs.realpathSync(parentDir);
-  if (realParent !== realRoot && !realParent.startsWith(`${realRoot}${path.sep}`)) {
-    throw new Error(`Refusing parent directory escaping repository realpath: ${normalizedRel}`);
-  }
-
-  const tempPath = path.join(
-    parentDir,
-    `.${path.basename(targetAbs)}.deadbolt-sync-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
-  );
-
-  let fd = null;
-  let renamed = false;
-  try {
-    fd = fs.openSync(tempPath, 'wx', 0o600);
-    if (Buffer.isBuffer(content)) {
-      fs.writeFileSync(fd, content);
-    } else {
-      fs.writeFileSync(fd, String(content ?? ''), 'utf8');
-    }
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = null;
-
-    fs.renameSync(tempPath, targetAbs);
-    renamed = true;
-    fsyncDirectory(parentDir);
-  } finally {
-    if (fd !== null) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        // Ignore descriptor close error
-      }
-    }
-    if (!renamed) {
-      try {
-        fs.rmSync(tempPath, { force: true });
-      } catch {
-        // Ignore temp file cleanup error
-      }
+function listOrphanedTempFiles(dirPath) {
+  const orphans = [];
+  if (!fs.existsSync(dirPath)) return orphans;
+  for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+    if (IGNORED_STAGE_DIRS.has(entry.name)) continue;
+    const full = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      orphans.push(...listOrphanedTempFiles(full));
+    } else if (entry.name.includes('.krusch-tmp-')) {
+      orphans.push(full);
     }
   }
+  return orphans;
 }
 
 /**
@@ -540,53 +505,63 @@ export function createFoundryEngine({ stack = null } = {}) {
       : [];
 
     let syncedToRepoDir = false;
+    let repoSyncJournalDb = null;
     if (applyToRepoDir && record?.stagingDir && record?.repoDir) {
-      /** @type {Array<{ relFile: string, targetAbs: string, existed: boolean, originalBytes: Buffer | null }>} */
-      const preSyncSnapshots = [];
-      /** @type {Array<{ relFile: string, targetAbs: string, existed: boolean, originalBytes: Buffer | null }>} */
-      const syncedEntries = [];
+      let repoDb = null;
       try {
+        /** @type {Array<{ file_path: string, content: string }>} */
+        const verifiedRepoEdits = [];
         for (const relFile of appliedFiles) {
           const { normalizedRel, targetAbs } = resolveContainedRepoTarget(record.repoDir, relFile);
-          let existed = false;
-          let originalBytes = null;
           try {
             const existingStat = fs.lstatSync(targetAbs);
             if (existingStat.isSymbolicLink() || existingStat.isDirectory()) {
               throw new Error(`Refusing non-regular file target "${normalizedRel}".`);
             }
-            existed = true;
-            originalBytes = fs.readFileSync(targetAbs);
           } catch (statErr) {
             if (statErr?.code !== 'ENOENT') {
               throw statErr;
             }
           }
-          preSyncSnapshots.push({ relFile: normalizedRel, targetAbs, existed, originalBytes });
+          const stagedFileInfo = resolveContainedRepoTarget(record.stagingDir, normalizedRel);
+          const verifiedContent = fs.readFileSync(stagedFileInfo.targetAbs, 'utf8');
+          verifiedRepoEdits.push({
+            file_path: normalizedRel,
+            content: verifiedContent
+          });
         }
 
-        for (const snap of preSyncSnapshots) {
-          const stagedFileInfo = resolveContainedRepoTarget(record.stagingDir, snap.relFile);
-          const verifiedBytes = fs.readFileSync(stagedFileInfo.targetAbs);
-          atomicSyncVerifiedFile(record.repoDir, snap.relFile, verifiedBytes);
-          syncedEntries.push(snap);
+        const repoJournalDir = path.join(record.repoDir, '.krusch-stack');
+        fs.mkdirSync(repoJournalDir, { recursive: true });
+        repoSyncJournalDb = path.join(repoJournalDir, 'repo-apply.db');
+        repoDb = openStackDatabase({
+          workspaceRoot: record.repoDir,
+          dbPath: repoSyncJournalDb,
+          ephemeral: false
+        });
+        const repoHarness = createHarnessEngine({
+          db: repoDb,
+          workspaceRoot: record.repoDir,
+          contextEngine: null
+        });
+        repoHarness.recoverInFlight();
+
+        const syncTaskId = `${cleanTaskId}-reposync-${crypto.randomBytes(3).toString('hex')}`;
+        const repoStageRes = repoHarness.run({
+          task_id: syncTaskId,
+          goal: `[${record.workOrderId || 'WO'}] Promote verified stage ${cleanTaskId} to repository`,
+          edits: verifiedRepoEdits
+        });
+        if (!repoStageRes.ok) {
+          throw new Error(repoStageRes.summary || 'Failed to stage repository promotion journal.');
+        }
+
+        const repoApplyRes = repoHarness.applyDiff({ task_id: syncTaskId });
+        if (!repoApplyRes.ok) {
+          throw new Error(repoApplyRes.summary || 'Failed to apply repository promotion journal.');
         }
         syncedToRepoDir = true;
       } catch (syncErr) {
-        let rollbackClean = true;
-        for (let idx = syncedEntries.length - 1; idx >= 0; idx -= 1) {
-          const prev = syncedEntries[idx];
-          try {
-            if (prev.existed && prev.originalBytes !== null) {
-              atomicSyncVerifiedFile(record.repoDir, prev.relFile, prev.originalBytes);
-            } else {
-              fs.rmSync(prev.targetAbs, { force: true });
-              fsyncDirectory(path.dirname(prev.targetAbs));
-            }
-          } catch {
-            rollbackClean = false;
-          }
-        }
         return errorEnvelope(
           'REPO_SYNC_FAILED',
           syncErr instanceof Error
@@ -595,11 +570,16 @@ export function createFoundryEngine({ stack = null } = {}) {
           {
             taskId: cleanTaskId,
             workOrderId: record?.workOrderId || null,
-            rolledBackCount: syncedEntries.length,
-            rollbackClean
+            journalBacked: true
           },
           'deadbolt.foundry.apply'
         );
+      } finally {
+        try {
+          repoDb?.close?.();
+        } catch {
+          // Ignore close error on repo-apply journal database
+        }
       }
     }
 
@@ -611,26 +591,36 @@ export function createFoundryEngine({ stack = null } = {}) {
       status: applyRes.data?.status || 'APPLIED',
       appliedFiles,
       stagingDir: record?.stagingDir || stack?.workspaceRoot || null,
-      syncedToRepoDir
+      syncedToRepoDir,
+      ...(repoSyncJournalDb ? { repoSyncJournalBacked: true } : {})
     });
   }
 
   /**
-   * Execute a live crash-recovery drill (`INV-DB-06`):
-   * 1. Stage a 2-file atomic edit (`src/fee-engine.js` + `src/settlement-service.js`) in an isolated scratch repo.
-   * 2. Simulate power/process loss mid-apply after writing file 1 and leaving `harness_apply_journal` in `RECOVERY_PENDING`.
-   * 3. Invoke `drillStack.harness.recoverInFlight()` and prove deterministic rollback (`halfWrittenFiles === 0`).
+   * Execute a live multi-process crash-recovery drill (`INV-DB-06`):
+   * 1. Stage a 2-file edit (`src/fee-engine.js` + `src/settlement-service.js`) in an isolated SQLite WAL database (`drill-stack.db`).
+   * 2. Spawn Worker Process 1 running `applyDiff()` and kill it with OS `SIGKILL` right after file 1 is renamed and fsynced (leaving file 1 mutated, file 2 untouched, an unrenamed `.krusch-tmp-*` sibling on disk, and `harness_apply_journal` in `APPLYING`).
+   * 3. Spawn a cold fresh Recovery Process 2 opening `drill-stack.db` and running `recoverInFlight()` to restore preimages (`halfWrittenFiles === 0`, `orphanedTempCleaned === true`).
    * @param {object} [params={}]
    * @param {string} [params.repoDir]
    */
-  function runCrashRecoveryDrill({ repoDir } = {}) {
+  async function runCrashRecoveryDrill({ repoDir } = {}) {
     const drillRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'deadbolt-crash-drill-'));
     const drillWorkspace = path.join(drillRoot, 'workspace');
     const drillDbPath = path.join(drillRoot, 'drill-stack.db');
+    const markerPath = path.join(drillRoot, 'first-rename.marker');
+    const workerApplyScript = path.join(drillRoot, 'worker-apply.mjs');
+    const workerRecoverScript = path.join(drillRoot, 'worker-recover.mjs');
 
     let drillStack = null;
+    let workerChild = null;
     try {
-      if (repoDir && typeof repoDir === 'string' && fs.existsSync(repoDir) && fs.statSync(repoDir).isDirectory()) {
+      if (
+        repoDir &&
+        typeof repoDir === 'string' &&
+        fs.existsSync(repoDir) &&
+        fs.statSync(repoDir).isDirectory()
+      ) {
         copyWorkspaceTree(path.resolve(repoDir), drillWorkspace);
       } else {
         fs.mkdirSync(path.join(drillWorkspace, 'src'), { recursive: true });
@@ -662,20 +652,22 @@ export function createFoundryEngine({ stack = null } = {}) {
       const baseFile1Hash = sha256Hex(baseFile1Text);
       const baseFile2Hash = sha256Hex(baseFile2Text);
 
-      const stagedFile1Text = `${baseFile1Text}\n// [WO-101] Staged atomic batch fee allocation part 1\n`;
-      const stagedFile2Text = `${baseFile2Text}\n// [WO-101] Staged atomic settlement parity check part 2\n`;
+      const stagedFile1Text = `${baseFile1Text}\n// [WO-101] Staged batch fee allocation part 1\n`;
+      const stagedFile2Text = `${baseFile2Text}\n// [WO-101] Staged settlement parity check part 2\n`;
       const stagedFile1Hash = sha256Hex(stagedFile1Text);
       const stagedFile2Hash = sha256Hex(stagedFile2Text);
 
       drillStack = createKruschStack({
         workspaceRoot: drillWorkspace,
         dbPath: drillDbPath,
+        ephemeral: false,
+        recoverOnStartup: false,
         profile: 'core'
       });
 
       const stageRes = drillStack.harness.run({
         task_id: 'task-crash-drill-wo-101',
-        goal: '[WO-101] Atomic 2-file fee and settlement update',
+        goal: '[WO-101] Staged 2-file fee and settlement update',
         edits: [
           { file_path: file1Rel, content: stagedFile1Text },
           { file_path: file2Rel, content: stagedFile2Text }
@@ -692,66 +684,153 @@ export function createFoundryEngine({ stack = null } = {}) {
       }
 
       const taskId = stageRes.data.task_id;
+      drillStack.db.close();
+      drillStack = null;
 
-      // Simulate mid-apply crash right after file 1 is renamed and before file 2 is renamed,
-      // leaving an orphaned sibling temp file for file 2 and journal state = RECOVERY_PENDING.
-      const journalEntries = [
-        {
-          file_path: file1Rel,
-          has_content: true,
-          existed_before: true,
-          base_content: baseFile1Text,
-          base_sha256: baseFile1Hash,
-          staged_sha256: stagedFile1Hash
-        },
-        {
-          file_path: file2Rel,
-          has_content: true,
-          existed_before: true,
-          base_content: baseFile2Text,
-          base_sha256: baseFile2Hash,
-          staged_sha256: stagedFile2Hash
-        }
-      ];
-
-      drillStack.db
-        .prepare(`
-          INSERT INTO harness_apply_journal (
-            task_id, state, entries_json, last_error, created_at, updated_at
-          ) VALUES (?, 'RECOVERY_PENDING', ?, 'SIMULATED_CRASH_AFTER_FILE_1_RENAME', datetime('now'), datetime('now'))
-        `)
-        .run(taskId, JSON.stringify(journalEntries));
-
-      fs.writeFileSync(file1Abs, stagedFile1Text, 'utf8');
-      const orphanedTmp = path.join(
-        path.dirname(file2Abs),
-        `.${path.basename(file2Abs)}.krusch-tmp-${process.pid}-crashsim`
+      // Worker Process 1: runs real applyDiff() and pauses immediately after file 1 rename + dir fsync
+      fs.writeFileSync(
+        workerApplyScript,
+        [
+          `import { createKruschStack } from ${JSON.stringify(KRUSCH_STACK_ENTRY_URL)};`,
+          'const [ws, dbPath, tId] = process.argv.slice(2);',
+          'const stack = createKruschStack({ workspaceRoot: ws, dbPath, ephemeral: false, recoverOnStartup: false, profile: "core" });',
+          'stack.harness.applyDiff({ task_id: tId });'
+        ].join('\n'),
+        'utf8'
       );
-      fs.writeFileSync(orphanedTmp, stagedFile2Text, 'utf8');
 
+      workerChild = spawn(
+        process.execPath,
+        [workerApplyScript, drillWorkspace, drillDbPath, taskId],
+        {
+          env: {
+            PATH: process.env.PATH || '/usr/bin:/bin',
+            NODE_NO_WARNINGS: '1',
+            KRUSCH_ENABLE_TEST_HOOKS: '1',
+            KRUSCH_TEST_HOOK_PAUSE_AFTER_FIRST_RENAME: '1',
+            KRUSCH_TEST_HOOK_MARKER_FILE: markerPath
+          },
+          stdio: ['ignore', 'pipe', 'pipe']
+        }
+      );
+
+      const workerExitPromise = new Promise((resolve, reject) => {
+        workerChild.once('error', reject);
+        workerChild.once('exit', (code, signal) => resolve({ code, signal }));
+      });
+
+      const pollDeadline = Date.now() + 6000;
+      let markerContent = '';
+      while (Date.now() < pollDeadline) {
+        if (fs.existsSync(markerPath)) {
+          markerContent = fs.readFileSync(markerPath, 'utf8').trim();
+          if (markerContent.length > 0) {
+            break;
+          }
+        }
+        if (workerChild.exitCode !== null || workerChild.signalCode !== null) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 12));
+      }
+
+      if (!markerContent) {
+        return errorEnvelope(
+          'CRASH_DRILL_WORKER_FAILED',
+          'Apply worker did not reach first-rename checkpoint within timeout.',
+          { taskId },
+          'deadbolt.foundry.crash_drill'
+        );
+      }
+
+      const workerPid = Number(markerContent) || workerChild.pid;
+      workerChild.kill('SIGKILL');
+      const workerExit = await workerExitPromise;
+      workerChild = null;
+
+      // Inspect torn on-disk state BEFORE opening SQLite in recovery process
       const crashFile1Hash = sha256Hex(fs.readFileSync(file1Abs, 'utf8'));
       const crashFile2Hash = sha256Hex(fs.readFileSync(file2Abs, 'utf8'));
-      const journalBeforeRow = drillStack.db
-        .prepare('SELECT state FROM harness_apply_journal WHERE task_id = ?')
-        .get(taskId);
-      const journalStateBefore = journalBeforeRow?.state || 'RECOVERY_PENDING';
+      const orphansDuringCrash = listOrphanedTempFiles(drillWorkspace);
+      const halfWrittenBefore =
+        (crashFile1Hash === stagedFile1Hash ? 1 : 0) +
+        (crashFile2Hash === stagedFile2Hash ? 1 : 0);
 
-      // Execute deterministic journal recovery
-      const recoveryEnvelope = drillStack.harness.recoverInFlight();
+      // Recovery Process 2: fresh OS process opening drill-stack.db cold over SQLite WAL
+      fs.writeFileSync(
+        workerRecoverScript,
+        [
+          `import { createKruschStack } from ${JSON.stringify(KRUSCH_STACK_ENTRY_URL)};`,
+          'const [ws, dbPath, tId] = process.argv.slice(2);',
+          'const stack = createKruschStack({ workspaceRoot: ws, dbPath, ephemeral: false, recoverOnStartup: false, profile: "core" });',
+          'const beforeRow = stack.db.prepare("SELECT state FROM harness_apply_journal WHERE task_id = ?").get(tId);',
+          'const recoveryEnvelope = stack.harness.recoverInFlight();',
+          'const afterRow = stack.db.prepare("SELECT state FROM harness_apply_journal WHERE task_id = ?").get(tId);',
+          'const taskRow = stack.db.prepare("SELECT status FROM harness_tasks WHERE task_id = ?").get(tId);',
+          'stack.db.close();',
+          'process.stdout.write(JSON.stringify({',
+          '  pid: process.pid,',
+          '  journalStateBefore: beforeRow?.state || "UNKNOWN",',
+          '  journalStateAfter: afterRow?.state || "UNKNOWN",',
+          '  taskStatusAfter: taskRow?.status || "UNKNOWN",',
+          '  recoveryEnvelope',
+          '}) + "\\n");'
+        ].join('\n'),
+        'utf8'
+      );
+
+      const recoverChild = spawn(
+        process.execPath,
+        [workerRecoverScript, drillWorkspace, drillDbPath, taskId],
+        {
+          env: {
+            PATH: process.env.PATH || '/usr/bin:/bin',
+            NODE_NO_WARNINGS: '1'
+          },
+          stdio: ['ignore', 'pipe', 'pipe']
+        }
+      );
+
+      let recoverStdout = '';
+      let recoverStderr = '';
+      recoverChild.stdout.on('data', (chunk) => {
+        recoverStdout += chunk.toString('utf8');
+      });
+      recoverChild.stderr.on('data', (chunk) => {
+        recoverStderr += chunk.toString('utf8');
+      });
+
+      const recoverExit = await new Promise((resolve, reject) => {
+        recoverChild.once('error', reject);
+        recoverChild.once('exit', (code, signal) => resolve({ code, signal }));
+      });
+
+      if (recoverExit.code !== 0) {
+        return errorEnvelope(
+          'CRASH_DRILL_RECOVERY_PROCESS_FAILED',
+          `Fresh recovery process exited non-zero (code=${recoverExit.code}, signal=${recoverExit.signal}).`,
+          { stderr: recoverStderr.slice(0, 400) },
+          'deadbolt.foundry.crash_drill'
+        );
+      }
+
+      const lastJsonLine = recoverStdout
+        .trim()
+        .split(/\r?\n/)
+        .reverse()
+        .find((line) => line.trim().startsWith('{'));
+      const recoverPayload = JSON.parse(lastJsonLine || '{}');
+      const recoveryEnvelope = recoverPayload.recoveryEnvelope || { ok: false };
+      const journalStateBefore = recoverPayload.journalStateBefore || 'APPLYING';
+      const journalStateAfter = recoverPayload.journalStateAfter || 'UNKNOWN';
+      const taskStatusAfter = recoverPayload.taskStatusAfter || 'UNKNOWN';
+      const recoveryPid = recoverPayload.pid || null;
 
       const recoveredFile1Hash = sha256Hex(fs.readFileSync(file1Abs, 'utf8'));
       const recoveredFile2Hash = sha256Hex(fs.readFileSync(file2Abs, 'utf8'));
-      const orphanCleaned = !fs.existsSync(orphanedTmp);
-
-      const journalAfterRow = drillStack.db
-        .prepare('SELECT state FROM harness_apply_journal WHERE task_id = ?')
-        .get(taskId);
-      const taskAfterRow = drillStack.db
-        .prepare('SELECT status FROM harness_tasks WHERE task_id = ?')
-        .get(taskId);
-
-      const journalStateAfter = journalAfterRow?.state || 'UNKNOWN';
-      const taskStatusAfter = taskAfterRow?.status || 'UNKNOWN';
+      const orphansAfterRecovery = listOrphanedTempFiles(drillWorkspace);
+      const orphanCleaned =
+        orphansDuringCrash.length >= 1 && orphansAfterRecovery.length === 0;
 
       const matchesStagedCount =
         (recoveredFile1Hash === stagedFile1Hash ? 1 : 0) +
@@ -762,7 +841,16 @@ export function createFoundryEngine({ stack = null } = {}) {
 
       const allConsistent = matchesBaseCount === 2 || matchesStagedCount === 2;
       const halfWrittenFiles = allConsistent ? 0 : 2 - Math.max(matchesBaseCount, matchesStagedCount);
-      const converged = Boolean(recoveryEnvelope.ok && halfWrittenFiles === 0 && orphanCleaned);
+      const converged = Boolean(
+        workerExit.signal === 'SIGKILL' &&
+          recoveryPid &&
+          recoveryPid !== workerPid &&
+          recoveryEnvelope.ok &&
+          journalStateBefore === 'APPLYING' &&
+          journalStateAfter === 'ROLLED_BACK' &&
+          halfWrittenFiles === 0 &&
+          orphanCleaned
+      );
 
       const fileHashes = {
         [file1Rel]: {
@@ -781,22 +869,34 @@ export function createFoundryEngine({ stack = null } = {}) {
 
       const recoveryResult = recoveryEnvelope.data || {};
       const summary = converged
-        ? `Crash-recovery drill converged cleanly (${journalStateBefore} -> ${journalStateAfter}, 0 half-written files, orphaned temp cleaned).`
+        ? `Multi-process crash-recovery drill converged cleanly (worker SIGKILL -> fresh-process ${journalStateBefore} -> ${journalStateAfter}, 0 half-written files, orphaned temp cleaned).`
         : `Crash-recovery drill did not converge (halfWrittenFiles=${halfWrittenFiles}).`;
 
       return okEnvelope('deadbolt.foundry.crash_drill', summary, {
         taskId,
+        workerPid,
+        recoveryPid,
+        workerKilledSignal: workerExit.signal || null,
+        recoveredInFreshProcess: Boolean(recoveryPid && recoveryPid !== workerPid),
         journalStateBefore,
         journalStateAfter,
         taskStatusAfter,
         recoveryResult,
-        halfWrittenFilesBeforeRecovery: 1,
+        halfWrittenFilesBeforeRecovery: halfWrittenBefore,
+        orphanedTempsBeforeRecovery: orphansDuringCrash.length,
         halfWrittenFiles,
         orphanedTempCleaned: orphanCleaned,
         fileHashes,
         converged
       });
     } finally {
+      if (workerChild && workerChild.exitCode === null && workerChild.signalCode === null) {
+        try {
+          workerChild.kill('SIGKILL');
+        } catch {
+          // Ignore worker kill error during cleanup
+        }
+      }
       try {
         drillStack?.db?.close?.();
       } catch {

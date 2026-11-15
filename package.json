@@ -29,6 +29,8 @@
   },
   "dependencies": {
     "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/b8bc7506bc4cf5c9ccb2a7ae76ae171e98ce99ad.tar.gz",
-    "krusch-stack": "https://github.com/kruschdev/krusch-stack/archive/9b8c4a2e7d08e88db5195aa701c287f7f076bc6d.tar.gz"
+    "krusch-stack": "https://github.com/kruschdev/krusch-stack/archive/98dcaacaa1e9d752be4b646a96fa81dfee5060b0.tar.gz",
+    "tree-sitter-wasms": "^0.1.13",
+    "web-tree-sitter": "^0.22.6"
   }
 }

@@ -20,6 +20,11 @@ import { selectCascadeTier, createTierCircuitBreaker } from '@krusch/toolkit/cas
 import { scoreLegoBrickCoverage, auditBoilerplateText } from '@krusch/toolkit/catalog';
 import { validateOutboundUrl, isPrivateOrReservedIp } from '@krusch/toolkit/security';
 import { scrubPrivateNetworkStrings } from '../connectors/hydradb-graph.js';
+import {
+  initTreeSitterRuntime,
+  isTreeSitterReady,
+  analyzeFileWithTreeSitter
+} from './treesitter-ast.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -803,12 +808,38 @@ function collectRepoCodeFiles(rootDir, maxFiles = 200, options = {}) {
   return collectPrioritizedRepoFiles(rootDir, maxFiles, options).files;
 }
 
+function resolveTreeSitterData(source, filePath, precomputedTsData = null) {
+  if (precomputedTsData && precomputedTsData.supported) {
+    return precomputedTsData;
+  }
+  if (!isTreeSitterReady() || !filePath) {
+    return null;
+  }
+  const tsEnv = analyzeFileWithTreeSitter(source, filePath);
+  return tsEnv.ok && tsEnv.data?.supported ? tsEnv.data : null;
+}
+
 /**
- * Extract relative ESM and CommonJS import specifiers from JS/TS source with comments masked.
+ * Extract relative ESM and CommonJS import specifiers from JS/TS source via Tree-sitter CST
+ * (with comment-masked regex fallback when WASM runtime has not been initialized yet).
  * @param {string} source
+ * @param {string} [filePath='module.js']
+ * @param {object|null} [precomputedTsData=null]
  * @returns {string[]}
  */
-function extractRelativeSpecifiers(source) {
+function extractRelativeSpecifiers(source, filePath = 'module.js', precomputedTsData = null) {
+  const tsData = resolveTreeSitterData(source, filePath, precomputedTsData);
+  if (tsData) {
+    const specifiers = new Set();
+    for (const imp of tsData.imports || []) {
+      const spec = String(imp?.specifier || '').trim();
+      if (spec.startsWith('./') || spec.startsWith('../')) {
+        specifiers.add(spec);
+      }
+    }
+    return [...specifiers];
+  }
+
   const noComments = maskCodePreservingNewlines(String(source || ''), { maskStrings: false });
   const specifiers = new Set();
 
@@ -1264,18 +1295,22 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
       if (!item || typeof item !== 'object') continue;
       const fp = normalizeRelPath(item.filePath ?? item.file_path ?? item.path ?? '');
       if (!fp) continue;
+      const content = String(item.content ?? item.code ?? '');
       entries.push({
         filePath: fp,
-        content: String(item.content ?? item.code ?? '')
+        content,
+        tsData: resolveTreeSitterData(content, fp, item.tsData || null)
       });
     }
   } else if (scannedFiles && typeof scannedFiles === 'object') {
     for (const [rawPath, rawContent] of Object.entries(scannedFiles)) {
       const fp = normalizeRelPath(rawPath);
       if (!fp) continue;
+      const content = String(rawContent ?? '');
       entries.push({
         filePath: fp,
-        content: String(rawContent ?? '')
+        content,
+        tsData: resolveTreeSitterData(content, fp, null)
       });
     }
   }
@@ -1308,21 +1343,35 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
   for (const entry of entries) {
     const ext = path.extname(entry.filePath).toLowerCase();
     if (ext !== '.java' && ext !== '.kt') continue;
-    const cleaned = stripCStyleComments(entry.content, false);
-    const pkgMatch = /^\s*package\s+([A-Za-z_][A-Za-z0-9_.]*)/m.exec(cleaned);
-    const pkg = pkgMatch ? pkgMatch[1] : '';
+    const tsData = entry.tsData;
+    const cleaned = tsData ? '' : stripCStyleComments(entry.content, false);
+    const pkg = tsData
+      ? String(tsData.packageName || '').trim()
+      : (() => {
+          const pkgMatch = /^\s*package\s+([A-Za-z_][A-Za-z0-9_.]*)/m.exec(cleaned);
+          return pkgMatch ? pkgMatch[1] : '';
+        })();
     const classSet = new Set();
     const stem = path.posix.basename(entry.filePath, ext);
     if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(stem)) {
       classSet.add(stem);
     }
-    for (const m of cleaned.matchAll(/\b(?:class|interface|enum|record|object)\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
-      if (m[1]) classSet.add(m[1]);
+    if (tsData) {
+      for (const sym of tsData.symbols || []) {
+        if (['class', 'interface', 'enum', 'record', 'object'].includes(sym.symbol_type)) {
+          classSet.add(sym.symbol_name);
+        }
+      }
+    } else {
+      for (const m of cleaned.matchAll(/\b(?:class|interface|enum|record|object)\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+        if (m[1]) classSet.add(m[1]);
+      }
     }
     const meta = {
       filePath: entry.filePath,
       ext,
       cleaned,
+      tsData,
       pkg,
       classNames: [...classSet]
     };
@@ -1345,11 +1394,18 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
 
   for (const entry of entries) {
     if (!entry.filePath.toLowerCase().endsWith('.cs')) continue;
-    const cleaned = stripCStyleComments(entry.content, false);
+    const tsData = entry.tsData;
+    const cleaned = tsData ? '' : stripCStyleComments(entry.content, false);
     const namespaces = [];
-    for (const m of cleaned.matchAll(/\bnamespace\s+([A-Za-z_][A-Za-z0-9_.]*)\s*[;{]/g)) {
-      if (m[1] && !namespaces.includes(m[1])) {
-        namespaces.push(m[1]);
+    if (tsData) {
+      for (const ns of tsData.namespaces || []) {
+        if (ns && !namespaces.includes(ns)) namespaces.push(ns);
+      }
+    } else {
+      for (const m of cleaned.matchAll(/\bnamespace\s+([A-Za-z_][A-Za-z0-9_.]*)\s*[;{]/g)) {
+        if (m[1] && !namespaces.includes(m[1])) {
+          namespaces.push(m[1]);
+        }
       }
     }
     const typeSet = new Set();
@@ -1357,12 +1413,21 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
     if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(stem)) {
       typeSet.add(stem);
     }
-    for (const m of cleaned.matchAll(/\b(?:class|interface|struct|record|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
-      if (m[1]) typeSet.add(m[1]);
+    if (tsData) {
+      for (const sym of tsData.symbols || []) {
+        if (['class', 'interface', 'struct', 'record', 'enum'].includes(sym.symbol_type)) {
+          typeSet.add(sym.symbol_name);
+        }
+      }
+    } else {
+      for (const m of cleaned.matchAll(/\b(?:class|interface|struct|record|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+        if (m[1]) typeSet.add(m[1]);
+      }
     }
     const meta = {
       filePath: entry.filePath,
       cleaned,
+      tsData,
       namespaces,
       typeNames: [...typeSet]
     };
@@ -1381,18 +1446,33 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
   for (const entry of entries) {
     const from = entry.filePath;
     const ext = path.extname(from).toLowerCase();
+    const tsData = entry.tsData;
 
     // 1. JS / TS relative + `@/` and `~/` path aliases
     if (JS_TS_EXTENSIONS.has(ext)) {
-      const masked = maskCodePreservingNewlines(entry.content, { maskStrings: false });
       const specs = new Set();
-      const jsPatterns = [
-        /\b(?:import|export)\s+(?:[^'";]{1,600}?\s+from\s+)?['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]/g,
-        /\b(?:import|require)\s*\(\s*['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]\s*\)/g
-      ];
-      for (const regex of jsPatterns) {
-        for (const m of masked.matchAll(regex)) {
-          if (m[1]) specs.add(m[1].trim());
+      if (tsData) {
+        for (const imp of tsData.imports || []) {
+          const spec = String(imp?.specifier || '').trim();
+          if (
+            spec.startsWith('./') ||
+            spec.startsWith('../') ||
+            spec.startsWith('@/') ||
+            spec.startsWith('~/')
+          ) {
+            specs.add(spec);
+          }
+        }
+      } else {
+        const masked = maskCodePreservingNewlines(entry.content, { maskStrings: false });
+        const jsPatterns = [
+          /\b(?:import|export)\s+(?:[^'";]{1,600}?\s+from\s+)?['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]/g,
+          /\b(?:import|require)\s*\(\s*['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]\s*\)/g
+        ];
+        for (const regex of jsPatterns) {
+          for (const m of masked.matchAll(regex)) {
+            if (m[1]) specs.add(m[1].trim());
+          }
         }
       }
       for (const spec of specs) {
@@ -1404,7 +1484,6 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
 
     // 2. Python (.py) absolute dotted & relative `.` / `..` imports
     if (ext === '.py') {
-      const cleanedPy = stripHashComments(entry.content).replace(/\\\r?\n/g, ' ');
       const fromDir = path.posix.dirname(from) === '.' ? '' : path.posix.dirname(from);
       const ancestorRoots = ['', 'src/'];
       let walkDir = fromDir;
@@ -1439,9 +1518,8 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
         if (!dotMatch) return;
         const dots = dotMatch[1] || '';
         const modRest = (dotMatch[2] || '').trim();
-        const names = String(rawNames || '')
-          .split(',')
-          .map((n) => n.trim().split(/\s+as\s+/)[0].trim())
+        const names = (Array.isArray(rawNames) ? rawNames : String(rawNames || '').split(','))
+          .map((n) => String(n).trim().split(/\s+as\s+/)[0].trim())
           .filter((n) => n && n !== '*' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(n));
 
         if (dots.length > 0) {
@@ -1488,21 +1566,39 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
         }
       };
 
-      for (const m of cleanedPy.matchAll(/^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+\(([^)]*)\)/gm)) {
-        handlePyFromImport(m[1], m[2]);
-      }
-      for (const m of cleanedPy.matchAll(/^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+([^\n(]+)/gm)) {
-        handlePyFromImport(m[1], m[2]);
-      }
-      for (const m of cleanedPy.matchAll(/^[ \t]*import[ \t]+([^\n]+)/gm)) {
-        const items = String(m[1] || '').split(',');
-        for (const rawItem of items) {
-          const modName = rawItem.trim().split(/\s+as\s+/)[0].trim();
-          if (!modName || !/^[A-Za-z_][A-Za-z0-9_.]*$/.test(modName)) continue;
-          const modPath = modName.replace(/\./g, '/');
-          for (const rootPrefix of ancestorRoots) {
-            if (tryPyModuleCandidates(`${rootPrefix}${modPath}`)) {
-              break;
+      if (tsData) {
+        for (const imp of tsData.imports || []) {
+          if (imp.kind === 'from_import') {
+            handlePyFromImport(imp.specifier, imp.importedNames || []);
+          } else if (imp.kind === 'import') {
+            const modName = String(imp.specifier || '').trim();
+            if (!modName || !/^[A-Za-z_][A-Za-z0-9_.]*$/.test(modName)) continue;
+            const modPath = modName.replace(/\./g, '/');
+            for (const rootPrefix of ancestorRoots) {
+              if (tryPyModuleCandidates(`${rootPrefix}${modPath}`)) {
+                break;
+              }
+            }
+          }
+        }
+      } else {
+        const cleanedPy = stripHashComments(entry.content).replace(/\\\r?\n/g, ' ');
+        for (const m of cleanedPy.matchAll(/^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+\(([^)]*)\)/gm)) {
+          handlePyFromImport(m[1], m[2]);
+        }
+        for (const m of cleanedPy.matchAll(/^[ \t]*from[ \t]+(\.*[A-Za-z0-9_.]*)[ \t]+import[ \t]+([^\n(]+)/gm)) {
+          handlePyFromImport(m[1], m[2]);
+        }
+        for (const m of cleanedPy.matchAll(/^[ \t]*import[ \t]+([^\n]+)/gm)) {
+          const items = String(m[1] || '').split(',');
+          for (const rawItem of items) {
+            const modName = rawItem.trim().split(/\s+as\s+/)[0].trim();
+            if (!modName || !/^[A-Za-z_][A-Za-z0-9_.]*$/.test(modName)) continue;
+            const modPath = modName.replace(/\./g, '/');
+            for (const rootPrefix of ancestorRoots) {
+              if (tryPyModuleCandidates(`${rootPrefix}${modPath}`)) {
+                break;
+              }
             }
           }
         }
@@ -1512,16 +1608,22 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
 
     // 3. Go (.go) single and grouped `import ( ... )` blocks
     if (ext === '.go') {
-      const cleanedGo = stripCStyleComments(entry.content, true);
       const goImports = new Set();
-      for (const blockMatch of cleanedGo.matchAll(/\bimport\s*\(([\s\S]*?)\)/g)) {
-        const body = blockMatch[1] || '';
-        for (const lineMatch of body.matchAll(/(?:[A-Za-z0-9_.]+\s+)?["`]([^"`\s]+)["`]/g)) {
-          if (lineMatch[1]) goImports.add(lineMatch[1].trim());
+      if (tsData) {
+        for (const imp of tsData.imports || []) {
+          if (imp.specifier) goImports.add(imp.specifier.trim());
         }
-      }
-      for (const singleMatch of cleanedGo.matchAll(/\bimport\s+(?:[A-Za-z0-9_.]+\s+)?["`]([^"`\s]+)["`]/g)) {
-        if (singleMatch[1]) goImports.add(singleMatch[1].trim());
+      } else {
+        const cleanedGo = stripCStyleComments(entry.content, true);
+        for (const blockMatch of cleanedGo.matchAll(/\bimport\s*\(([\s\S]*?)\)/g)) {
+          const body = blockMatch[1] || '';
+          for (const lineMatch of body.matchAll(/(?:[A-Za-z0-9_.]+\s+)?["`]([^"`\s]+)["`]/g)) {
+            if (lineMatch[1]) goImports.add(lineMatch[1].trim());
+          }
+        }
+        for (const singleMatch of cleanedGo.matchAll(/\bimport\s+(?:[A-Za-z0-9_.]+\s+)?["`]([^"`\s]+)["`]/g)) {
+          if (singleMatch[1]) goImports.add(singleMatch[1].trim());
+        }
       }
 
       const fromIsTest = from.endsWith('_test.go');
@@ -1571,7 +1673,6 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
 
     // 4. Rust (.rs) `mod foo;`, `use crate::...`, `use super::...`, `use self::...`
     if (ext === '.rs') {
-      const cleanedRs = stripCStyleComments(entry.content, false);
       const fromBase = path.posix.basename(from);
       const fromDir = path.posix.dirname(from) === '.' ? '' : path.posix.dirname(from);
       const srcMarkerIdx = from.indexOf('/src/');
@@ -1615,9 +1716,27 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
         return false;
       };
 
-      for (const modMatch of cleanedRs.matchAll(/\b(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/g)) {
-        const modName = modMatch[1];
-        if (!modName) continue;
+      const modNames = [];
+      const useClauses = [];
+      if (tsData) {
+        for (const imp of tsData.imports || []) {
+          if (imp.kind === 'mod' && imp.specifier) {
+            modNames.push(imp.specifier);
+          } else if (imp.kind === 'use' && imp.specifier) {
+            useClauses.push(imp.specifier);
+          }
+        }
+      } else {
+        const cleanedRs = stripCStyleComments(entry.content, false);
+        for (const modMatch of cleanedRs.matchAll(/\b(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/g)) {
+          if (modMatch[1]) modNames.push(modMatch[1]);
+        }
+        for (const useMatch of cleanedRs.matchAll(/\b(?:pub(?:\s*\([^)]*\))?\s+)?use\s+([^;]+);/g)) {
+          if (useMatch[1]) useClauses.push(useMatch[1]);
+        }
+      }
+
+      for (const modName of modNames) {
         const modSearchDirs = isRootOrModFile ? [fromDir] : [selfModuleDir, fromDir];
         for (const base of modSearchDirs) {
           if (tryRustModPath([base, modName].filter(Boolean).join('/'))) {
@@ -1626,8 +1745,8 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
         }
       }
 
-      for (const useMatch of cleanedRs.matchAll(/\b(?:pub(?:\s*\([^)]*\))?\s+)?use\s+([^;]+);/g)) {
-        const expanded = expandRustUseTree(useMatch[1]);
+      for (const rawClause of useClauses) {
+        const expanded = expandRustUseTree(rawClause);
         for (const usePath of expanded) {
           const rawSegs = usePath.split('::').map((s) => s.trim()).filter(Boolean);
           if (rawSegs.length === 0) continue;
@@ -1674,10 +1793,14 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
     if (ext === '.java' || ext === '.kt') {
       const meta = jvmMetaByFile.get(from);
       if (!meta) continue;
-      const bodyWithoutHeaders = meta.cleaned
-        .replace(/^\s*package\s+[^\n]+/gm, ' ')
-        .replace(/^\s*import\s+[^\n]+/gm, ' ');
-      const bodyIdents = new Set(bodyWithoutHeaders.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || []);
+      const bodyIdents = meta.tsData
+        ? new Set(meta.tsData.identifiers || [])
+        : (() => {
+            const bodyWithoutHeaders = meta.cleaned
+              .replace(/^\s*package\s+[^\n]+/gm, ' ')
+              .replace(/^\s*import\s+[^\n]+/gm, ' ');
+            return new Set(bodyWithoutHeaders.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || []);
+          })();
 
       const matchJvmFqcnOrSuffix = (fqcn) => {
         const indexed = jvmFqcnToFiles.get(fqcn) || [];
@@ -1700,9 +1823,13 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
         return matched;
       };
 
-      for (const impMatch of meta.cleaned.matchAll(/^\s*import\s+(?:static\s+)?([A-Za-z_][A-Za-z0-9_.*]*)(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?\s*;?/gm)) {
-        const rawImp = (impMatch[1] || '').trim();
-        if (!rawImp) continue;
+      const jvmImports = meta.tsData
+        ? (meta.tsData.imports || []).map((i) => String(i.specifier || '').trim()).filter(Boolean)
+        : [...meta.cleaned.matchAll(/^\s*import\s+(?:static\s+)?([A-Za-z_][A-Za-z0-9_.*]*)(?:\s+as\s+[A-Za-z_][A-Za-z0-9_]*)?\s*;?/gm)]
+            .map((m) => (m[1] || '').trim())
+            .filter(Boolean);
+
+      for (const rawImp of jvmImports) {
         if (rawImp.endsWith('.*')) {
           const wildcardPkg = rawImp.slice(0, -2);
           const peers = jvmPkgToMeta.get(wildcardPkg) || [];
@@ -1743,10 +1870,13 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
       const meta = csMetaByFile.get(from);
       if (!meta) continue;
 
-      for (const usingMatch of meta.cleaned.matchAll(/^\s*(?:global\s+)?using\s+(?:static\s+)?(?!var\b)(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?([A-Za-z_][A-Za-z0-9_.]*)\s*;/gm)) {
-        const ns = (usingMatch[1] || '').trim();
-        if (!ns) continue;
+      const csUsings = meta.tsData
+        ? (meta.tsData.imports || []).map((i) => String(i.specifier || '').trim()).filter(Boolean)
+        : [...meta.cleaned.matchAll(/^\s*(?:global\s+)?using\s+(?:static\s+)?(?!var\b)(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?([A-Za-z_][A-Za-z0-9_.]*)\s*;/gm)]
+            .map((m) => (m[1] || '').trim())
+            .filter(Boolean);
 
+      for (const ns of csUsings) {
         const matchedTargets = [];
         const byNs = csNamespaceToFiles.get(ns) || [];
         for (const target of byNs) {
@@ -1792,8 +1922,12 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
       }
 
       if (meta.namespaces.length > 0) {
-        const bodyNoUsing = meta.cleaned.replace(/^\s*(?:global\s+)?using\s+[^\n]+/gm, ' ');
-        const bodyIdents = new Set(bodyNoUsing.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || []);
+        const bodyIdents = meta.tsData
+          ? new Set(meta.tsData.identifiers || [])
+          : (() => {
+              const bodyNoUsing = meta.cleaned.replace(/^\s*(?:global\s+)?using\s+[^\n]+/gm, ' ');
+              return new Set(bodyNoUsing.match(/\b[A-Za-z_][A-Za-z0-9_]*\b/g) || []);
+            })();
         for (const ns of meta.namespaces) {
           let sameNsAdded = 0;
           for (const peer of csNamespaceToMeta.get(ns) || []) {
@@ -1811,11 +1945,28 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
 
     // 7. Ruby (.rb) `require_relative` and `require`
     if (ext === '.rb') {
-      const cleanedRb = stripHashComments(entry.content);
       const fromDir = path.posix.dirname(from) === '.' ? '' : path.posix.dirname(from);
+      const reqRelSpecs = [];
+      const reqSpecs = [];
+      if (tsData) {
+        for (const imp of tsData.imports || []) {
+          if (imp.kind === 'require_relative' && imp.specifier) {
+            reqRelSpecs.push(imp.specifier.trim());
+          } else if (imp.kind === 'require' && imp.specifier) {
+            reqSpecs.push(imp.specifier.trim());
+          }
+        }
+      } else {
+        const cleanedRb = stripHashComments(entry.content);
+        for (const reqRelMatch of cleanedRb.matchAll(/\brequire_relative\s*(?:\(\s*)?['"]([^'"]+)['"]\s*\)?/g)) {
+          if (reqRelMatch[1]) reqRelSpecs.push(reqRelMatch[1].trim());
+        }
+        for (const reqMatch of cleanedRb.matchAll(/\brequire\s*(?:\(\s*)?['"]([^'"]+)['"]\s*\)?/g)) {
+          if (reqMatch[1]) reqSpecs.push(reqMatch[1].trim());
+        }
+      }
 
-      for (const reqRelMatch of cleanedRb.matchAll(/\brequire_relative\s*(?:\(\s*)?['"]([^'"]+)['"]\s*\)?/g)) {
-        const rawSpec = (reqRelMatch[1] || '').trim();
+      for (const rawSpec of reqRelSpecs) {
         if (!rawSpec) continue;
         const joined = path.posix.normalize(path.posix.join(fromDir || '.', rawSpec));
         if (joined.startsWith('..')) continue;
@@ -1827,8 +1978,7 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
         }
       }
 
-      for (const reqMatch of cleanedRb.matchAll(/\brequire\s*(?:\(\s*)?['"]([^'"]+)['"]\s*\)?/g)) {
-        const rawSpec = (reqMatch[1] || '').trim();
+      for (const rawSpec of reqSpecs) {
         if (!rawSpec) continue;
 
         const candidates = [];
@@ -1858,7 +2008,7 @@ export function extractPolyglotDependencyEdges(scannedFiles = []) {
 
     // 8. PHP (.php) `require` / `include` / route links
     if (ext === '.php') {
-      for (const dep of extractPhpDependencies(entry.content)) {
+      for (const dep of extractPhpDependencies(entry.content, from, tsData)) {
         const target = resolvePhpDependencyTarget(from, dep.specifier, repoFileSet);
         if (target) {
           addEdge(from, target);
@@ -1940,8 +2090,7 @@ function stripPhpCommentsPreservingNewlines(source) {
  * @param {string} source
  * @returns {Array<{ specifier: string, relation: string }>}
  */
-function extractPhpDependencies(source) {
-  const cleaned = stripPhpCommentsPreservingNewlines(source);
+function extractPhpDependencies(source, filePath = 'index.php', precomputedTsData = null) {
   const found = [];
   const seen = new Set();
 
@@ -1957,6 +2106,18 @@ function extractPhpDependencies(source) {
       found.push({ specifier: trimmed, relation });
     }
   };
+
+  const tsData = resolveTreeSitterData(source, filePath, precomputedTsData);
+  if (tsData) {
+    for (const imp of tsData.imports || []) {
+      if (imp.kind === 'requires' || imp.kind === 'links') {
+        addSpec(imp.specifier, imp.kind);
+      }
+    }
+    return found;
+  }
+
+  const cleaned = stripPhpCommentsPreservingNewlines(source);
 
   // Match `require "config.php"`, `include_once('templates/header.php')`,
   // `require_once __DIR__ . '/../common.php'`, `include APPPATH . 'views/head.php'`
@@ -2027,45 +2188,61 @@ function resolvePhpDependencyTarget(importerRelFile, rawSpecifier, repoFileSet) 
  * @param {string} relFile
  * @returns {Array<{ symbol_name: string, symbol_type: string, start_line: number }>}
  */
-function extractPhpFileSymbols(source, relFile) {
-  const cleaned = stripPhpCommentsPreservingNewlines(source);
-  const lines = cleaned.split(/\r?\n/);
+function extractPhpFileSymbols(source, relFile, precomputedTsData = null) {
   const symbols = [];
   const seen = new Set();
 
-  const pushSym = (symbolName, symbolType, lineNumber) => {
+  const pushSym = (symbolName, symbolType, lineNumber, endLine = lineNumber, signature = '') => {
     const cleanName = String(symbolName || '').trim();
     if (!cleanName || seen.has(cleanName)) return;
     seen.add(cleanName);
     symbols.push({
       symbol_name: cleanName,
       symbol_type: symbolType,
-      start_line: lineNumber
+      start_line: lineNumber,
+      end_line: endLine,
+      signature
     });
   };
 
-  for (let idx = 0; idx < lines.length; idx += 1) {
-    const line = lines[idx];
-    if (line.length > 2000) continue;
-    const lineNo = idx + 1;
-
-    const nsMatch = line.match(/\bnamespace\s+([A-Za-z_\\][A-Za-z0-9_\\]*)\s*;/);
-    if (nsMatch) {
-      pushSym(nsMatch[1], 'namespace', lineNo);
+  const tsData = resolveTreeSitterData(source, relFile, precomputedTsData);
+  if (tsData) {
+    for (const sym of tsData.symbols || []) {
+      pushSym(
+        sym.symbol_name,
+        sym.symbol_type,
+        sym.start_line,
+        sym.end_line || sym.start_line,
+        sym.signature || ''
+      );
     }
+  } else {
+    const cleaned = stripPhpCommentsPreservingNewlines(source);
+    const lines = cleaned.split(/\r?\n/);
 
-    const classMatch = line.match(
-      /\b(?:(?:abstract|final|readonly)\s+)*(class|interface|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b/
-    );
-    if (classMatch) {
-      pushSym(classMatch[2], classMatch[1], lineNo);
-    }
+    for (let idx = 0; idx < lines.length; idx += 1) {
+      const line = lines[idx];
+      if (line.length > 2000) continue;
+      const lineNo = idx + 1;
 
-    const fnMatch = line.match(
-      /\bfunction\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/
-    );
-    if (fnMatch) {
-      pushSym(fnMatch[1], 'function', lineNo);
+      const nsMatch = line.match(/\bnamespace\s+([A-Za-z_\\][A-Za-z0-9_\\]*)\s*;/);
+      if (nsMatch) {
+        pushSym(nsMatch[1], 'namespace', lineNo);
+      }
+
+      const classMatch = line.match(
+        /\b(?:(?:abstract|final|readonly)\s+)*(class|interface|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b/
+      );
+      if (classMatch) {
+        pushSym(classMatch[2], classMatch[1], lineNo);
+      }
+
+      const fnMatch = line.match(
+        /\bfunction\s+&?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/
+      );
+      if (fnMatch) {
+        pushSym(fnMatch[1], 'function', lineNo);
+      }
     }
   }
 
@@ -2203,45 +2380,61 @@ function auditPhpMigrationFile(source, filePath) {
  * @param {string} ext
  * @returns {Array<{ symbol_name: string, symbol_type: string, start_line: number }>}
  */
-function extractPolyglotFileSymbols(source, relFile, ext) {
-  const cleaned = stripPhpCommentsPreservingNewlines(source);
-  const lines = cleaned.split(/\r?\n/);
+function extractPolyglotFileSymbols(source, relFile, ext, precomputedTsData = null) {
   const symbols = [];
   const seen = new Set();
 
-  const pushSym = (symbolName, symbolType, lineNumber) => {
+  const pushSym = (symbolName, symbolType, lineNumber, endLine = lineNumber, signature = '') => {
     const cleanName = String(symbolName || '').trim();
     if (!cleanName || seen.has(cleanName) || symbols.length >= 24) return;
     seen.add(cleanName);
     symbols.push({
       symbol_name: cleanName,
       symbol_type: symbolType,
-      start_line: lineNumber
+      start_line: lineNumber,
+      end_line: endLine,
+      signature
     });
   };
 
-  for (let idx = 0; idx < lines.length; idx += 1) {
-    const line = lines[idx];
-    if (line.length > 2000) continue;
-    const lineNo = idx + 1;
-
-    const typeMatch = line.match(
-      /\b(class|interface|struct|enum|trait|record|module)\s+([A-Za-z_][A-Za-z0-9_]*)\b/
-    );
-    if (typeMatch) {
-      pushSym(typeMatch[2], typeMatch[1], lineNo);
-    }
-
-    const fnMatch =
-      line.match(/\b(?:func|fn|def|fun)\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_?!]*)/) ||
-      line.match(
-        /\b(?:public|protected|private|internal)\s+(?:(?:static|final|virtual|override|async|synchronized)\s+)*(?:[A-Za-z0-9_<>\[\].,?*]+\s+){1,6}([A-Za-z_][A-Za-z0-9_]*)\s*\(/
+  const tsData = resolveTreeSitterData(source, relFile, precomputedTsData);
+  if (tsData) {
+    for (const sym of tsData.symbols || []) {
+      pushSym(
+        sym.symbol_name,
+        sym.symbol_type,
+        sym.start_line,
+        sym.end_line || sym.start_line,
+        sym.signature || ''
       );
-    if (
-      fnMatch &&
-      !['if', 'for', 'while', 'switch', 'catch', 'return', 'new'].includes(fnMatch[1])
-    ) {
-      pushSym(fnMatch[1], 'function', lineNo);
+    }
+  } else {
+    const cleaned = stripPhpCommentsPreservingNewlines(source);
+    const lines = cleaned.split(/\r?\n/);
+
+    for (let idx = 0; idx < lines.length; idx += 1) {
+      const line = lines[idx];
+      if (line.length > 2000) continue;
+      const lineNo = idx + 1;
+
+      const typeMatch = line.match(
+        /\b(class|interface|struct|enum|trait|record|module)\s+([A-Za-z_][A-Za-z0-9_]*)\b/
+      );
+      if (typeMatch) {
+        pushSym(typeMatch[2], typeMatch[1], lineNo);
+      }
+
+      const fnMatch =
+        line.match(/\b(?:func|fn|def|fun)\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_?!]*)/) ||
+        line.match(
+          /\b(?:public|protected|private|internal)\s+(?:(?:static|final|virtual|override|async|synchronized)\s+)*(?:[A-Za-z0-9_<>\[\].,?*]+\s+){1,6}([A-Za-z_][A-Za-z0-9_]*)\s*\(/
+        );
+      if (
+        fnMatch &&
+        !['if', 'for', 'while', 'switch', 'catch', 'return', 'new'].includes(fnMatch[1])
+      ) {
+        pushSym(fnMatch[1], 'function', lineNo);
+      }
     }
   }
 
@@ -2584,6 +2777,9 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
     // 1. Walk relative/polyglot imports and PHP `require`/`include` dependencies across repository files
     const phpSourceByFile = new Map();
+    const sourceByFile = new Map();
+    const tsAstByFile = new Map();
+    const syntaxErrorFiles = [];
     const polyglotSourceEntries = [];
     for (const relFile of allFiles) {
       const ext = path.extname(relFile).toLowerCase();
@@ -2599,9 +2795,22 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         continue;
       }
 
+      sourceByFile.set(relFile, content);
+      const tsData = resolveTreeSitterData(content, relFile, null);
+      if (tsData) {
+        tsAstByFile.set(relFile, tsData);
+        if (tsData.hasSyntaxError) {
+          syntaxErrorFiles.push({
+            filePath: relFile,
+            language: tsData.language,
+            errors: tsData.syntaxErrors || []
+          });
+        }
+      }
+
       if (ext === '.php') {
         phpSourceByFile.set(relFile, content);
-        for (const dep of extractPhpDependencies(content)) {
+        for (const dep of extractPhpDependencies(content, relFile, tsData)) {
           const resolvedTarget = resolvePhpDependencyTarget(relFile, dep.specifier, repoFileSet);
           if (resolvedTarget) {
             recordDirectedDependency(relFile, resolvedTarget, dep.relation);
@@ -2610,9 +2819,9 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         continue;
       }
 
-      polyglotSourceEntries.push({ filePath: relFile, content });
+      polyglotSourceEntries.push({ filePath: relFile, content, tsData });
       if (JS_TS_EXTENSIONS.has(ext)) {
-        const specifiers = extractRelativeSpecifiers(content);
+        const specifiers = extractRelativeSpecifiers(content, relFile, tsData);
         for (const spec of specifiers) {
           const resolvedTarget = resolveRelativeImportTarget(relFile, spec, repoFileSet);
           if (resolvedTarget) {
@@ -2626,16 +2835,29 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       recordDirectedDependency(edge.from, edge.to, 'imports');
     }
 
-    // 2. Walk AST symbols (`stack.git` one-shot map for JS/TS/PY + PHP symbol/call extractor for `.php`)
+    // 2. Walk CST/AST symbols (`treesitter-ast` when ready, with `stack.git` + regex fallbacks)
     let totalSymbols = 0;
     const phpDeclaredSymbolOwner = new Map();
+    const cstSymbolOwners = new Map();
     const indexedSymbolsByFile = loadAllRepoSymbolsByFile(stack, repoName);
+
+    const registerCstOwner = (symName, symType, relFile) => {
+      if (!symName || ['route', 'template', 'config', 'module', 'namespace'].includes(symType)) {
+        return;
+      }
+      if (!cstSymbolOwners.has(symName)) {
+        cstSymbolOwners.set(symName, new Set());
+      }
+      cstSymbolOwners.get(symName).add(relFile);
+    };
 
     for (const relFile of allFiles) {
       const ext = path.extname(relFile).toLowerCase();
+      const tsData = tsAstByFile.get(relFile) || null;
+
       if (ext === '.php') {
         const phpContent = phpSourceByFile.get(relFile) || '';
-        const phpSyms = extractPhpFileSymbols(phpContent, relFile);
+        const phpSyms = extractPhpFileSymbols(phpContent, relFile, tsData);
         symbolsByFile.set(relFile, phpSyms);
         totalSymbols += phpSyms.length;
         for (const sym of phpSyms) {
@@ -2645,31 +2867,60 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
           ) {
             phpDeclaredSymbolOwner.set(sym.symbol_name, relFile);
           }
+          registerCstOwner(sym.symbol_name, sym.symbol_type, relFile);
         }
         continue;
       }
 
-      const syms = indexedSymbolsByFile.get(normalizeRelPath(relFile)) || [];
+      if (POLYGLOT_EXTENSIONS.has(ext)) {
+        const polyContent = sourceByFile.get(relFile) || '';
+        const polySyms = extractPolyglotFileSymbols(polyContent, relFile, ext, tsData);
+        symbolsByFile.set(relFile, polySyms);
+        totalSymbols += polySyms.length;
+        for (const sym of polySyms) {
+          registerCstOwner(sym.symbol_name, sym.symbol_type, relFile);
+        }
+        continue;
+      }
+
+      const syms = tsData
+        ? tsData.symbols || []
+        : indexedSymbolsByFile.get(normalizeRelPath(relFile)) || [];
       symbolsByFile.set(relFile, syms);
       totalSymbols += syms.length;
 
       for (const sym of syms) {
-        const depRes = stack.git.dependencyGraph({
-          repo: repoName,
-          symbol: sym.symbol_name
-        });
-        const inboundCallers = Array.isArray(depRes?.data?.inbound) ? depRes.data.inbound : [];
-        for (const caller of inboundCallers) {
-          const callerFile = normalizeRelPath(caller.from_file);
-          if (callerFile && callerFile !== relFile) {
-            recordDirectedDependency(callerFile, relFile, 'calls', sym.symbol_name);
+        registerCstOwner(sym.symbol_name, sym.symbol_type, relFile);
+        if (!tsData) {
+          const depRes = stack.git.dependencyGraph({
+            repo: repoName,
+            symbol: sym.symbol_name
+          });
+          const inboundCallers = Array.isArray(depRes?.data?.inbound) ? depRes.data.inbound : [];
+          for (const caller of inboundCallers) {
+            const callerFile = normalizeRelPath(caller.from_file);
+            if (callerFile && callerFile !== relFile) {
+              recordDirectedDependency(callerFile, relFile, 'calls', sym.symbol_name);
+            }
           }
         }
       }
     }
 
-    // Resolve cross-file PHP function & class invocation edges
-    if (phpDeclaredSymbolOwner.size > 0) {
+    if (tsAstByFile.size > 0) {
+      for (const [callerFile, tsData] of tsAstByFile.entries()) {
+        for (const calledName of tsData.calls || []) {
+          const owners = cstSymbolOwners.get(calledName);
+          if (!owners || owners.size === 0 || owners.size > 3) continue;
+          for (const ownerFile of owners) {
+            if (ownerFile !== callerFile) {
+              recordDirectedDependency(callerFile, ownerFile, 'calls', calledName);
+            }
+          }
+        }
+      }
+    } else if (phpDeclaredSymbolOwner.size > 0) {
+      // Fallback cross-file PHP function & class invocation edges when WASM parser is uninitialized
       for (const [callerFile, rawPhp] of phpSourceByFile.entries()) {
         const cleanedPhp = stripPhpCommentsPreservingNewlines(rawPhp);
         for (const [symName, ownerFile] of phpDeclaredSymbolOwner.entries()) {
@@ -2703,6 +2954,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       repoFileSet,
       symbolsByFile,
       totalSymbols,
+      syntaxErrorFiles,
       inboundDependents,
       outboundTargets,
       edgeRecords,
@@ -2835,6 +3087,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       );
     }
 
+    await initTreeSitterRuntime();
     const normalizedEntry = normalizeRelPath(entryFile || 'src/fee-engine.js');
     const model = buildRepositoryDependencyModel(realRepoDir, repoName);
     const {
@@ -2844,6 +3097,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       repoFileSet,
       symbolsByFile,
       totalSymbols,
+      syntaxErrorFiles,
       inboundDependents,
       outboundTargets,
       edgeRecords,
@@ -3115,6 +3369,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
     const searchSnapshot = stack.git.searchSymbols({ repo: repoName, query: '*' });
     const symbolGraph = {
       repo: repoName,
+      astEngine: isTreeSitterReady() ? 'web-tree-sitter-wasm' : 'regex-fallback',
       totalFiles: allFiles.length,
       totalSymbols,
       sampledSymbols: Array.isArray(searchSnapshot?.data?.symbols)
@@ -3122,6 +3377,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         : totalSymbols,
       rootEntries: rootTreeEntries.length,
       indexedCommit: indexRes?.data?.head_commit || 'working-tree',
+      syntaxErrorFiles,
       entrySymbols,
       edges: edgeRecords
     };
@@ -3317,6 +3573,7 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         localDisplayName = path.basename(realDir) || 'local-scan';
       }
 
+      await initTreeSitterRuntime();
       const scanStartNs = process.hrtime.bigint();
       const cloneElapsedMs = Number((Number(scanStartNs - startNs) / 1e6).toFixed(3));
       const {
@@ -3340,6 +3597,8 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       const seenMergedEdge = new Set();
       const phpSymbolsByFile = new Map();
       const polyglotSymbolsByFile = new Map();
+      const cstSymbolsByFile = new Map();
+      const syntaxErrorFiles = [];
       const extraFindings = [];
       let phpSymbolTotal = 0;
 
@@ -3369,33 +3628,51 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         } catch {
           continue;
         }
+
+        const tsData = resolveTreeSitterData(content, relFile, null);
+        if (tsData?.hasSyntaxError) {
+          syntaxErrorFiles.push({
+            filePath: relFile,
+            language: tsData.language,
+            errors: tsData.syntaxErrors || []
+          });
+        }
+
         fileEntries.push({
           filePath: relFile,
-          content
+          content,
+          tsData
         });
 
         const ext = path.extname(relFile).toLowerCase();
         if (ext === '.php') {
-          const phpSyms = extractPhpFileSymbols(content, relFile);
+          const phpSyms = extractPhpFileSymbols(content, relFile, tsData);
           phpSymbolsByFile.set(relFile, phpSyms);
+          cstSymbolsByFile.set(relFile, phpSyms);
           phpSymbolTotal += phpSyms.length;
           extraFindings.push(...auditPhpMigrationFile(content, relFile));
 
-          for (const dep of extractPhpDependencies(content)) {
+          for (const dep of extractPhpDependencies(content, relFile, tsData)) {
             const target = resolvePhpDependencyTarget(relFile, dep.specifier, repoFileSet);
             if (target) {
               pushPreviewEdge(relFile, target, dep.relation);
             }
           }
         } else if (POLYGLOT_EXTENSIONS.has(ext)) {
-          const polySyms = extractPolyglotFileSymbols(content, relFile, ext);
+          const polySyms = extractPolyglotFileSymbols(content, relFile, ext, tsData);
           polyglotSymbolsByFile.set(relFile, polySyms);
+          cstSymbolsByFile.set(relFile, polySyms);
           extraFindings.push(...auditPolyglotMigrationFile(content, relFile));
-        } else if (JS_TS_EXTENSIONS.has(ext)) {
-          for (const spec of extractRelativeSpecifiers(content)) {
-            const target = resolveRelativeImportTarget(relFile, spec, repoFileSet);
-            if (target) {
-              pushPreviewEdge(relFile, target, 'imports');
+        } else {
+          if (tsData) {
+            cstSymbolsByFile.set(relFile, tsData.symbols || []);
+          }
+          if (JS_TS_EXTENSIONS.has(ext)) {
+            for (const spec of extractRelativeSpecifiers(content, relFile, tsData)) {
+              const target = resolveRelativeImportTarget(relFile, spec, repoFileSet);
+              if (target) {
+                pushPreviewEdge(relFile, target, 'imports');
+              }
             }
           }
         }
@@ -3437,8 +3714,33 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
       const indexedSymbolsByFile = loadAllRepoSymbolsByFile(stack, scanRepoName);
 
-      // Supplement dependencyEdges with AST symbol call/import edges from stack.git
-      if (stack?.db?.prepare && indexedSymbolsByFile.size > 0) {
+      if (cstSymbolsByFile.size > 0) {
+        const symbolOwners = new Map();
+        for (const [ownerFile, syms] of cstSymbolsByFile.entries()) {
+          if (!scannedFileSet.has(ownerFile)) continue;
+          for (const sym of syms) {
+            const name = sym?.symbol_name;
+            if (!name || ['route', 'template', 'config', 'module', 'namespace'].includes(sym?.symbol_type)) {
+              continue;
+            }
+            if (!symbolOwners.has(name)) symbolOwners.set(name, new Set());
+            symbolOwners.get(name).add(ownerFile);
+          }
+        }
+        for (const entry of fileEntries) {
+          const fromFile = entry.filePath;
+          for (const calledName of entry.tsData?.calls || []) {
+            const owners = symbolOwners.get(calledName);
+            if (!owners || owners.size === 0 || owners.size > 3) continue;
+            for (const targetOwner of owners) {
+              if (targetOwner !== fromFile && scannedFileSet.has(targetOwner)) {
+                pushPreviewEdge(fromFile, targetOwner, 'calls');
+              }
+            }
+          }
+        }
+      } else if (stack?.db?.prepare && indexedSymbolsByFile.size > 0) {
+        // Fallback: supplement dependencyEdges with AST symbol call/import edges from stack.git
         const symbolOwners = new Map();
         for (const [ownerFile, syms] of indexedSymbolsByFile.entries()) {
           if (!scannedFileSet.has(ownerFile)) continue;
@@ -3524,8 +3826,9 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
       const topFiles = fileEntries.slice(0, 15).map((entry) => {
         const fp = entry.filePath;
         const ext = path.extname(fp).toLowerCase();
-        const syms =
-          ext === '.php'
+        const syms = cstSymbolsByFile.has(fp)
+          ? cstSymbolsByFile.get(fp) || []
+          : ext === '.php'
             ? phpSymbolsByFile.get(fp) || []
             : (() => {
                 const indexed = indexedSymbolsByFile.get(normalizeRelPath(fp)) || [];
@@ -3616,8 +3919,14 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
         findings: mergedFindings
       };
 
+      let cstTotalSymbols = 0;
+      for (const syms of cstSymbolsByFile.values()) {
+        cstTotalSymbols += syms.length;
+      }
       const symbolCount =
-        Number(indexRes?.data?.symbols_indexed ?? 0) + phpSymbolTotal + fallbackPolyglotSymbols;
+        cstSymbolsByFile.size > 0
+          ? cstTotalSymbols
+          : Number(indexRes?.data?.symbols_indexed ?? 0) + phpSymbolTotal + fallbackPolyglotSymbols;
       const elapsedMs = Number((Number(process.hrtime.bigint() - scanStartNs) / 1e6).toFixed(3));
       const displayTarget = normalizedInput.isRemoteCandidate
         ? normalizedInput.displayTarget
@@ -3627,10 +3936,12 @@ export function createPlannerEngine({ stack, kruschGitClient = null } = {}) {
 
       return okEnvelope('deadbolt.planner.repo_scan', summary, {
         target: displayTarget,
+        astEngine: isTreeSitterReady() ? 'web-tree-sitter-wasm' : 'regex-fallback',
         hintedFile: effectiveHintedFile,
         scannedFiles: fileEntries.length,
         scannedFilePaths: fileEntries.map((entry) => entry.filePath),
         symbolCount,
+        syntaxErrorFiles,
         topFiles,
         dependencyEdges,
         dependencyEdgeCount: dependencyEdges.length,
