@@ -162,7 +162,7 @@ Exports of `client/src/components/BreakerCockpit.jsx`:
 ### Choke-Point Orchestrator (Wired Only by Main Orchestrator)
 Files wired exclusively by the orchestrator after subagents finish:
 - `src/config.js`
-- `src/orchestrator.js`
+- `src/orchestrator.js`: Central choke-point orchestrator exposing `modernizeRepository()` (with live 4-axis `SoftwareStack` inference across `python-fastapi`, `react-vite`, `typescript-node`, and `node-esm`, returning `brickOntology: { targetStack, ontologyReady, supportedStacks, supportedPorts }`) alongside `inspectBrickOntology()`, `composeBrickOntology()`, and `synthesizeBrickOntologyBinding()` backed by `stack.brickExchange` (`@krusch/toolkit/brick-exchange`).
 - `src/server.js`
 - `src/mcp/deadbolt-mcp.js`
 - `client/src/App.jsx`

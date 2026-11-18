@@ -30,8 +30,8 @@ flowchart LR
    - **Import-Frozen Policy Floor (`INV-DB-05`)**: Catches and rejects DEADBOLT's own supervised agent (`FLOOR-PATH-PROTECTED`) if it attempts a shortcut workaround (such as editing `sox-reconciler.js` or `settlement-service.js`, or widening cent tolerance) instead of fixing the root rounding bug.
    - **SOX-Style Batch Reconciliation Demonstration (`INV-FIN-03`)**: Executes candidate billing patches inside a Node 22 `--permission` sandboxed subprocess (stripped of host `process.env` secrets and bounded by a hard timeout) to compute exact integer-cent batch settlement totals (`expectedNetCents`, `actualNetCents`, and `+1¢` delta).
    - **Separate-Family Review & Disagreement Escalation**: Runs fail-closed cross-family review (`Gemini` + `DeepSeek`) only after deterministic checks pass, escalates reviewer disagreement to a human operator, logs every verdict to a restart-safe HMAC SHA-256 hash-chained audit ledger, and measures real cost per verified task.
-5. **Live GitHub Legacy Modernization Benchmark (`src/engines/modernizer-benchmark.js`)**  
-   Runs a live head-to-head modernization wave (`POST /api/repo/modernize`) comparing a single frontier model with full-repository context stuffing against **HydraDB 2-hop graph slicing + `< 25µs` Cascade Router + `< 1ms` Golden Brick Slop Breaker + 2-family verification**, writing `:SUPERSEDES` lineage back to HydraDB only when verification succeeds.
+5. **Live GitHub Legacy Modernization Benchmark & 4-Axis Brick Ontology (`src/engines/modernizer-benchmark.js`, `src/orchestrator.js`)**  
+   Runs a live head-to-head modernization wave (`POST /api/repo/modernize` / `modernizeRepository()`) comparing a single frontier model with full-repository context stuffing against **HydraDB 2-hop graph slicing + `< 25µs` Cascade Router + `< 1ms` Golden Brick Slop Breaker + 2-family verification**, writing `:SUPERSEDES` lineage back to HydraDB only when verification succeeds. `modernizeRepository()` also infers the target 4-axis `SoftwareStack` (`python-fastapi`, `react-vite`, `typescript-node`, or `node-esm`) and attaches live `brickOntology` compatibility metadata (`targetStack`, `ontologyReady`, `supportedStacks`, `supportedPorts`), alongside direct orchestrator methods (`inspectBrickOntology`, `composeBrickOntology`, `synthesizeBrickOntologyBinding`) backed by `@krusch/toolkit/brick-exchange`.
 6. **3-Tab Live Breaker Panel, 8090 Tri-API Control Plane & 8090-Aligned MCP Server (`client/`, `src/connectors/sponsors.js`, `src/mcp/deadbolt-mcp.js`)**  
    High-contrast dark-obsidian cockpit (`1. Work Order Gate`, `2. GitHub Modernizer`, `3. 8090 Factory & Safety`) with split-screen **Standard Agent vs. DEADBOLT** SSE streaming, live **8090 Software Factory Tri-API Governance Control Plane** (`GET /api/sofa/governance` & Stage-4-gated `POST /api/sofa/sync-receipt` surfacing live Work Orders, Blueprints, Requirements, Skills, locked `tests`/`blueprints` automation overrides, org token spend, and idempotent Stage 4 receipt writeback), **ElevenLabs** Factory Foreman breaker alerts (with offline PCM16 WAV synthesis fallback), **Composio** Confused-Deputy gated PR dispatch, and a 5-tool MCP server matching 8090's `4 Allow` (read-only Automations) vs. `1 Confirm` (mutating Action) permission split.
 
@@ -48,7 +48,7 @@ Read https://raw.githubusercontent.com/kruschdev/deadbolt/main/INSTALL.md and se
 ```bash
 cp .env.example .env
 npm ci
-npm test
+npm test # 18/18 passing tests
 npm start
 ```
 
@@ -78,7 +78,7 @@ DEADBOLT operates as the deterministic Stage-4 verification and crash-recoverabl
 ### 2. Pre-Existing Public Open-Source Libraries by Author (Disclosed per Agreement Section 10(c))
 | Package / Repository | License | Pre-Existing Role Used as Library Dependency |
 |---|---|---|
-| [`@krusch/toolkit`](https://github.com/kruschdev/toolkit) (`v1.8.1`) | MIT | Pre-audited runtime Golden Bricks (`http`, `streaming`, `mcp`, `sqlite`, `security`, `audit-log`, `cascade`, `hydradb`, `audio`, `raw-rag`, `harness-engineering`, `trajectory-guard`, `react`) & `<1ms` `auditBoilerplateText` / `scoreLegoBrickCoverage` Slop-Breaker rules. |
+| [`@krusch/toolkit`](https://github.com/kruschdev/toolkit) (`v1.8.1`) | MIT | Pre-audited runtime Golden Bricks (`http`, `streaming`, `mcp`, `sqlite`, `security`, `audit-log`, `brick-exchange`, `cascade`, `hydradb`, `audio`, `raw-rag`, `harness-engineering`, `trajectory-guard`, `react`) & `<1ms` `auditBoilerplateText` / `scoreLegoBrickCoverage` Slop-Breaker rules. |
 | [`krusch-stack`](https://github.com/kruschdev/krusch-stack) (`v1.1.0`) | MIT | Unified Node 22 SQLite packaging of Tier 1 working memory (`krusch-context-mcp`), Tier 2A AST symbol & dependency graph (`krusch-git`), and Tier 3 staged diff journal (`krusch-coding-harness`). |
 | [`krusch-context-mcp`](https://github.com/kruschdev/krusch-context-mcp) (`v2.0.0`) | MIT | Tier 1 SQLite `FTS5/BM25` + `1024d` vector working-memory MCP server with `INV-12` SHA-256 span drift locks. |
 | [`krusch-git`](https://github.com/kruschdev/krusch-git) (`v1.2.2`) | MIT | Tier 2A AST symbol & 2-hop call-graph dependency engine. |
