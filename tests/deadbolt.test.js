@@ -2470,4 +2470,13 @@ test('INV-DB-TS-01 & INV-DB-05: Portable WASM Tree-sitter across 11 grammars, do
     assert.equal(brokenEditCheck.ok, true);
     assert.equal(brokenEditCheck.data.syntaxCheck.astEngine, 'web-tree-sitter-wasm');
     assert.equal(brokenEditCheck.data.syntaxCheck.hasSyntaxErrors, true);
+
+    // 3. 4-Axis Common Ground + HydraScope Brick Ontology runtime wiring
+    const ontInspect = orch.inspectBrickOntology();
+    assert.equal(ontInspect.ok, true);
+    const stackIds = Array.isArray(ontInspect.data.stacks)
+        ? ontInspect.data.stacks.map((s) => s.id)
+        : Object.keys(ontInspect.data.stacks || {});
+    assert.ok(stackIds.includes('cloudflare-edge'));
+    assert.ok(stackIds.includes('typescript-node'));
 });

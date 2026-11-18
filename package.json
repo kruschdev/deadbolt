@@ -28,7 +28,7 @@
     "test": "NODE_ENV=test node --test tests/*.test.js"
   },
   "dependencies": {
-    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/ebe08720fc765520737ba4edc5c4fcd9c2420e93.tar.gz",
+    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/b22f25c34e000bada54e681ccfafc13a05409261.tar.gz",
     "krusch-stack": "https://github.com/kruschdev/krusch-stack/archive/763034180493d2307f1a19b8b349be3172b1b80b.tar.gz",
     "tree-sitter-wasms": "^0.1.13",
     "web-tree-sitter": "^0.22.6"

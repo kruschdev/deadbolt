@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/ebe08720fc765520737ba4edc5c4fcd9c2420e93.tar.gz",
+    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/b22f25c34e000bada54e681ccfafc13a05409261.tar.gz",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

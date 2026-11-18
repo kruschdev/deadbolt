@@ -1291,11 +1291,83 @@ export async function createDeadboltOrchestrator(options = {}) {
             }
         }
 
-        return modernizer.runModernizationComparison({
+        const modEnv = await modernizer.runModernizationComparison({
             repoUrlOrPath: cleanTarget,
             targetFile,
             maxFiles
         });
+        if (!modEnv?.ok) return modEnv;
+
+        const targetPathHint = String(
+            targetFile || modEnv.data?.targetFile || ''
+        ).toLowerCase();
+        const inferredStack = /\.py$/i.test(targetPathHint)
+            ? 'python-fastapi'
+            : /\.(?:tsx|jsx)$/i.test(targetPathHint)
+              ? 'react-vite'
+              : /\.ts$/i.test(targetPathHint)
+                ? 'typescript-node'
+                : 'node-esm';
+        const ontologyInspect =
+            typeof stack?.brickExchange?.inspectOntology === 'function'
+                ? stack.brickExchange.inspectOntology({ stack: inferredStack })
+                : null;
+        return okEnvelope(modEnv.tool, modEnv.summary, {
+            ...modEnv.data,
+            brickOntology: {
+                targetStack: inferredStack,
+                ontologyReady: Boolean(ontologyInspect?.ok),
+                supportedStacks: ontologyInspect?.ok
+                    ? Array.isArray(ontologyInspect.data?.stacks)
+                        ? ontologyInspect.data.stacks.map((s) => s.id)
+                        : Object.keys(ontologyInspect.data?.stacks || {})
+                    : [],
+                supportedPorts: ontologyInspect?.ok
+                    ? Array.isArray(ontologyInspect.data?.ports)
+                        ? ontologyInspect.data.ports.map((p) => p.id)
+                        : Object.keys(ontologyInspect.data?.ports || {})
+                    : []
+            }
+        });
+    }
+
+    /**
+     * Inspect or compose across the 4-Axis Common Ground + HydraScope + DEADBOLT Brick Ontology.
+     */
+    function inspectBrickOntology(opts = {}) {
+        if (typeof stack?.brickExchange?.inspectOntology === 'function') {
+            return stack.brickExchange.inspectOntology(opts);
+        }
+        return errorEnvelope(
+            'ONTOLOGY_UNAVAILABLE',
+            'Brick ontology engine is unavailable on stack instance.',
+            null,
+            'deadbolt.orchestrator.ontology'
+        );
+    }
+
+    async function composeBrickOntology(opts = {}) {
+        if (typeof stack?.brickExchange?.composeCrossStack === 'function') {
+            return stack.brickExchange.composeCrossStack(opts);
+        }
+        return errorEnvelope(
+            'ONTOLOGY_UNAVAILABLE',
+            'Brick ontology composition is unavailable on stack instance.',
+            null,
+            'deadbolt.orchestrator.ontology'
+        );
+    }
+
+    async function synthesizeBrickOntologyBinding(opts = {}) {
+        if (typeof stack?.brickExchange?.synthesizeBinding === 'function') {
+            return stack.brickExchange.synthesizeBinding(opts);
+        }
+        return errorEnvelope(
+            'ONTOLOGY_UNAVAILABLE',
+            'Brick ontology binding synthesis is unavailable on stack instance.',
+            null,
+            'deadbolt.orchestrator.ontology'
+        );
     }
 
     /**
@@ -1525,6 +1597,9 @@ export async function createDeadboltOrchestrator(options = {}) {
         runHeadToHead,
         scanRepository,
         modernizeRepository,
+        inspectBrickOntology,
+        composeBrickOntology,
+        synthesizeBrickOntologyBinding,
         runCrashDrill,
         runDeputyDrill,
         speakForeman,
