@@ -37,6 +37,14 @@ flowchart LR
 
 ## Quick Start
 
+### Agent-Assisted Setup
+
+Ask your coding agent (Claude Code, Codex, Cursor, Windsurf, or Antigravity):
+
+```text
+Read https://raw.githubusercontent.com/kruschdev/deadbolt/main/INSTALL.md and set up deadbolt on this machine.
+```
+
 ```bash
 cp .env.example .env
 npm ci
