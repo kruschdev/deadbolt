@@ -8,6 +8,7 @@
  * - Queries 2-hop blast radius via MATCH [:DEPENDED_ON_BY*1..2] WHERE dst.id <> $start
  */
 
+import crypto from 'node:crypto';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { safeFetch } from '@krusch/toolkit/security';
 
@@ -314,23 +315,36 @@ export function decodeHydraQueryResult(payload) {
 }
 
 /**
- * Derive a deterministic positive integer vertex_id for a file path when beyond the 3 canonical hops.
+ * Map `(namespace, logicalId)` deterministically to a positive 48-bit safe integer
+ * matching HydraScope & `@krusch/toolkit/brick-exchange` (`[1000, 281474976700999]`).
  *
- * @param {string} filePath
- * @param {number} index
+ * @param {string} namespace
+ * @param {string} [logicalId]
  * @returns {number}
  */
-function resolveCodeFileVertexId(filePath, index = 0) {
+export function surrogateVertexId(namespace, logicalId) {
+    const hasTwoArgs = logicalId !== undefined;
+    const ns = hasTwoArgs ? String(namespace ?? 'default').trim() || 'default' : 'default';
+    const id = hasTwoArgs ? String(logicalId ?? '').trim() : String(namespace ?? '').trim();
+    const digest = crypto.createHash('sha256').update(`${ns}\0${id}`, 'utf8').digest();
+    return (digest.readUIntBE(0, 6) % 281474976700000) + 1000;
+}
+
+/**
+ * Derive a deterministic positive 48-bit integer vertex_id for a file path when beyond the 3 canonical hops.
+ *
+ * @param {string} filePath
+ * @param {string} [namespace='default']
+ * @returns {number}
+ */
+export function resolveCodeFileVertexId(filePath, namespace = 'default') {
     const clean = String(filePath || '').trim();
     if (clean === 'src/fee-engine.js') return 1001;
     if (clean === 'src/settlement-service.js') return 1002;
     if (clean === 'src/sox-reconciler.js') return 1003;
-    let hash = 2166136261;
-    for (let i = 0; i < clean.length; i += 1) {
-        hash ^= clean.charCodeAt(i);
-        hash = Math.imul(hash, 16777619);
-    }
-    return 2000 + ((hash >>> 0) % 100000) + index;
+    const safeNs =
+        typeof namespace === 'string' && namespace.trim() ? namespace.trim() : 'default';
+    return surrogateVertexId(safeNs, `file:${clean}`);
 }
 
 /**
@@ -627,8 +641,8 @@ export function createHydraGraphClient(options = {}) {
                 ? hopFiles.map((f) => String(f).trim()).filter(Boolean)
                 : ['src/fee-engine.js', 'src/settlement-service.js', 'src/sox-reconciler.js'];
 
-        const fileVertices = orderedFiles.map((filePath, idx) => ({
-            vertexId: resolveCodeFileVertexId(filePath, idx),
+        const fileVertices = orderedFiles.map((filePath) => ({
+            vertexId: resolveCodeFileVertexId(filePath, cleanNamespace),
             filePath,
             isProtected: filePath.endsWith('sox-reconciler.js') ? true : null
         }));
@@ -765,7 +779,7 @@ export function createHydraGraphClient(options = {}) {
         const startId =
             Number.isInteger(entryVertexId) && entryVertexId > 0
                 ? entryVertexId
-                : resolveCodeFileVertexId(entryFile, 0);
+                : resolveCodeFileVertexId(entryFile, cleanNamespace);
 
         if (!isConfigured()) {
             return okEnvelope(

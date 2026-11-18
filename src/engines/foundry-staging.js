@@ -666,7 +666,7 @@ export function createFoundryEngine({ stack = null } = {}) {
       });
 
       const stageRes = drillStack.harness.run({
-        task_id: 'task-crash-drill-wo-101',
+        task_id: 'stage-crash-drill-wo-101',
         goal: '[WO-101] Staged 2-file fee and settlement update',
         edits: [
           { file_path: file1Rel, content: stagedFile1Text },

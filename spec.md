@@ -11,6 +11,12 @@ DEADBOLT is the deterministic governance control plane, 2-hop blast-radius plann
 
 8090 builds the software; DEADBOLT makes it harder to break. DEADBOLT reduces the risk of unsafe AI-generated changes through deterministic controls, independent cross-family review, and recoverable staged execution.
 
+### Role in the Common Ground · HydraScope · DEADBOLT Ontology Triad
+DEADBOLT serves as **Pillar 3** of the [Common Ground · HydraScope · DEADBOLT Ontology Triad](https://krusch.dev/articles/ontological-brick-exchange-deadbolt-common-ground-hydrascope):
+- **Pillar 1 ([`0xANUSHKA/common-ground-8090`](https://github.com/0xANUSHKA/common-ground-8090), MIT)**: Captures and structures multi-channel organizational context into Software Factory Work Orders and specifications.
+- **Pillar 2 ([`kruschdev/HydraScope`](https://github.com/kruschdev/HydraScope) + [`@krusch/toolkit`](https://github.com/kruschdev/toolkit) `brick-exchange`, MIT)**: Compiles sealed Golden Bricks across the 4-axis ontology (`SoftwareStack`, `DataPort`, `Channel`, `MoEProfile`) into HydraDB `v0.4.0` using deterministic 48-bit SHA-256 `surrogateVertexId` keys, `:SUPERSEDES` lineage, and `:GOVERNS` AST links.
+- **Pillar 3 (`DEADBOLT`, MIT)**: Enforces 2-hop Tree-sitter CST blast-radius leases, `< 1ms` Golden Brick Slop-Breaker checks, import-frozen policy floors, integer-cent reconciliation (`INV-FIN-03`), and cross-family consensus prior to Stage-4 promotion.
+
 ## 2. Numbered Operational & Architectural Invariants
 
 - **`INV-DB-01` (Deterministic Envelope Contract)**: Every HTTP API handler, engine method, and MCP tool returns `{ ok: boolean, tool: string, summary: string, data?: object, error?: { code, message, details } }` via `okEnvelope` / `errorEnvelope` (`@krusch/toolkit/http`) or `okMcpResult` / `errorMcpResult` (`@krusch/toolkit/mcp`).

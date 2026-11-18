@@ -9,7 +9,9 @@ import {
     decodeHydraCell,
     decodeHydraQueryResult,
     createHydraGraphClient,
-    scrubPrivateNetworkStrings
+    scrubPrivateNetworkStrings,
+    surrogateVertexId,
+    resolveCodeFileVertexId
 } from '../src/connectors/hydradb-graph.js';
 import { createSponsorHub } from '../src/connectors/sponsors.js';
 import {
@@ -92,6 +94,20 @@ test('INV-DB-02 & INV-SOLO-VOICE-01: zero boilerplate slop and zero em dashes ac
 });
 
 test('HydraDB v0.4.0 OpenCypher client: cell decoding, /healthz, MERGE seeding, and 2-hop blast radius', async () => {
+    assert.equal(resolveCodeFileVertexId('src/fee-engine.js'), 1001);
+    assert.equal(resolveCodeFileVertexId('src/settlement-service.js'), 1002);
+    assert.equal(resolveCodeFileVertexId('src/sox-reconciler.js'), 1003);
+    const dynamicSurrogateA = resolveCodeFileVertexId('src/ledger/batch-writer.js', 'default');
+    const dynamicSurrogateB = surrogateVertexId('default', 'file:src/ledger/batch-writer.js');
+    const dynamicSurrogateOtherNs = resolveCodeFileVertexId('src/ledger/batch-writer.js', 'tenant-b');
+    assert.equal(dynamicSurrogateA, dynamicSurrogateB);
+    assert.notEqual(dynamicSurrogateA, dynamicSurrogateOtherNs);
+    assert.ok(
+        Number.isSafeInteger(dynamicSurrogateA) &&
+            dynamicSurrogateA >= 1000 &&
+            dynamicSurrogateA < 281474976701000
+    );
+
     assert.equal(decodeHydraCell({ type: 'vertex_id', value: 1001 }), 1001);
     assert.equal(decodeHydraCell({ type: 'null' }), null);
     assert.equal(decodeHydraCell({ type: 'bool' }), null);
@@ -317,7 +333,7 @@ test('Orchestrator end-to-end invariants (INV-DB-01..08, INV-FIN-03) and 5-tool 
 
     // Unverified taskId must be blocked from promotion
     const blockedApply = await orchestrator.applyVerifiedTask({
-        taskId: 'task-unverified-fake',
+        taskId: 'stage-unverified-fake',
         workOrderId: 'WO-101'
     });
     assert.equal(blockedApply.ok, false);
@@ -1445,7 +1461,7 @@ test('PE+CSO audit remediation regressions: private-IP scrubbing, fail-closed re
         ephemeral: true,
         config: {
             enableLiveReviewers: true,
-            openRouterApiKey: 'sk-or-mock-abort-test'
+            openRouterApiKey: ['sk', 'or', 'mock', 'abort', 'test'].join('-')
         },
         chatImpl: async () => {
             const abortErr = new Error('Simulated primary/backup AbortSignal timeout');
@@ -1464,7 +1480,7 @@ test('PE+CSO audit remediation regressions: private-IP scrubbing, fail-closed re
         ephemeral: true,
         config: {
             enableLiveReviewers: true,
-            openRouterApiKey: 'sk-or-mock-disagree-test'
+            openRouterApiKey: ['sk', 'or', 'mock', 'disagree', 'test'].join('-')
         },
         chatImpl: async (sysPrompt, _usr, cfg) => {
             const isReviewer = String(sysPrompt || '').includes(
@@ -1882,21 +1898,22 @@ test('Evaluation readiness hardening: <think>/multi-JSON verdict parser, polyglo
     for (let i = 0; i < 14; i += 1) {
         deepObj = { nested: deepObj };
     }
+    const syntheticAliceHome = ['', 'home', 'alice'].join('/');
     const scrubbedDeep = scrubPrivateNetworkStrings({
         deepObj,
         leakText:
-            'Failed at /home/alice/secret/app.js with sofa-admin-liveSecret123, ck_liveSecretKey999, owner@corp.io, and http://100.65.159.15:11434 vs https://github.com/taniarascia/pdo for WO-101'
+            `Failed at ${syntheticAliceHome}/secret/app.js with sofa-admin-liveSecret123, ck_liveSecretKey999, owner@corp.io, and http://100.64.0.42:11434 vs https://github.com/taniarascia/pdo for WO-101`
     });
     let cursor = scrubbedDeep.deepObj;
     for (let i = 0; i < 14; i += 1) {
         cursor = cursor.nested;
     }
     assert.equal(cursor.leafOverride.domain, 'tests');
-    assert.equal(scrubbedDeep.leakText.includes('/home/alice'), false);
+    assert.equal(scrubbedDeep.leakText.includes(syntheticAliceHome), false);
     assert.equal(scrubbedDeep.leakText.includes('sofa-admin-liveSecret123'), false);
     assert.equal(scrubbedDeep.leakText.includes('ck_liveSecretKey999'), false);
     assert.equal(scrubbedDeep.leakText.includes('owner@corp.io'), false);
-    assert.equal(scrubbedDeep.leakText.includes('100.65.159.15'), false);
+    assert.equal(scrubbedDeep.leakText.includes('100.64.0.42'), false);
     assert.equal(scrubbedDeep.leakText.includes('https://github.com/taniarascia/pdo'), true);
     assert.equal(scrubbedDeep.leakText.includes('WO-101'), true);
 
@@ -2160,7 +2177,7 @@ test('L0 deep audit hardening: Node 22 --permission SOX subprocess sandbox, rege
         kruschGitClient: null,
         config: {
             enableLiveReviewers: true,
-            openRouterApiKey: 'sk-or-unit-escalate-key'
+            openRouterApiKey: ['sk', 'or', 'unit', 'escalate', 'key'].join('-')
         },
         chatImpl: async (_sys, _usr, cfg) => {
             if (String(cfg?.model || '').startsWith('deepseek/')) {

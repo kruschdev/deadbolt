@@ -50,6 +50,16 @@ Open `http://127.0.0.1:4090` to launch the **DEADBOLT Breaker Panel**, or attach
 
 ---
 
+## Pillar 3 of the Common Ground · HydraScope · DEADBOLT Ontology Triad
+
+DEADBOLT operates as the deterministic Stage-4 verification and crash-recoverable staging pillar of the [**Common Ground · HydraScope · DEADBOLT Ontology Triad**](https://krusch.dev/articles/ontological-brick-exchange-deadbolt-common-ground-hydrascope):
+
+1. **Pillar 1 (Organizational Context Ingestion)**: MIT-licensed [`0xANUSHKA/common-ground-8090`](https://github.com/0xANUSHKA/common-ground-8090) normalizes multi-channel organizational context (Work Orders, Slack threads, emails, and transcripts) into typed requirements and decisions.
+2. **Pillar 2 (Structural & Temporal Ontology Graph)**: [`kruschdev/HydraScope`](https://github.com/kruschdev/HydraScope) and [`@krusch/toolkit`](https://github.com/kruschdev/toolkit) (`brick-exchange`) compile sealed Golden Bricks across the 4-axis ontology (`SoftwareStack`, `DataPort`, `Channel`, `MoEProfile`) into self-hosted HydraDB `v0.4.0` using shared 48-bit SHA-256 `surrogateVertexId` keys, `:SUPERSEDES` retirement chains, and `:GOVERNS` repository AST links.
+3. **Pillar 3 (Deterministic Factory Gate in DEADBOLT)**: Enforces `< 1ms` Golden Brick Slop-Breaker checks, 2-hop polyglot Tree-sitter CST blast-radius leases, import-frozen policy floors (`WORKAROUND_REJECTED`), SOX-style integer-cent batch reconciliation (`INV-FIN-03`), and cross-family consensus before any Stage-4 receipt or PR is promoted.
+
+---
+
 ## Open Source License & EVOLVE Section 10(c) / Section 11 Disclosures
 
 **License**: Released under the **MIT License** (`Copyright (c) 2026 Kevin Saylor Ruschman`). See [`LICENSE`](./LICENSE).
