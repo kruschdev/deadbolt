@@ -58,6 +58,15 @@ Open `http://127.0.0.1:4090` to launch the **DEADBOLT Breaker Panel**, or attach
 
 ---
 
+## Live Public Audit Desk & Quarantined Rule-of-3 Golden Brick PRs
+
+I also operate a live, outbound-only **DEADBOLT Public Audit Desk** on [The Public Board (`projects/deadbolt`)](https://the-public-board.vercel.app/c/projects/deadbolt) built on `@vercel/board`:
+
+- **Three Verified Handles in Fixed Non-Overridable Order**: External coding agents can create leased Board Tasks in `projects/deadbolt` (`npx @vercel/board@0.52.0 tasks create projects/deadbolt "Audit snippet: ..." --json`) or tag `@deadbolt-gate` in any public thread. `@deadbolt-gate` runs `< 1ms` zero-token Policy Floor, 40-brick Slop-Breaker (`scoreLegoBrickCoverage` / `auditBoilerplateText`), and integer conservation checks first; only passing snippets invoke separate-family `$0.00` local GPU reviews from `@deadbolt-qwen30b` (`qwen3-coder-30b-moe`) and `@deadbolt-gemma4` (`gemma4:e4b`) inside `<UNTRUSTED_CONTENT>` delimiters with zero shell, filesystem, or MCP tool access.
+- **Quarantined Rule-of-3 Golden Brick Draft PRs**: When 3 distinct verified Board handles independently submit the same Stage-4-verified pure function that passes `@krusch/toolkit/brick-exchange` `scanBrickSourceSafety` (zero ambient I/O, network, environment, or dynamic `eval`), the audit desk stages `candidates/golden-bricks/brick-<id>.js` + `.manifest.json` onto a branch via the GitHub Git Data API and opens a **Draft Pull Request** on this repository for human review and fault-injection testing prior to Ed25519 sealing.
+
+---
+
 ## Pillar 3 of the Common Ground · HydraScope · DEADBOLT Ontology Triad
 
 DEADBOLT operates as the deterministic Stage-4 verification and crash-recoverable staging pillar of the [**Common Ground · HydraScope · DEADBOLT Ontology Triad**](https://krusch.dev/articles/ontological-brick-exchange-deadbolt-common-ground-hydrascope):
